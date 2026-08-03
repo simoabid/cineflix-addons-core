@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>addons-core · admin</title>
+        <link rel="stylesheet" href="/admin/styles.css" />
+    </head>
+    <body>
+        <header class="topbar">
+            <div class="brand">
+                <span class="logo">▶</span>
+                <div>
+                    <h1>addons-core</h1>
+                    <p class="tagline">Stremio addon aggregator · OMSS backend</p>
+                </div>
+            </div>
+            <div class="status" id="health">
+                <span class="dot" id="health-dot"></span>
+                <span id="health-text">checking…</span>
+            </div>
+        </header>
+
+        <main>
+            <section class="panel" id="token-panel" hidden>
+                <h2>Admin token</h2>
+                <p class="muted">
+                    This server requires an admin token for management calls.
+                </p>
+                <div class="row">
+                    <input
+                        type="password"
+                        id="token-input"
+                        placeholder="x-admin-token"
+                    />
+                    <button id="token-save">Save</button>
+                </div>
+            </section>
+
+            <section class="grid">
+                <div class="panel">
+                    <h2>Import from URL</h2>
+                    <p class="muted">
+                        Paste any addon <code>manifest.json</code> (or transport)
+                        URL. One per line for several.
+                    </p>
+                    <textarea
+                        id="url-input"
+                        rows="3"
+                        placeholder="https://torrentio.strem.fun/manifest.json"
+                    ></textarea>
+                    <button id="url-btn">Install</button>
+                </div>
+
+                <div class="panel">
+                    <h2>Import from Stremio account</h2>
+                    <p class="muted">
+                        Imports your whole Stremio addon collection. Credentials
+                        are sent once to <code>api.strem.io</code> and not stored.
+                    </p>
+                    <input type="email" id="stremio-email" placeholder="email" />
+                    <input
+                        type="password"
+                        id="stremio-password"
+                        placeholder="password"
+                    />
+                    <div class="or">— or —</div>
+                    <input
+                        type="text"
+                        id="stremio-authkey"
+                        placeholder="authKey (optional, instead of email/password)"
+                    />
+                    <button id="stremio-btn">Import collection</button>
+                </div>
+
+                <div class="panel">
+                    <h2>Import from repository</h2>
+                    <p class="muted">
+                        A URL returning a list of addon URLs (JSON array/object or
+                        one-per-line text).
+                    </p>
+                    <input
+                        type="text"
+                        id="repo-input"
+                        placeholder="https://example.com/addons.json"
+                    />
+                    <button id="repo-btn">Import all</button>
+                </div>
+            </section>
+
+            <section class="panel" id="debrid-panel">
+                <div class="panel-head">
+                    <h2>Debrid</h2>
+                    <span class="debrid-badge" id="debrid-badge">off</span>
+                </div>
+                <p class="muted">
+                    Resolve torrent streams (Torrentio, MediaFusion, Comet, …)
+                    into playable HTTP links via your debrid account. Only
+                    already-cached torrents are used, to keep playback fast.
+                </p>
+                <div class="row">
+                    <select id="debrid-provider">
+                        <option value="none">Disabled</option>
+                        <option value="realdebrid">Real-Debrid</option>
+                        <option value="alldebrid">AllDebrid</option>
+                        <option value="premiumize">Premiumize</option>
+                    </select>
+                    <input
+                        type="password"
+                        id="debrid-key"
+                        placeholder="API key"
+                        autocomplete="off"
+                    />
+                </div>
+                <div class="row">
+                    <button id="debrid-save">Save</button>
+                    <button class="ghost" id="debrid-test">Test key</button>
+                </div>
+                <p class="muted lock" id="debrid-lock" hidden>
+                    Debrid is pinned by environment variables (DEBRID_*) and
+                    can't be changed here.
+                </p>
+            </section>
+
+            <section class="panel">
+                <div class="panel-head">
+                    <h2>
+                        Installed addons
+                        <span class="count" id="addon-count">0</span>
+                    </h2>
+                    <div class="head-actions">
+                        <input
+                            type="search"
+                            id="addon-search"
+                            placeholder="Filter…"
+                        />
+                        <button class="ghost" id="health-btn">
+                            Check health
+                        </button>
+                        <button class="ghost" id="refresh-btn">Reload</button>
+                    </div>
+                </div>
+                <p class="muted store" id="store-desc"></p>
+                <ul class="addon-list" id="addon-list"></ul>
+                <p class="empty" id="empty-msg" hidden>
+                    No addons installed yet — import some above.
+                </p>
+            </section>
+        </main>
+
+        <div class="toast" id="toast" hidden></div>
+
+        <script src="/admin/app.js"></script>
+    </body>
+</html>

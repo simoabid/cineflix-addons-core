@@ -1,0 +1,48 @@
+services:
+    addons-core:
+        build: .
+        ports:
+            - '3006:3006'
+        environment:
+            - HOST=0.0.0.0
+            - PORT=3006
+            - NODE_ENV=production
+            - TMDB_API_KEY=${TMDB_API_KEY}
+            - TMDB_CACHE_TTL=86400
+            # In-memory cache is fine for a single instance; switch to redis below
+            # for multi-instance / durable caching.
+            - CACHE_TYPE=memory
+            # Persist installed addons on the mounted volume.
+            - ADDONS_STORE=file
+            - ADDONS_DATA_FILE=/data/addons.json
+            - ADMIN_ENABLED=true
+            # Uncomment to require a token for management/import calls:
+            # - ADMIN_TOKEN=${ADMIN_TOKEN}
+            # Set your public URL when behind a domain / reverse proxy (no trailing slash):
+            # - PUBLIC_URL=${PUBLIC_URL}
+            # Residential egress proxy to avoid datacenter IP blocks on EC2:
+            # - PROXY_URL=${PROXY_URL}
+            # - SCRAPE_PROXY_MODE=all
+            # - SCRAPE_PROXY_STREAM=true
+        volumes:
+            - addons-data:/data
+        restart: unless-stopped
+        networks:
+            - addons-network
+
+    # Optional: enable and set CACHE_TYPE=redis + REDIS_HOST=redis above.
+    # redis:
+    #     image: redis:7-alpine
+    #     restart: unless-stopped
+    #     volumes:
+    #         - redis-data:/data
+    #     networks:
+    #         - addons-network
+
+volumes:
+    addons-data:
+    # redis-data:
+
+networks:
+    addons-network:
+        driver: bridge

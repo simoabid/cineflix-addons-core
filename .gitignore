@@ -1,0 +1,23 @@
+# Dependencies
+node_modules
+
+# Build output
+dist
+
+# Env
+.env
+.env.local
+
+# Runtime persistence (installed addons + settings)
+data/*.json
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Plans
+PRODUCTION_READINESS_PLAN.md
