@@ -20,7 +20,11 @@ export class PremiumizeResolver implements DebridResolver {
         try {
             const res = await scrapeFetch(
                 `${BASE}/account/info?apikey=${encodeURIComponent(this.apiKey)}`,
-                { headers: { Accept: 'application/json' }, viaProxy: false, timeoutMs: 15_000 }
+                {
+                    headers: { Accept: 'application/json' },
+                    viaProxy: false,
+                    timeoutMs: 15_000
+                }
             );
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const data = (await res.json()) as {

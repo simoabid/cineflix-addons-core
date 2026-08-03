@@ -1,0 +1,21 @@
+# CODEOWNERS — example template (NOT effective)
+#
+# This file is intentionally named CODEOWNERS.example. GitHub does not honor
+# it for ownership or required reviews because it is not named CODEOWNERS.
+#
+# Do not enable code ownership until a maintainer supplies approved real
+# GitHub usernames or team handles. This template contains no actual owner
+# rules and no handles. Do not commit this file (or a new CODEOWNERS) with
+# placeholders or invented identities.
+#
+# To make it effective:
+#   1. Decide an owning team or the specific people who must review each area.
+#   2. Replace the <approved-user-or-team> placeholder below with a real,
+#      approved GitHub username or an existing owning team.
+#   3. Rename this file to CODEOWNERS (the exact filename, no extension).
+#   4. Confirm branch-protection rules reference the resulting owners.
+#
+# Placeholder example showing the intended shape only (not an owner rule):
+#   src/                 <approved-user-or-team>
+#   test/                <approved-user-or-team>
+#   package.json         <approved-user-or-team>

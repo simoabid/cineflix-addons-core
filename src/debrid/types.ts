@@ -7,10 +7,7 @@
  */
 
 export type DebridProviderId =
-    | 'none'
-    | 'realdebrid'
-    | 'alldebrid'
-    | 'premiumize';
+    'none' | 'realdebrid' | 'alldebrid' | 'premiumize';
 
 export interface DebridConfig {
     provider: DebridProviderId;

@@ -13,9 +13,7 @@ import {
 import { debridService } from './service.js';
 
 export function isTorrentStream(s: StremioStream): boolean {
-    return (
-        typeof s.infoHash === 'string' && s.infoHash.length > 0 && !s.url
-    );
+    return typeof s.infoHash === 'string' && s.infoHash.length > 0 && !s.url;
 }
 
 /** Cap how many torrents we try per addon so a query stays snappy. */
@@ -29,9 +27,7 @@ export interface TorrentResolveContext {
 }
 
 function torrentLabel(stream: StremioStream): string {
-    const raw = (stream.title || stream.name || '')
-        .replace(/\s+/g, ' ')
-        .trim();
+    const raw = (stream.title || stream.name || '').replace(/\s+/g, ' ').trim();
     return raw.split('\n')[0].slice(0, 70) || 'Torrent';
 }
 

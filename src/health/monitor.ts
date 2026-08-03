@@ -52,7 +52,11 @@ export class HealthMonitor {
         try {
             if (this.opts.autoRefresh) {
                 const r = await this.manager.refresh(providerId);
-                this.manager.setHealth(providerId, r.ok, r.ok ? undefined : r.error);
+                this.manager.setHealth(
+                    providerId,
+                    r.ok,
+                    r.ok ? undefined : r.error
+                );
                 return r.ok;
             }
             await fetchManifest(manifestUrl, 8000);

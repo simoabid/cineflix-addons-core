@@ -73,6 +73,8 @@ export function manifestSupportsType(
     if (!Array.isArray(types) || types.length === 0) return true;
     const stremioType = toStremioType(type);
     return types.some(
-        (t) => t === stremioType || (type === 'tv' && (t === 'tv' || t === 'series'))
+        (t) =>
+            t === stremioType ||
+            (type === 'tv' && (t === 'tv' || t === 'series'))
     );
 }

@@ -81,9 +81,7 @@ export async function aggregateSubtitles(
             error: 'Could not resolve an IMDb id (provide imdbId, or tmdbId with a TMDB key)'
         };
     }
-    const id = isSeries
-        ? `${imdb}:${query.season}:${query.episode}`
-        : imdb;
+    const id = isSeries ? `${imdb}:${query.season}:${query.episode}` : imdb;
 
     const proxy = (url: string) =>
         `${publicUrl}/v1/proxy?data=${encodeURIComponent(

@@ -28,9 +28,12 @@ export function registerImportRoutes(
             if (Array.isArray(body.urls) && body.urls.length) {
                 const results = await importFromUrls(manager, body.urls);
                 const installed = results.filter((r) => r.ok).length;
-                return reply
-                    .code(200)
-                    .send({ ok: true, installed, total: results.length, results });
+                return reply.code(200).send({
+                    ok: true,
+                    installed,
+                    total: results.length,
+                    results
+                });
             }
             if (typeof body.url === 'string' && body.url.trim()) {
                 const result = await importFromUrl(manager, body.url.trim());

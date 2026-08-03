@@ -10,6 +10,8 @@
         "serve": "node dist/server.js",
         "test": "npm run build && node --test test/*.test.js",
         "format": "prettier --write src",
+        "format:check": "prettier --check src",
+        "lint": "eslint src",
         "clean": "npx rimraf dist"
     },
     "dependencies": {
@@ -19,10 +21,14 @@
         "undici": "^6.27.0"
     },
     "devDependencies": {
+        "@eslint/js": "^9.9.1",
         "@types/node": "^22.7.4",
+        "eslint": "^9.9.1",
+        "eslint-config-prettier": "^9.1.0",
         "prettier": "^3.3.3",
         "tsx": "^4.19.1",
-        "typescript": "^5.6.2"
+        "typescript": "^5.6.2",
+        "typescript-eslint": "^8.4.0"
     },
     "engines": {
         "node": ">=20"

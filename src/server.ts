@@ -175,7 +175,9 @@ async function main(): Promise<void> {
         const seasonRaw = q.season ?? q.s;
         const episodeRaw = q.episode ?? q.e;
         const season =
-            seasonRaw != null && seasonRaw !== '' ? Number(seasonRaw) : undefined;
+            seasonRaw != null && seasonRaw !== ''
+                ? Number(seasonRaw)
+                : undefined;
         const episode =
             episodeRaw != null && episodeRaw !== ''
                 ? Number(episodeRaw)
@@ -219,9 +221,7 @@ async function main(): Promise<void> {
     console.log(
         `\n[addons-core] ready → ${publicUrl}` +
             `\n  • Point CINEFLIX serverUrl / VITE_CINEPRO_URL at this base.` +
-            (cfg.adminEnabled
-                ? `\n  • Admin UI: ${publicUrl}/admin`
-                : '') +
+            (cfg.adminEnabled ? `\n  • Admin UI: ${publicUrl}/admin` : '') +
             `\n  • Store: ${manager.describeStore()}\n`
     );
 }
@@ -247,9 +247,7 @@ function registerAdminUi(app: import('fastify').FastifyInstance): void {
         relPath: string,
         reply: import('fastify').FastifyReply
     ): Promise<void> => {
-        const safe = path
-            .normalize(relPath)
-            .replace(/^(\.\.(\/|\\|$))+/, '');
+        const safe = path.normalize(relPath).replace(/^(\.\.(\/|\\|$))+/, '');
         const full = path.join(ADMIN_DIR, safe);
         if (!full.startsWith(ADMIN_DIR)) {
             await reply.code(403).send({ error: 'Forbidden' });
@@ -271,13 +269,10 @@ function registerAdminUi(app: import('fastify').FastifyInstance): void {
     };
 
     app.get('/admin', async (_req, reply) => serveFile('index.html', reply));
-    app.get<{ Params: { '*': string } }>(
-        '/admin/*',
-        async (req, reply) => {
-            const rest = req.params['*'] || 'index.html';
-            return serveFile(rest, reply);
-        }
-    );
+    app.get<{ Params: { '*': string } }>('/admin/*', async (req, reply) => {
+        const rest = req.params['*'] || 'index.html';
+        return serveFile(rest, reply);
+    });
 }
 
 main().catch((err) => {

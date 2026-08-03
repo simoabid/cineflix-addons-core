@@ -5,7 +5,12 @@
  * them from the url + human-readable name/title/description (same heuristics as
  * @omss/framework's built-in StremioService, extended a little).
  */
-import type { Source, SourceType, Subtitle, SubtitleFormat } from '@omss/framework';
+import type {
+    Source,
+    SourceType,
+    Subtitle,
+    SubtitleFormat
+} from '@omss/framework';
 import type { StremioStream, StremioSubtitle } from './protocol.js';
 
 export type ProxyFn = (url: string, headers?: Record<string, string>) => string;
@@ -78,7 +83,9 @@ export function mapStreamsToSources(
         if (!isPlayableStream(stream)) continue;
         const upstream = stream.url as string;
         const reqHeaders = stream.behaviorHints?.proxyHeaders?.request;
-        const proxied = reqHeaders ? proxy(upstream, reqHeaders) : proxy(upstream);
+        const proxied = reqHeaders
+            ? proxy(upstream, reqHeaders)
+            : proxy(upstream);
         const label = streamLabel(stream, providerName);
         sources.push({
             url: proxied,

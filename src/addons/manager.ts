@@ -160,11 +160,7 @@ export class AddonManager {
         });
     }
 
-    setHealth(
-        providerId: string,
-        healthy: boolean,
-        error?: string
-    ): void {
+    setHealth(providerId: string, healthy: boolean, error?: string): void {
         const addon = this.get(providerId);
         if (!addon) return;
         addon.health = {
@@ -224,7 +220,10 @@ export class AddonManager {
         } catch (err) {
             return {
                 ok: false,
-                error: err instanceof Error ? err.message : 'Failed to fetch manifest'
+                error:
+                    err instanceof Error
+                        ? err.message
+                        : 'Failed to fetch manifest'
             };
         }
 

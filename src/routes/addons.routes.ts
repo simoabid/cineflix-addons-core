@@ -62,9 +62,9 @@ export function registerAddonRoutes(
         async (req, reply) => {
             const addon = manager.get(req.params.providerId);
             if (!addon) {
-                return reply
-                    .code(404)
-                    .send({ error: { code: 'NOT_FOUND', message: 'Addon not found' } });
+                return reply.code(404).send({
+                    error: { code: 'NOT_FOUND', message: 'Addon not found' }
+                });
             }
             return reply.code(200).send({
                 ...toPublicAddon(addon),
@@ -79,38 +79,38 @@ export function registerAddonRoutes(
         async (req, reply) => {
             const removed = await manager.remove(req.params.providerId);
             if (!removed) {
-                return reply
-                    .code(404)
-                    .send({ error: { code: 'NOT_FOUND', message: 'Addon not found' } });
+                return reply.code(404).send({
+                    error: { code: 'NOT_FOUND', message: 'Addon not found' }
+                });
             }
-            return reply.code(200).send({ ok: true, removed: req.params.providerId });
+            return reply
+                .code(200)
+                .send({ ok: true, removed: req.params.providerId });
         }
     );
 
     app.patch<{
         Params: { providerId: string };
         Body: { enabled?: boolean; timeoutMs?: number };
-    }>(
-        '/v1/addons/:providerId',
-        { preHandler: guard },
-        async (req, reply) => {
-            const { providerId } = req.params;
-            const body = req.body ?? {};
-            let addon = manager.get(providerId);
-            if (!addon) {
-                return reply
-                    .code(404)
-                    .send({ error: { code: 'NOT_FOUND', message: 'Addon not found' } });
-            }
-            if (typeof body.enabled === 'boolean') {
-                addon = await manager.setEnabled(providerId, body.enabled);
-            }
-            if (typeof body.timeoutMs === 'number') {
-                addon = await manager.setTimeout(providerId, body.timeoutMs);
-            }
-            return reply.code(200).send({ ok: true, addon: addon && toPublicAddon(addon) });
+    }>('/v1/addons/:providerId', { preHandler: guard }, async (req, reply) => {
+        const { providerId } = req.params;
+        const body = req.body ?? {};
+        let addon = manager.get(providerId);
+        if (!addon) {
+            return reply.code(404).send({
+                error: { code: 'NOT_FOUND', message: 'Addon not found' }
+            });
         }
-    );
+        if (typeof body.enabled === 'boolean') {
+            addon = await manager.setEnabled(providerId, body.enabled);
+        }
+        if (typeof body.timeoutMs === 'number') {
+            addon = await manager.setTimeout(providerId, body.timeoutMs);
+        }
+        return reply
+            .code(200)
+            .send({ ok: true, addon: addon && toPublicAddon(addon) });
+    });
 
     app.post<{ Body: { order?: string[] } }>(
         '/v1/addons/reorder',
@@ -170,27 +170,40 @@ export function registerAddonRoutes(
                 provider: body.provider,
                 apiKey: body.apiKey
             });
-            return reply.code(200).send({ ok: true, debrid: debridService.status() });
+            return reply
+                .code(200)
+                .send({ ok: true, debrid: debridService.status() });
         }
     );
 
-    app.post('/v1/settings/debrid/check', { preHandler: guard }, async (_req, reply) => {
-        const result = await debridService.check();
-        return reply.code(result.ok ? 200 : 400).send(result);
-    });
+    app.post(
+        '/v1/settings/debrid/check',
+        { preHandler: guard },
+        async (_req, reply) => {
+            const result = await debridService.check();
+            return reply.code(result.ok ? 200 : 400).send(result);
+        }
+    );
 
     // ── health ───────────────────────────────────────────────────────────────
-    app.post('/v1/addons/health/check', { preHandler: guard }, async (_req, reply) => {
-        if (!monitor) {
-            return reply
-                .code(503)
-                .send({ error: { code: 'UNAVAILABLE', message: 'Health monitor not enabled' } });
+    app.post(
+        '/v1/addons/health/check',
+        { preHandler: guard },
+        async (_req, reply) => {
+            if (!monitor) {
+                return reply.code(503).send({
+                    error: {
+                        code: 'UNAVAILABLE',
+                        message: 'Health monitor not enabled'
+                    }
+                });
+            }
+            const summary = await monitor.checkAll();
+            return reply.code(200).send({
+                ok: true,
+                ...summary,
+                addons: manager.list().map(toPublicAddon)
+            });
         }
-        const summary = await monitor.checkAll();
-        return reply.code(200).send({
-            ok: true,
-            ...summary,
-            addons: manager.list().map(toPublicAddon)
-        });
-    });
+    );
 }

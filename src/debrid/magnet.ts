@@ -107,7 +107,6 @@ export function pickFileIndex(
     }
 
     // Otherwise the largest (video) file.
-    return pool.reduce((best, cur) =>
-        cur.f.size > best.f.size ? cur : best
-    ).i;
+    return pool.reduce((best, cur) => (cur.f.size > best.f.size ? cur : best))
+        .i;
 }

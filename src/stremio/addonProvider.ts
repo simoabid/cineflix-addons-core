@@ -188,7 +188,11 @@ export class StremioAddonProvider extends BaseProvider {
         // Dedicated /subtitles resource if the addon advertises it.
         if (this.supportsSubtitles) {
             try {
-                const subs = await fetchSubtitles(this.BASE_URL, stremioType, id);
+                const subs = await fetchSubtitles(
+                    this.BASE_URL,
+                    stremioType,
+                    id
+                );
                 collected.push(...subs);
             } catch {
                 /* subtitles are best-effort */

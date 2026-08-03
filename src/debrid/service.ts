@@ -25,7 +25,11 @@ const CACHE_MAX = 500;
 
 class DebridService {
     private resolver: DebridResolver | null = null;
-    private config: DebridConfig = { provider: 'none', apiKey: '', source: 'none' };
+    private config: DebridConfig = {
+        provider: 'none',
+        apiKey: '',
+        source: 'none'
+    };
     private cache = new Map<string, CacheEntry>();
 
     configure(config: DebridConfig): void {

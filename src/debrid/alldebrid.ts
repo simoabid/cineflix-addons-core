@@ -40,9 +40,7 @@ export class AllDebridResolver implements DebridResolver {
         if (!res.ok) throw new Error(`AllDebrid ${path} → HTTP ${res.status}`);
         const body = (await res.json()) as AdEnvelope<T>;
         if (body.status !== 'success' || !body.data) {
-            throw new Error(
-                body.error?.message || `AllDebrid ${path} error`
-            );
+            throw new Error(body.error?.message || `AllDebrid ${path} error`);
         }
         return body.data;
     }
@@ -73,7 +71,11 @@ export class AllDebridResolver implements DebridResolver {
 
             const status = await this.ad<{
                 magnets: {
-                    links?: Array<{ link: string; filename: string; size: number }>;
+                    links?: Array<{
+                        link: string;
+                        filename: string;
+                        size: number;
+                    }>;
                 };
             }>('/magnet/status', { id: String(m.id) });
 

@@ -86,7 +86,8 @@ export function loadConfig(): AppConfig {
         tmdbApiKey: envStr('TMDB_API_KEY'),
         tmdbCacheTTL: envNum('TMDB_CACHE_TTL', 86400),
 
-        cacheType: envStr('CACHE_TYPE', 'memory') === 'redis' ? 'redis' : 'memory',
+        cacheType:
+            envStr('CACHE_TYPE', 'memory') === 'redis' ? 'redis' : 'memory',
         redis: {
             host: envStr('REDIS_HOST', 'localhost'),
             port: envNum('REDIS_PORT', 6379),
@@ -114,7 +115,5 @@ export function loadConfig(): AppConfig {
 export function resolvePublicUrl(cfg: AppConfig): string {
     if (cfg.publicUrl) return cfg.publicUrl.replace(/\/$/, '');
     const needsPort = !(cfg.port === 80 || cfg.port === 443);
-    return needsPort
-        ? `http://${cfg.host}:${cfg.port}`
-        : `http://${cfg.host}`;
+    return needsPort ? `http://${cfg.host}:${cfg.port}` : `http://${cfg.host}`;
 }
