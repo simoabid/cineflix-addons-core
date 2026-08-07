@@ -30,7 +30,8 @@ function normalize(data: unknown): AddonStoreData {
         return {
             version: 1,
             addons: d.addons,
-            settings: d.settings ?? defaultSettings()
+            settings: d.settings ?? defaultSettings(),
+            revision: typeof d.revision === 'number' ? d.revision : 0
         };
     }
     return emptyStoreData();
