@@ -2,7 +2,11 @@ import { OMSSServer } from '@omss/framework';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
-import { loadConfig, resolvePublicUrl } from './config.js';
+import {
+    loadConfig,
+    resolvePublicUrl,
+    assertProductionSafe
+} from './config.js';
 import { AddonManager } from './addons/manager.js';
 import {
     buildProgressiveMedia,
@@ -13,8 +17,24 @@ import { aggregateSubtitles } from './subtitles/index.js';
 import { HealthMonitor } from './health/monitor.js';
 import { registerAddonRoutes } from './routes/addons.routes.js';
 import { registerImportRoutes } from './routes/import.routes.js';
+import { registerAuthRoutes } from './routes/auth.js';
 import { logScrapeProxyStatus } from './egress/scrapeFetch.js';
 import { installStreamEgress } from './egress/globalDispatcher.js';
+import {
+    assertCorsSafe,
+    registerHttpSecurity,
+    applySecurityHeaders,
+    createAuditLogger,
+    createSecureProxyContext,
+    registerSecureProxyRoutes,
+    toSafeError
+} from './security/index.js';
+import {
+    createRateLimiter as createScrapeRateLimiter,
+    RATE_LIMITS as SCRAPE_RATE_LIMITS,
+    rateLimitKey as scrapeRateLimitKey
+} from './security/rateLimit.js';
+import { getRateLimitIp } from './security/auth.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -40,10 +60,41 @@ async function main(): Promise<void> {
         process.exit(1);
     }
 
-    // Route stream egress (framework /v1/proxy fetches) through the proxy when set.
+    // Fail closed on unsafe production (and some non-prod) combinations.
+    try {
+        assertProductionSafe(cfg);
+        assertCorsSafe(cfg);
+    } catch (err) {
+        console.error(
+            '\n[fatal] ' +
+                (err instanceof Error ? err.message : String(err)) +
+                '\n'
+        );
+        process.exit(1);
+    }
+
+    // Effective secure-proxy flag: on by default; legacy only when explicitly allowed.
+    if (cfg.allowLegacyProxy && cfg.nodeEnv === 'production') {
+        console.error(
+            '\n[fatal] ALLOW_LEGACY_PROXY is forbidden in production.\n'
+        );
+        process.exit(1);
+    }
+
     installStreamEgress();
 
     const publicUrl = resolvePublicUrl(cfg);
+    const audit = createAuditLogger({
+        filePath: cfg.auditLogFile,
+        enabled: cfg.auditEnabled
+    });
+
+    const corsOrigin = cfg.corsOrigin.includes(',')
+        ? cfg.corsOrigin
+              .split(',')
+              .map((s) => s.trim())
+              .filter(Boolean)
+        : cfg.corsOrigin;
 
     const server = new OMSSServer({
         name: cfg.name,
@@ -63,15 +114,30 @@ async function main(): Promise<void> {
         tmdb: { apiKey: cfg.tmdbApiKey, cacheTTL: cfg.tmdbCacheTTL },
         proxyConfig: {
             knownThirdPartyProxies: {},
-            // Segment/binary types stream; keep .m3u8/.mpd buffered so the
-            // framework rewrites their inner URLs through /v1/proxy.
             streamPatterns: [/\.ts(\?|$)/i, /\.m4s(\?|$)/i]
         },
         cors: {
-            origin: cfg.corsOrigin,
+            origin: corsOrigin,
             methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'],
-            allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-token'],
-            exposedHeaders: ['Content-Range', 'Accept-Ranges', 'ETag'],
+            allowedHeaders: [
+                'Content-Type',
+                'Authorization',
+                'x-admin-token',
+                'x-request-id',
+                'x-forwarded-user',
+                'x-forwarded-role',
+                'x-csrf-token',
+                'X-CSRF-Token'
+            ],
+            exposedHeaders: [
+                'Content-Range',
+                'Accept-Ranges',
+                'ETag',
+                'X-Request-Id',
+                'X-RateLimit-Limit',
+                'X-RateLimit-Remaining',
+                'Retry-After'
+            ],
             optionsSuccessStatus: 204
         },
         stremio: {
@@ -85,6 +151,12 @@ async function main(): Promise<void> {
     const manager = AddonManager.create(registry, cfg);
     await manager.init();
 
+    const proxyCtx = createSecureProxyContext(cfg);
+    // Wire grants into providers so sources use /v1/proxy/grant/:id.
+    if (cfg.secureProxy) {
+        manager.setPlaybackGrants(proxyCtx.grants, publicUrl);
+    }
+
     const monitor = new HealthMonitor(manager, {
         intervalMinutes: cfg.healthIntervalMinutes,
         autoRefresh: cfg.autoRefresh
@@ -92,15 +164,89 @@ async function main(): Promise<void> {
 
     const app = server.getInstance();
 
+    // Redact raw request URLs for the framework logger (P1): grant/token URLs contain bearer tokens
+    // Mutate request.url before the logger's finish handler captures it; restore after.
+    const origUrls = new WeakMap<import('fastify').FastifyRequest, string>();
+    app.addHook('onRequest', async (request) => {
+        const url = request.url ?? '';
+        if (
+            url.startsWith('/v1/proxy/grant/') ||
+            url.startsWith('/v1/proxy/token/')
+        ) {
+            origUrls.set(request, url);
+            const redacted = url.startsWith('/v1/proxy/grant/')
+                ? '/v1/proxy/grant/[REDACTED]'
+                : '/v1/proxy/token/[REDACTED]';
+            // Fastify's request.url is mutable via raw
+            (request as unknown as { url: string }).url = redacted;
+            if ((request as unknown as { raw: { url?: string } }).raw) {
+                (request as unknown as { raw: { url: string } }).raw.url =
+                    redacted;
+            }
+        }
+    });
+    app.addHook('onResponse', async (request) => {
+        const orig = origUrls.get(request);
+        if (orig) {
+            (request as unknown as { url: string }).url = orig;
+            if ((request as unknown as { raw: { url?: string } }).raw) {
+                (request as unknown as { raw: { url: string } }).raw.url = orig;
+            }
+        }
+    });
+    // The above hooks ensure grant URLs are redacted before the framework logger reads them.
+
+    // Global HTTP security (headers, cookies, safe errors, query length).
+    registerHttpSecurity(app, cfg);
+
+    // Secure playback grant routes + legacy open-proxy block.
+    registerSecureProxyRoutes(app, cfg, proxyCtx, publicUrl);
+
+    // ── Auth session endpoints ────────────────────────────────────────────────
+    registerAuthRoutes(app, cfg, audit);
+
     // ── Provider list (frontend waterfall order) ──────────────────────────────
     app.get('/v1/providers', async (_req, reply) => {
         return reply.code(200).send(listProvidersWithPriority(manager));
     });
 
     // ── Progressive single-addon scrape ───────────────────────────────────────
+    const scrapeLimiter = {
+        lim: createScrapeRateLimiter(),
+        RATE_LIMITS: SCRAPE_RATE_LIMITS,
+        rateLimitKey: scrapeRateLimitKey
+    };
+    async function checkScrapeRateLimit(
+        request: import('fastify').FastifyRequest,
+        reply: import('fastify').FastifyReply
+    ): Promise<boolean> {
+        const ip = getRateLimitIp(request, cfg);
+        const key = scrapeLimiter.rateLimitKey(
+            'scrape' as string,
+            undefined,
+            ip
+        );
+        // Use a dedicated bucket for progressive scraping: 30/min per IP, concurrency via limiter
+        const res = scrapeLimiter.lim.take(key, 30, 60_000);
+        reply.header('X-RateLimit-Limit', String(res.limit));
+        reply.header('X-RateLimit-Remaining', String(res.remaining));
+        if (!res.allowed) {
+            reply.header('Retry-After', String(res.retryAfterSec));
+            await reply.code(429).send({
+                error: {
+                    code: 'RATE_LIMITED',
+                    message: 'Too many scraping requests'
+                }
+            });
+            return false;
+        }
+        return true;
+    }
+
     app.get<{ Params: { tmdbId: string; providerId: string } }>(
         '/v1/movies/:tmdbId/providers/:providerId',
         async (request, reply) => {
+            if (!(await checkScrapeRateLimit(request, reply))) return;
             const { tmdbId, providerId } = request.params;
             try {
                 const media = await buildProgressiveMedia('movie', tmdbId);
@@ -127,6 +273,7 @@ async function main(): Promise<void> {
     }>(
         '/v1/tv/:tmdbId/seasons/:season/episodes/:episode/providers/:providerId',
         async (request, reply) => {
+            if (!(await checkScrapeRateLimit(request, reply))) return;
             const { tmdbId, season, episode, providerId } = request.params;
             const s = Number(season);
             const e = Number(episode);
@@ -166,6 +313,7 @@ async function main(): Promise<void> {
             language?: string;
         };
     }>('/v1/subtitles', async (request, reply) => {
+        if (!(await checkScrapeRateLimit(request, reply))) return;
         const q = request.query;
         const id = (q.id || '').trim();
         const imdbId = (q.imdbId || (id.startsWith('tt') ? id : '')).trim();
@@ -190,13 +338,23 @@ async function main(): Promise<void> {
             });
         }
 
-        const result = await aggregateSubtitles(manager, publicUrl, {
-            imdbId: imdbId || undefined,
-            tmdbId: tmdbId || undefined,
-            season: Number.isFinite(season as number) ? season : undefined,
-            episode: Number.isFinite(episode as number) ? episode : undefined,
-            language: q.language
-        });
+        const result = await aggregateSubtitles(
+            manager,
+            publicUrl,
+            {
+                imdbId: imdbId || undefined,
+                tmdbId: tmdbId || undefined,
+                season: Number.isFinite(season as number) ? season : undefined,
+                episode: Number.isFinite(episode as number)
+                    ? episode
+                    : undefined,
+                language: q.language
+            },
+            {
+                grants: cfg.secureProxy ? proxyCtx.grants : undefined,
+                secureProxy: cfg.secureProxy
+            }
+        );
         return reply.code(200).send({
             subtitles: result.subtitles,
             source: 'stremio-addons',
@@ -206,20 +364,27 @@ async function main(): Promise<void> {
     });
 
     // ── Management + import API ────────────────────────────────────────────────
-    registerAddonRoutes(app, manager, cfg, monitor);
-    registerImportRoutes(app, manager, cfg);
+    registerAddonRoutes(app, manager, cfg, monitor, audit);
+    registerImportRoutes(app, manager, cfg, audit);
 
     // ── Admin UI (static) ──────────────────────────────────────────────────────
     if (cfg.adminEnabled) {
-        registerAdminUi(app);
+        registerAdminUi(app, cfg);
     }
 
     await server.start();
 
     logScrapeProxyStatus();
     monitor.start();
+
+    const authSummary =
+        cfg.authMode === 'disabled'
+            ? 'AUTH_MODE=disabled (local only)'
+            : `AUTH_MODE=${cfg.authMode}`;
     console.log(
         `\n[addons-core] ready → ${publicUrl}` +
+            `\n  • ${authSummary}` +
+            `\n  • secureProxy=${cfg.secureProxy} legacyProxy=${cfg.allowLegacyProxy}` +
             `\n  • Point CINEFLIX serverUrl / VITE_CINEPRO_URL at this base.` +
             (cfg.adminEnabled ? `\n  • Admin UI: ${publicUrl}/admin` : '') +
             `\n  • Store: ${manager.describeStore()}\n`
@@ -231,18 +396,27 @@ function sendProviderError(
     err: unknown
 ) {
     const status = (err as Error & { statusCode?: number }).statusCode ?? 500;
-    const message = err instanceof Error ? err.message : 'Unknown error';
-    return reply.code(status).send({
+    const safe = toSafeError(err, status);
+    const message = safe.body.error.message;
+    return reply.code(safe.status).send({
         sources: [],
         subtitles: [],
         diagnostics: [
-            { code: 'PROVIDER_ERROR', message, field: '', severity: 'error' }
+            {
+                code: safe.body.error.code,
+                message,
+                field: '',
+                severity: 'error'
+            }
         ],
         error: message
     });
 }
 
-function registerAdminUi(app: import('fastify').FastifyInstance): void {
+function registerAdminUi(
+    app: import('fastify').FastifyInstance,
+    cfg: import('./config.js').AppConfig
+): void {
     const serveFile = async (
         relPath: string,
         reply: import('fastify').FastifyReply
@@ -256,6 +430,7 @@ function registerAdminUi(app: import('fastify').FastifyInstance): void {
         try {
             const data = await fs.readFile(full);
             const ext = path.extname(full).toLowerCase();
+            applySecurityHeaders(reply, cfg, { adminUi: true });
             await reply
                 .header(
                     'Content-Type',
