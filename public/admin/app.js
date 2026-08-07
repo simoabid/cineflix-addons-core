@@ -1,17 +1,29 @@
 'use strict';
 
-// ── admin token (only needed when the server sets ADMIN_TOKEN) ────────────────
-const TOKEN_KEY = 'addons-core.adminToken';
-let adminToken = localStorage.getItem(TOKEN_KEY) || '';
+// Session auth: login exchanges the admin token for an HttpOnly cookie.
+// We keep an in-memory token only long enough to call /v1/auth/login — it is
+// never written to localStorage (phase 1 security requirement).
+let pendingToken = '';
+let csrfToken = '';
+let authed = false;
+
+function getCsrfFromCookie() {
+    const m = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/);
+    return m ? decodeURIComponent(m[1]) : '';
+}
 
 function authHeaders(extra) {
     const h = Object.assign({ Accept: 'application/json' }, extra || {});
-    if (adminToken) h['x-admin-token'] = adminToken;
+    // Prefer cookie session; fall back to header only during first login.
+    if (pendingToken) h['x-admin-token'] = pendingToken;
+    // CSRF double-submit: send cookie value as header for state-changing requests
+    const csrf = csrfToken || getCsrfFromCookie();
+    if (csrf) h['x-csrf-token'] = csrf;
     return h;
 }
 
 async function api(path, options) {
-    const opts = Object.assign({}, options);
+    const opts = Object.assign({ credentials: 'same-origin' }, options);
     opts.headers = authHeaders(opts.headers);
     const res = await fetch(path, opts);
     let body = null;
@@ -21,14 +33,61 @@ async function api(path, options) {
         /* ignore */
     }
     if (res.status === 401) {
+        authed = false;
         document.getElementById('token-panel').hidden = false;
-        throw new Error('Admin token required');
+        throw new Error('Admin authentication required');
     }
     if (!res.ok) {
         const msg = (body && (body.error?.message || body.error)) || `HTTP ${res.status}`;
         throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
     }
     return body;
+}
+
+async function ensureSession() {
+    try {
+        const me = await api('/v1/auth/me');
+        authed = true;
+        document.getElementById('token-panel').hidden = true;
+        // Fetch CSRF token for subsequent mutations if not already in cookie
+        try {
+            const csrf = getCsrfFromCookie();
+            if (!csrf) {
+                const r = await api('/v1/auth/csrf');
+                if (r && r.csrfToken) csrfToken = r.csrfToken;
+            } else {
+                csrfToken = csrf;
+            }
+        } catch (_) {
+            /* ignore */
+        }
+        return me;
+    } catch (_) {
+        document.getElementById('token-panel').hidden = false;
+        return null;
+    }
+}
+
+async function loginWithToken(token) {
+    pendingToken = token;
+    try {
+        const body = await api('/v1/auth/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token })
+        });
+        // Store CSRF token returned by login (also set as cookie)
+        if (body && body.csrfToken) csrfToken = body.csrfToken;
+        else csrfToken = getCsrfFromCookie();
+        // Drop the raw token from memory once the HttpOnly cookie is set.
+        pendingToken = '';
+        authed = true;
+        document.getElementById('token-panel').hidden = true;
+        return body;
+    } catch (err) {
+        pendingToken = '';
+        throw err;
+    }
 }
 
 // ── toast ─────────────────────────────────────────────────────────────────────
@@ -400,13 +459,22 @@ function wireImports() {
         .getElementById('debrid-test')
         .addEventListener('click', (e) => testDebrid(e.target));
 
-    document.getElementById('token-save').addEventListener('click', () => {
-        adminToken = document.getElementById('token-input').value.trim();
-        localStorage.setItem(TOKEN_KEY, adminToken);
-        document.getElementById('token-panel').hidden = true;
-        toast('Token saved', 'ok');
-        loadAddons();
-        loadSettings();
+    document.getElementById('token-save').addEventListener('click', async () => {
+        const token = document.getElementById('token-input').value.trim();
+        if (!token) {
+            toast('Enter the admin token', 'err');
+            return;
+        }
+        try {
+            await loginWithToken(token);
+            // Clear the password field so the token does not linger in the DOM.
+            document.getElementById('token-input').value = '';
+            toast('Signed in (session cookie)', 'ok');
+            loadAddons();
+            loadSettings();
+        } catch (err) {
+            toast(err.message || 'Login failed', 'err');
+        }
     });
 }
 
@@ -427,6 +495,8 @@ function escapeAttr(s) {
 // ── init ──────────────────────────────────────────────────────────────────────
 wireImports();
 checkHealth();
-loadAddons();
-loadSettings();
+ensureSession().then(() => {
+    loadAddons();
+    loadSettings();
+});
 setInterval(checkHealth, 30000);
