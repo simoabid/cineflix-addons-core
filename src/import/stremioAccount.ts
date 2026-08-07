@@ -11,7 +11,8 @@
  *
  * The Stremio API is never IP-blocked, so these calls bypass the egress proxy.
  */
-import { scrapeFetch } from '../egress/scrapeFetch.js';
+import { secureFetch } from '../security/secureFetch.js';
+import { validateOutboundUrl, UrlPolicyError } from '../security/urlPolicy.js';
 import type { AddonManager, InstallResult } from '../addons/manager.js';
 
 const DEFAULT_ENDPOINT = 'https://api.strem.io';
@@ -21,20 +22,52 @@ interface StremioApiError {
     message?: string;
 }
 
+function endpointPolicy() {
+    // Stremio endpoint policy: HTTPS-only in production, strict host check
+    const isProd = process.env.NODE_ENV === 'production';
+    return {
+        allowHttp: !isProd,
+        hostAllowlist: undefined,
+        allowHostSuffixes: undefined,
+        maxLength: 2048
+    };
+}
+
+async function validateEndpoint(endpoint: string): Promise<void> {
+    const u = new URL(endpoint);
+    if (process.env.NODE_ENV === 'production' && u.protocol !== 'https:') {
+        throw new UrlPolicyError(
+            'BLOCKED_PROTOCOL',
+            'Custom Stremio endpoint must use https in production'
+        );
+    }
+    const policy = endpointPolicy();
+    // Validate hostname resolves to public IP (DNS check)
+    await validateOutboundUrl(endpoint, policy);
+}
+
 async function apiRequest<T = Record<string, unknown>>(
     method: string,
     params: Record<string, unknown>,
     authKey: string | null,
     endpoint = DEFAULT_ENDPOINT
 ): Promise<T> {
+    await validateEndpoint(endpoint);
     const url = `${endpoint.replace(/\/$/, '')}/api/${method}`;
-    const res = await scrapeFetch(url, {
+    // Validate the full API URL before sending credentials
+    await validateOutboundUrl(url, {
+        ...endpointPolicy()
+        // For the API request, enforce the same policy but with DNS check
+    });
+    const res = await secureFetch(url, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ authKey, ...params }),
-        viaProxy: false,
-        timeoutMs: 15_000
-    });
+        timeoutMs: 15_000,
+        maxBytes: 1_048_576,
+        maxRedirects: 0,
+        policy: endpointPolicy()
+    }).then((r) => r.response);
     if (!res.ok) {
         throw new Error(`Stremio API '${method}' failed: HTTP ${res.status}`);
     }
@@ -132,11 +165,17 @@ export async function importFromStremioAccount(
     const results = await manager.installMany(urls, 'stremio-account');
 
     const installed = results.filter((r) => r.ok).length;
+    // Collection may contain sensitive URLs; return redacted form only
+    const { redactUrl } = await import('../security/redaction.js');
+    const safeCollection = collection.map((c) => ({
+        transportUrl: redactUrl(c.transportUrl),
+        name: c.name
+    }));
     return {
         installed,
         failed: results.length - installed,
         total: results.length,
         results,
-        collection
+        collection: safeCollection
     };
 }
