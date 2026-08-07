@@ -16,6 +16,7 @@ import type {
 import { fetchSubtitles } from '../stremio/client.js';
 import { mapSubtitles } from '../stremio/mapper.js';
 import { normalizeImdb } from '../stremio/ids.js';
+import type { PlaybackGrantStore } from '../security/playbackGrant.js';
 
 function hasSubtitleResource(manifest: StremioManifest): boolean {
     const resources = manifest.resources;
@@ -64,10 +65,17 @@ export interface SubtitleAggregateResult {
     error?: string;
 }
 
+export interface SubtitleAggregateOptions {
+    /** When set, issue short-lived playback grants instead of legacy proxy URLs. */
+    grants?: PlaybackGrantStore;
+    secureProxy?: boolean;
+}
+
 export async function aggregateSubtitles(
     manager: AddonManager,
     publicUrl: string,
-    query: SubtitleQuery
+    query: SubtitleQuery,
+    options: SubtitleAggregateOptions = {}
 ): Promise<SubtitleAggregateResult> {
     const isSeries = query.season != null && query.episode != null;
     const type: 'movie' | 'tv' = isSeries ? 'tv' : 'movie';
@@ -83,23 +91,23 @@ export async function aggregateSubtitles(
     }
     const id = isSeries ? `${imdb}:${query.season}:${query.episode}` : imdb;
 
-    const proxy = (url: string) =>
-        `${publicUrl}/v1/proxy?data=${encodeURIComponent(
-            JSON.stringify({ url })
-        )}`;
-
     const capable = manager
         .list()
         .filter((a) => a.enabled && hasSubtitleResource(a.manifest));
 
     const collected: StremioSubtitle[] = [];
+    const urlPolicy = manager.urlPolicy();
     await Promise.all(
         capable.map(async (addon) => {
             try {
                 const subs = await fetchSubtitles(
                     addon.baseUrl,
                     stremioType,
-                    id
+                    id,
+                    12_000,
+                    {
+                        policy: urlPolicy
+                    }
                 );
                 collected.push(...subs);
             } catch {
@@ -108,7 +116,39 @@ export async function aggregateSubtitles(
         })
     );
 
-    let subtitles = mapSubtitles(collected, proxy);
+    const base = publicUrl.replace(/\/$/, '');
+    const useGrants = options.secureProxy !== false && options.grants;
+
+    // Issue grants per unique subtitle URL when secure proxy is on.
+    const out: Subtitle[] = [];
+    const seen = new Set<string>();
+    for (const s of collected) {
+        if (!s?.url || !/^https?:\/\//i.test(s.url)) continue;
+        if (seen.has(s.url)) continue;
+        seen.add(s.url);
+
+        let proxied: string;
+        if (useGrants && options.grants) {
+            try {
+                const grant = await options.grants.issue({
+                    url: s.url,
+                    providerId: 'subtitles'
+                });
+                proxied = options.grants.toProxyUrl(grant, base);
+            } catch {
+                continue;
+            }
+        } else {
+            // Legacy path only when secure proxy is explicitly off.
+            proxied = `${base}/v1/proxy?data=${encodeURIComponent(
+                JSON.stringify({ url: s.url })
+            )}`;
+        }
+        const mapped = mapSubtitles([s], () => proxied);
+        out.push(...mapped);
+    }
+
+    let subtitles = out;
     if (query.language) {
         const lang = query.language.toLowerCase();
         const filtered = subtitles.filter((s) =>

@@ -21,6 +21,7 @@
  */
 import {
     ProxyAgent,
+    Agent,
     fetch as undiciFetch,
     type RequestInit as UndiciRequestInit
 } from 'undici';
@@ -32,6 +33,8 @@ export type ScrapeFetchInit = RequestInit & {
     viaProxy?: boolean | 'auto';
     /** Abort after this many ms (sets signal if none provided). */
     timeoutMs?: number;
+    /** Pin DNS to validated address to prevent rebinding (SSRF defense). */
+    pinnedIp?: string;
 };
 
 /** Control-plane hosts that are never IP-blocked — keep them off the proxy. */
@@ -215,11 +218,28 @@ function normalizeHeaders(
  * Fetch that optionally routes through the scrape egress proxy.
  * Drop-in replacement for global `fetch` in addon HTTP calls.
  */
+function createPinnedDispatcher(pinnedIp: string): Agent {
+    // Pin DNS: override lookup to return the validated address regardless of
+    // current DNS state (mitigates rebinding).
+    const isV6 = pinnedIp.includes(':');
+    return new Agent({
+        connect: {
+            lookup: (
+                _hostname: string,
+                _opts: unknown,
+                cb: (err: Error | null, address: string, family: number) => void
+            ) => {
+                cb(null, pinnedIp, isV6 ? 6 : 4);
+            }
+        }
+    });
+}
+
 export async function scrapeFetch(
     input: string | URL | Request,
     init: ScrapeFetchInit = {}
 ): Promise<Response> {
-    const { viaProxy = 'auto', timeoutMs, ...rest } = init;
+    const { viaProxy = 'auto', timeoutMs, pinnedIp, ...rest } = init;
 
     let urlStr: string;
     if (typeof input === 'string') urlStr = input;
@@ -238,6 +258,29 @@ export async function scrapeFetch(
     const headers = normalizeHeaders(rest.headers);
 
     try {
+        // DNS-pinned requests MUST bypass the egress proxy: the proxy would
+        // resolve the hostname itself, ignoring the validated IP and re-introducing
+        // SSRF/DNS-rebinding. When pinnedIp is set, use the pinned dispatcher directly.
+        if (pinnedIp) {
+            const pinnedDispatcher = createPinnedDispatcher(pinnedIp);
+            try {
+                const undiciInit: UndiciRequestInit = {
+                    method: rest.method,
+                    headers,
+                    body: rest.body as UndiciRequestInit['body'],
+                    signal: signal as UndiciRequestInit['signal'],
+                    redirect: rest.redirect,
+                    dispatcher: pinnedDispatcher
+                };
+                return (await undiciFetch(
+                    urlStr,
+                    undiciInit
+                )) as unknown as Response;
+            } finally {
+                void pinnedDispatcher.close?.().catch(() => undefined);
+            }
+        }
+
         if (useProxy) {
             const dispatcher = getAgent();
             if (dispatcher) {

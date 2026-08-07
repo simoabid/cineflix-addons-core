@@ -26,6 +26,12 @@ export interface TorrentResolveContext {
     title?: string;
 }
 
+/** Sync or async proxy URL builder (grants are async). */
+export type AsyncProxyFn = (
+    url: string,
+    headers?: Record<string, string>
+) => string | Promise<string>;
+
 function torrentLabel(stream: StremioStream): string {
     const raw = (stream.title || stream.name || '').replace(/\s+/g, ' ').trim();
     return raw.split('\n')[0].slice(0, 70) || 'Torrent';
@@ -35,7 +41,7 @@ export async function resolveTorrentStreams(
     streams: StremioStream[],
     providerId: string,
     providerName: string,
-    proxy: ProxyFn,
+    proxy: ProxyFn | AsyncProxyFn,
     ctx: TorrentResolveContext
 ): Promise<Source[]> {
     if (!debridService.isEnabled()) return [];
@@ -60,9 +66,11 @@ export async function resolveTorrentStreams(
                         title: ctx.title
                     });
                     if (!url) return null;
+                    const proxied = await Promise.resolve(proxy(url));
+                    if (!proxied) return null;
                     const label = torrentLabel(stream);
                     const source: Source = {
-                        url: proxy(url),
+                        url: proxied,
                         type: inferTypeFromUrl(url) ?? 'mp4',
                         quality: inferQuality(stream),
                         audioTracks: [{ language: 'und', label }],

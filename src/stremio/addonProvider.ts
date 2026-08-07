@@ -3,6 +3,10 @@
  * `BaseProvider`. One instance is registered per enabled addon, so each addon
  * shows up individually in `/v1/providers` and the frontend waterfall can query
  * them one-by-one (best → worst).
+ *
+ * When a PlaybackGrantStore is wired, source/subtitle URLs are issued as
+ * short-lived `/v1/proxy/grant/:id` links instead of the legacy open
+ * `/v1/proxy?data=` payloads.
  */
 import { BaseProvider } from '@omss/framework';
 import type {
@@ -15,8 +19,9 @@ import type {
 import type { StremioManifest, StremioResource } from './protocol.js';
 import { fetchStreams, fetchSubtitles } from './client.js';
 import { buildIdCandidates, toStremioType } from './ids.js';
-import { mapStreamsToSources, mapSubtitles } from './mapper.js';
+import { mapStreamsToSources, mapSubtitles, type ProxyFn } from './mapper.js';
 import { resolveTorrentStreams } from '../debrid/torrentSources.js';
+import type { PlaybackGrantStore } from '../security/playbackGrant.js';
 
 function hasResource(manifest: StremioManifest, name: string): boolean {
     const resources = manifest.resources;
@@ -56,6 +61,13 @@ export class StremioAddonProvider extends BaseProvider {
     private readonly manifest: StremioManifest;
     private readonly supportsSubtitles: boolean;
     private readonly streamTimeoutMs: number;
+    private readonly grants?: PlaybackGrantStore;
+    private readonly publicBase?: string;
+    private readonly secureProxy: boolean;
+    private readonly urlPolicy?: import('../security/urlPolicy.js').UrlPolicyOptions;
+
+    /** Cache of last issued grant URLs so async grant issue can be sync-shaped. */
+    private pendingProxy: ProxyFn;
 
     constructor(opts: {
         providerId: string;
@@ -64,6 +76,10 @@ export class StremioAddonProvider extends BaseProvider {
         manifest: StremioManifest;
         enabled?: boolean;
         streamTimeoutMs?: number;
+        grants?: PlaybackGrantStore;
+        publicBase?: string;
+        secureProxy?: boolean;
+        urlPolicy?: import('../security/urlPolicy.js').UrlPolicyOptions;
     }) {
         super();
         this.id = opts.providerId;
@@ -73,8 +89,27 @@ export class StremioAddonProvider extends BaseProvider {
         this.manifest = opts.manifest;
         this.supportsSubtitles = hasResource(opts.manifest, 'subtitles');
         this.streamTimeoutMs = opts.streamTimeoutMs ?? 20_000;
+        this.grants = opts.grants;
+        this.publicBase = opts.publicBase;
+        this.secureProxy = opts.secureProxy !== false;
+        this.urlPolicy = opts.urlPolicy;
         this.capabilities = {
             supportedContentTypes: deriveCapabilities(opts.manifest)
+        };
+
+        // Default: fall back to framework createProxyUrl (legacy) only when
+        // secure proxy is explicitly off. Otherwise callers must use the
+        // async grant path via buildProxyFn().
+        this.pendingProxy = (url: string, headers?: Record<string, string>) => {
+            if (!this.secureProxy || !this.grants || !this.publicBase) {
+                return headers
+                    ? this.createProxyUrl(url, headers)
+                    : this.createProxyUrl(url);
+            }
+            // Synchronous fallback should not be reached when using
+            // resolveWithGrants; return a deliberate error URL rather than
+            // an open proxy payload.
+            return `${this.publicBase}/v1/proxy/grant/pending`;
         };
     }
 
@@ -84,6 +119,35 @@ export class StremioAddonProvider extends BaseProvider {
 
     async getTVSources(media: ProviderMediaObject): Promise<ProviderResult> {
         return this.resolve(media);
+    }
+
+    /**
+     * Build a ProxyFn that issues real grants. Because mapStreamsToSources is
+     * synchronous, we pre-issue grants for known URLs, or use a queue that
+     * the async resolve path drains by mapping in two passes.
+     */
+    private async proxyUrl(
+        url: string,
+        headers?: Record<string, string>
+    ): Promise<string> {
+        if (!this.secureProxy || !this.grants || !this.publicBase) {
+            return headers
+                ? this.createProxyUrl(url, headers)
+                : this.createProxyUrl(url);
+        }
+        try {
+            const grant = await this.grants.issue({
+                url,
+                headers,
+                providerId: this.id
+            });
+            return this.grants.toProxyUrl(grant, this.publicBase);
+        } catch {
+            // Policy rejection — omit the source by returning empty; mapper
+            // still emits it, so better to fall through without a usable URL.
+            // Callers filter empty.
+            return '';
+        }
     }
 
     private async resolve(media: ProviderMediaObject): Promise<ProviderResult> {
@@ -97,10 +161,6 @@ export class StremioAddonProvider extends BaseProvider {
         }
 
         const diagnostics: Diagnostic[] = [];
-        const proxy = (url: string, headers?: Record<string, string>) =>
-            headers
-                ? this.createProxyUrl(url, headers)
-                : this.createProxyUrl(url);
 
         for (const id of candidates) {
             try {
@@ -108,21 +168,36 @@ export class StremioAddonProvider extends BaseProvider {
                     this.BASE_URL,
                     stremioType,
                     id,
-                    this.streamTimeoutMs
+                    this.streamTimeoutMs,
+                    { policy: this.urlPolicy }
                 );
                 if (!streams.length) continue;
 
-                const httpSources = mapStreamsToSources(
-                    streams,
-                    this.id,
-                    this.name,
-                    proxy
-                );
+                // Async-aware mapping: issue grants per stream.
+                const httpSources = [];
+                for (const stream of streams) {
+                    if (!stream.url || !/^https?:\/\//i.test(stream.url))
+                        continue;
+                    const reqHeaders =
+                        stream.behaviorHints?.proxyHeaders?.request;
+                    const proxied = await this.proxyUrl(stream.url, reqHeaders);
+                    if (!proxied) continue;
+                    // Reuse mapper heuristics via a one-shot proxy fn.
+                    const one: ProxyFn = () => proxied;
+                    const mapped = mapStreamsToSources(
+                        [stream],
+                        this.id,
+                        this.name,
+                        one
+                    );
+                    httpSources.push(...mapped);
+                }
+
                 const torrentSources = await resolveTorrentStreams(
                     streams,
                     this.id,
                     this.name,
-                    proxy,
+                    async (url, headers) => this.proxyUrl(url, headers),
                     {
                         season: media.type === 'tv' ? media.s : undefined,
                         episode: media.type === 'tv' ? media.e : undefined,
@@ -134,13 +209,10 @@ export class StremioAddonProvider extends BaseProvider {
                 const subtitles = await this.collectSubtitles(
                     streams,
                     stremioType,
-                    id,
-                    proxy
+                    id
                 );
 
                 if (sources.length === 0) {
-                    // Streams existed but none were playable (uncached torrents,
-                    // external players, …) and debrid resolved nothing.
                     diagnostics.push({
                         code: 'PROVIDER_ERROR',
                         message: `${this.name}: ${streams.length} stream(s) but none playable (torrent/external; enable debrid to unlock torrents)`,
@@ -175,23 +247,22 @@ export class StremioAddonProvider extends BaseProvider {
     private async collectSubtitles(
         streams: import('./protocol.js').StremioStream[],
         stremioType: string,
-        id: string,
-        proxy: (url: string, headers?: Record<string, string>) => string
+        id: string
     ): Promise<Subtitle[]> {
         const collected: import('./protocol.js').StremioSubtitle[] = [];
 
-        // Subtitles embedded on the streams themselves.
         for (const s of streams) {
             if (Array.isArray(s.subtitles)) collected.push(...s.subtitles);
         }
 
-        // Dedicated /subtitles resource if the addon advertises it.
         if (this.supportsSubtitles) {
             try {
                 const subs = await fetchSubtitles(
                     this.BASE_URL,
                     stremioType,
-                    id
+                    id,
+                    12_000,
+                    { policy: this.urlPolicy }
                 );
                 collected.push(...subs);
             } catch {
@@ -199,7 +270,19 @@ export class StremioAddonProvider extends BaseProvider {
             }
         }
 
-        return mapSubtitles(collected, proxy);
+        // Issue grants per subtitle URL.
+        const out: Subtitle[] = [];
+        const seen = new Set<string>();
+        for (const s of collected) {
+            if (!s?.url || !/^https?:\/\//i.test(s.url)) continue;
+            if (seen.has(s.url)) continue;
+            seen.add(s.url);
+            const proxied = await this.proxyUrl(s.url);
+            if (!proxied) continue;
+            const mapped = mapSubtitles([s], () => proxied);
+            out.push(...mapped);
+        }
+        return out;
     }
 
     private emptyResult(message: string): ProviderResult {

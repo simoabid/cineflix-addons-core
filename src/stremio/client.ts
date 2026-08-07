@@ -6,10 +6,11 @@
  *   {base}/stream/{type}/{id}.json
  *   {base}/subtitles/{type}/{id}.json
  *
- * All requests go through the egress proxy (scrapeFetch) so a self-hosted
- * instance on EC2 doesn't get IP-blocked by addon backends.
+ * All fetches go through secureFetch (SSRF, DNS pinning, redirect, size policy).
  */
-import { scrapeFetch } from '../egress/scrapeFetch.js';
+import { secureFetch } from '../security/secureFetch.js';
+import { type UrlPolicyOptions } from '../security/urlPolicy.js';
+import { redactUrl } from '../security/redaction.js';
 import type {
     StremioManifest,
     StremioStream,
@@ -37,19 +38,23 @@ export class StremioAddonError extends Error {
 
 /**
  * Normalise any user-supplied addon reference into a canonical
- * `{ manifestUrl, baseUrl }`. Accepts:
+ * `{ manifestUrl, baseUrl, originalUrl }`. Accepts:
  *   - https://host/path/manifest.json
  *   - https://host/path            (assumed base; /manifest.json appended)
  *   - stremio://host/path/manifest.json
+ *
+ * Query strings are preserved on both base and manifest URLs so
+ * configuration-bearing transport URLs are not silently stripped.
  */
 export function normalizeAddonUrl(input: string): {
     manifestUrl: string;
     baseUrl: string;
+    originalUrl: string;
 } {
     let raw = input.trim();
     if (!raw) throw new StremioAddonError('Empty addon URL');
+    const originalUrl = raw;
 
-    // stremio:// deep-links are just http(s) with a custom scheme
     if (raw.startsWith('stremio://')) {
         raw = 'https://' + raw.slice('stremio://'.length);
     }
@@ -71,9 +76,9 @@ export function normalizeAddonUrl(input: string): {
         path = '';
     }
 
-    const baseUrl = `${u.origin}${path}`;
-    const manifestUrl = `${baseUrl}/manifest.json${u.search}`;
-    return { manifestUrl, baseUrl: baseUrl + u.search };
+    const baseUrl = `${u.origin}${path}${u.search}`;
+    const manifestUrl = `${u.origin}${path}/manifest.json${u.search}`;
+    return { manifestUrl, baseUrl, originalUrl };
 }
 
 /** Split a base URL into origin+path and a preserved query string. */
@@ -86,73 +91,141 @@ function splitBase(baseUrl: string): { root: string; query: string } {
     };
 }
 
+export interface FetchManifestOptions {
+    maxBytes?: number;
+    policy?: UrlPolicyOptions;
+    signal?: AbortSignal;
+}
+
 export async function fetchManifest(
     addonUrl: string,
-    timeoutMs = 15_000
-): Promise<{ manifest: StremioManifest; baseUrl: string }> {
-    const { manifestUrl, baseUrl } = normalizeAddonUrl(addonUrl);
-    const res = await scrapeFetch(manifestUrl, {
+    timeoutMs = 15_000,
+    options: FetchManifestOptions = {}
+): Promise<{
+    manifest: StremioManifest;
+    baseUrl: string;
+    manifestUrl: string;
+    originalUrl: string;
+}> {
+    const { manifestUrl, baseUrl, originalUrl } = normalizeAddonUrl(addonUrl);
+
+    const result = await secureFetch(manifestUrl, {
         headers: DEFAULT_HEADERS,
-        timeoutMs
+        timeoutMs,
+        maxBytes: options.maxBytes ?? 1_048_576,
+        maxRedirects: 3,
+        acceptContentTypes: ['json', 'text/plain', 'javascript'],
+        policy: options.policy ?? { allowHttp: false },
+        viaProxy: 'auto',
+        signal: options.signal
     });
-    if (!res.ok) {
+
+    if (!result.response.ok) {
         throw new StremioAddonError(
-            `Manifest HTTP ${res.status} for ${manifestUrl}`,
-            manifestUrl
+            `Manifest HTTP ${result.response.status} for ${redactUrl(manifestUrl)}`,
+            redactUrl(manifestUrl)
         );
     }
+
     let manifest: StremioManifest;
     try {
-        manifest = (await res.json()) as StremioManifest;
+        manifest = (await result.response.json()) as StremioManifest;
     } catch {
         throw new StremioAddonError(
-            `Manifest is not valid JSON: ${manifestUrl}`,
-            manifestUrl
+            `Manifest is not valid JSON: ${redactUrl(manifestUrl)}`,
+            redactUrl(manifestUrl)
         );
     }
     if (!manifest || typeof manifest !== 'object' || !manifest.id) {
         throw new StremioAddonError(
-            `Manifest missing required 'id': ${manifestUrl}`,
-            manifestUrl
+            `Manifest missing required 'id': ${redactUrl(manifestUrl)}`,
+            redactUrl(manifestUrl)
         );
     }
-    return { manifest, baseUrl };
+    return {
+        manifest,
+        baseUrl,
+        manifestUrl: result.finalUrl || manifestUrl,
+        originalUrl
+    };
+}
+
+export interface FetchStreamsOptions {
+    timeoutMs?: number;
+    policy?: UrlPolicyOptions;
+    maxBytes?: number;
+    maxRedirects?: number;
 }
 
 export async function fetchStreams(
     baseUrl: string,
     type: string,
     id: string,
-    timeoutMs = 20_000
+    timeoutMs = 20_000,
+    options: FetchStreamsOptions = {}
 ): Promise<StremioStream[]> {
     const { root, query } = splitBase(baseUrl);
     const url = `${root}/stream/${encodeURIComponent(type)}/${encodeURIComponent(id)}.json${query}`;
-    const res = await scrapeFetch(url, {
-        headers: DEFAULT_HEADERS,
-        timeoutMs
-    });
-    if (!res.ok) {
-        throw new StremioAddonError(`Stream HTTP ${res.status}`, url);
+    const policy = options.policy ?? { allowHttp: true };
+    // Use full outbound policy (DNS, HTTPS, redirects, size) — not just syntax check.
+    // Installed bases were validated at install time, but redirects and rebinding still need checks.
+    try {
+        const result = await secureFetch(url, {
+            headers: DEFAULT_HEADERS,
+            timeoutMs: options.timeoutMs ?? timeoutMs,
+            maxBytes: options.maxBytes ?? 1_048_576,
+            maxRedirects: options.maxRedirects ?? 3,
+            acceptContentTypes: ['json', 'text/plain', 'javascript'],
+            policy,
+            viaProxy: 'auto'
+        });
+        if (!result.response.ok) {
+            throw new StremioAddonError(
+                `Stream HTTP ${result.response.status}`,
+                redactUrl(url)
+            );
+        }
+        const json = (await result.response.json()) as StremioStreamResponse;
+        return Array.isArray(json?.streams) ? json.streams : [];
+    } catch (err) {
+        if (err instanceof StremioAddonError) throw err;
+        // Wrap policy errors as StremioAddonError for uniform handling
+        throw new StremioAddonError(
+            err instanceof Error ? err.message : 'Failed to fetch streams',
+            redactUrl(url)
+        );
     }
-    const json = (await res.json()) as StremioStreamResponse;
-    return Array.isArray(json?.streams) ? json.streams : [];
+}
+
+export interface FetchSubtitlesOptions {
+    timeoutMs?: number;
+    policy?: UrlPolicyOptions;
+    maxBytes?: number;
+    maxRedirects?: number;
 }
 
 export async function fetchSubtitles(
     baseUrl: string,
     type: string,
     id: string,
-    timeoutMs = 12_000
+    timeoutMs = 12_000,
+    options: FetchSubtitlesOptions = {}
 ): Promise<StremioSubtitle[]> {
     const { root, query } = splitBase(baseUrl);
     const url = `${root}/subtitles/${encodeURIComponent(type)}/${encodeURIComponent(id)}.json${query}`;
+    const policy = options.policy ?? { allowHttp: true };
     try {
-        const res = await scrapeFetch(url, {
+        const result = await secureFetch(url, {
             headers: DEFAULT_HEADERS,
-            timeoutMs
+            timeoutMs: options.timeoutMs ?? timeoutMs,
+            maxBytes: options.maxBytes ?? 512_000,
+            maxRedirects: options.maxRedirects ?? 3,
+            acceptContentTypes: ['json', 'text/plain', 'javascript'],
+            policy,
+            viaProxy: 'auto'
         });
-        if (!res.ok) return [];
-        const json = (await res.json()) as StremioSubtitleResponse;
+        if (!result.response.ok) return [];
+        const json = (await result.response.json()) as StremioSubtitleResponse;
         return Array.isArray(json?.subtitles) ? json.subtitles : [];
     } catch {
         return [];
