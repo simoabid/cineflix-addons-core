@@ -1,5 +1,6 @@
 import type { StremioManifest } from '../stremio/protocol.js';
 import type { DebridProviderId } from '../debrid/types.js';
+import type { AddonCapabilities } from '../capabilities/index.js';
 
 export interface AppSettings {
     debrid: {
@@ -83,6 +84,8 @@ export interface InstalledAddon {
         lastChecked: string;
         error?: string;
     };
+    /** Normalized capabilities derived from manifest (cached for fast filtering). */
+    capabilities?: AddonCapabilities;
 }
 
 export interface AddonStoreData {

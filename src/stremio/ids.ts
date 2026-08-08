@@ -8,6 +8,7 @@
  */
 import type { ProviderMediaObject } from '@omss/framework';
 import type { StremioManifest } from './protocol.js';
+import { deriveCapabilities } from '../capabilities/index.js';
 
 /** OMSS media type → Stremio content type. */
 export function toStremioType(type: 'movie' | 'tv'): 'movie' | 'series' {
@@ -21,6 +22,18 @@ export function normalizeImdb(id: string): string {
 }
 
 function supportsPrefix(manifest: StremioManifest, prefix: string): boolean {
+    // Prefer resource-level idPrefixes for stream resources when present.
+    // This honors e.g. { name: 'stream', idPrefixes: ['tmdb'] } while still
+    // supporting manifest-level fallback.
+    const caps = deriveCapabilities(manifest);
+    if (caps.stream.length > 0) {
+        const union = new Set<string>();
+        for (const e of caps.stream) for (const p of e.idPrefixes) union.add(p);
+        if (union.size > 0) {
+            for (const p of union) if (typeof p === 'string' && p.startsWith(prefix)) return true;
+            return false;
+        }
+    }
     const prefixes = manifest.idPrefixes;
     // No declared prefixes → assume the de-facto standard (imdb `tt`).
     if (!Array.isArray(prefixes) || prefixes.length === 0) {

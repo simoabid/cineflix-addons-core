@@ -27,9 +27,11 @@ export class HealthMonitor {
         }
     ) {}
 
-    /** Run a single sweep over all enabled addons. */
-    async checkAll(): Promise<HealthCheckSummary> {
-        const addons = this.manager.getEnabled();
+    /** Run a single sweep over all stream-enabled addons (health is readiness). */
+    async checkAll(): Promise<HealthCheckSummary & { revision: number }> {
+        // Prioritize stream-capable providers — they determine readiness.
+        // Still count subtitle-only as secondary, but they don't gate degraded.
+        const addons = this.manager.getStreamEnabled();
         let healthy = 0;
         for (let i = 0; i < addons.length; i += CONCURRENCY) {
             const batch = addons.slice(i, i + CONCURRENCY);
@@ -41,7 +43,8 @@ export class HealthMonitor {
         return {
             checked: addons.length,
             healthy,
-            unhealthy: addons.length - healthy
+            unhealthy: addons.length - healthy,
+            revision: this.manager.getRevision()
         };
     }
 

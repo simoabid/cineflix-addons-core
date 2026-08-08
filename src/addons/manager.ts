@@ -32,6 +32,13 @@ import {
     UrlPolicyError,
     type UrlPolicyOptions
 } from '../security/urlPolicy.js';
+import {
+    deriveCapabilities,
+    isStreamCapable,
+    isSubtitleCapable,
+    type AddonCapabilities
+} from '../capabilities/index.js';
+import { parseAddonUrl } from '../stremio/url.js';
 
 function nowIso(): string {
     return new Date().toISOString();
@@ -74,6 +81,36 @@ function hasResource(manifest: StremioManifest, name: string): boolean {
     );
 }
 
+function capabilitiesFor(manifest: StremioManifest): AddonCapabilities {
+    return deriveCapabilities(manifest);
+}
+
+function redactPathForPublic(url: string): string {
+    try {
+        const u = new URL(url);
+        // Redact path segments that look like opaque addon configuration:
+        // long base64/JWT-like tokens (>=20 chars, base64url charset) commonly used in
+        // path-configured addons (e.g. torrentio.strem.fun/<base64>/manifest.json).
+        // Keep short human-readable segments (catalog, meta, etc.) intact.
+        const parts = u.pathname.split('/').map((seg) => {
+            if (!seg) return seg;
+            if (seg === 'manifest.json') return seg;
+            // Heuristic: long opaque token
+            if (seg.length >= 20 && /^[A-Za-z0-9_-]+={0,2}$/.test(seg) && /[A-Za-z0-9_-]{20,}/.test(seg)) {
+                // Additional check: contains mixed case + digits or padding, not a plain word
+                if (!/^[a-z]+$/.test(seg) && !/^[A-Z]+$/.test(seg)) return '[REDACTED]';
+            }
+            // Hex-like long token
+            if (seg.length >= 20 && /^[0-9a-fA-F]{20,}$/.test(seg)) return '[REDACTED]';
+            return seg;
+        });
+        u.pathname = parts.join('/') || '/';
+        return u.toString();
+    } catch {
+        return url;
+    }
+}
+
 function urlLooksSecretBearing(url: string): boolean {
     // Treat ANY query or fragment as sensitive: addon transport URLs often carry
     // arbitrary configuration, signatures, or opaque tokens that are not captured
@@ -102,6 +139,8 @@ export class AddonManager {
     private readonly secrets: SecretBox;
     private grants: PlaybackGrantStore | null = null;
     private publicBase = '';
+    private onRevisionBump?: (rev: number) => void;
+    private onRevisionBumpAsync?: (rev: number) => Promise<void>;
 
     constructor(
         private readonly registry: ProviderRegistry,
@@ -128,6 +167,15 @@ export class AddonManager {
         }
     }
 
+    /** Register a hook to clear bulk/OMSS caches when revision changes. */
+    setRevisionHook(fn: (rev: number) => void | Promise<void>): void {
+        this.onRevisionBump = fn as (rev: number) => void;
+        this.onRevisionBumpAsync = async (rev: number) => {
+            const r = fn(rev);
+            if (r instanceof Promise) await r;
+        };
+    }
+
     describeStore(): string {
         return this.store.describe();
     }
@@ -136,8 +184,22 @@ export class AddonManager {
         return this.data.revision ?? 0;
     }
 
-    private bumpRevision(): void {
+    private async bumpRevision(): Promise<void> {
         this.data.revision = (this.data.revision ?? 0) + 1;
+        const rev = this.data.revision;
+        if (this.onRevisionBumpAsync) {
+            try {
+                await this.onRevisionBumpAsync(rev);
+            } catch {
+                /* ignore */
+            }
+        } else if (this.onRevisionBump) {
+            try {
+                this.onRevisionBump(rev);
+            } catch {
+                /* ignore */
+            }
+        }
     }
 
     urlPolicy(): UrlPolicyOptions {
@@ -196,6 +258,10 @@ export class AddonManager {
         // Open any sealed URLs for runtime use
         for (const addon of this.data.addons) {
             this.openAddonUrls(addon);
+            // Backfill capabilities if missing (migration from pre-Phase-2 stores).
+            if (!addon.capabilities) {
+                addon.capabilities = capabilitiesFor(addon.manifest);
+            }
         }
 
         // Migrate plaintext debrid keys → sealed form on load.
@@ -243,8 +309,16 @@ export class AddonManager {
         }
 
         sortAddons(this.data.addons).forEach((a, i) => (a.order = i));
+        // Recompute capabilities for any addon that may have been updated
+        // while we were sealing; ensure every record has up-to-date caps.
+        for (const a of this.data.addons) {
+            a.capabilities = capabilitiesFor(a.manifest);
+        }
+        // Register ONLY stream-capable enabled addons as OMSS providers.
         for (const addon of this.data.addons) {
-            if (addon.enabled) this.registerProvider(addon);
+            if (addon.enabled && addon.capabilities && isStreamCapable(addon.capabilities)) {
+                this.registerProvider(addon);
+            }
         }
         console.log(
             `[addons] Loaded ${this.data.addons.length} addon(s) from ${this.store.describe()} ` +
@@ -279,12 +353,62 @@ export class AddonManager {
 
     orderedEnabledProviderIds(): string[] {
         return sortAddons(this.data.addons)
-            .filter((a) => a.enabled)
+            .filter((a) => a.enabled && a.capabilities && isStreamCapable(a.capabilities))
             .map((a) => a.providerId);
     }
 
     getEnabled(): InstalledAddon[] {
         return sortAddons(this.data.addons).filter((a) => a.enabled);
+    }
+
+    /** Enabled AND stream-capable — the authoritative stream waterfall set. */
+    getStreamEnabled(): InstalledAddon[] {
+        return sortAddons(this.data.addons).filter(
+            (a) => a.enabled && a.capabilities && isStreamCapable(a.capabilities)
+        );
+    }
+
+    /** Enabled AND subtitle-capable — used by subtitle aggregation. */
+    getSubtitleEnabled(): InstalledAddon[] {
+        return sortAddons(this.data.addons).filter(
+            (a) => a.enabled && a.capabilities && isSubtitleCapable(a.capabilities)
+        );
+    }
+
+    /** Reconcile registry state atomically after a mutation. */
+    reconcileRegistry(): void {
+        // Ensure registry exactly matches the desired stream-enabled set,
+        // in priority order. This avoids windows where storage, registry,
+        // and cache disagree.
+        const desired = new Set(this.getStreamEnabled().map((a) => a.providerId));
+        // Remove stale
+        for (const pid of this.registry.listProviders()) {
+            if (!desired.has(pid) && pid.startsWith('addon:')) {
+                this.unregisterProvider(pid);
+            }
+        }
+        // Re-register in order — insertion order now equals business priority.
+        // Clear and re-register sorted to keep Map order deterministic.
+        const ordered = this.getStreamEnabled();
+        // Check if order already matches registry insertion order; if not, rebuild.
+        const currentOrder = this.registry
+            .getProviders()
+            .filter((p) => p.id.startsWith('addon:'))
+            .map((p) => p.id);
+        const needsReorder =
+            currentOrder.length !== ordered.length ||
+            currentOrder.some((id, i) => id !== ordered[i].providerId);
+        if (needsReorder) {
+            for (const pid of currentOrder) this.unregisterProvider(pid);
+            for (const addon of ordered) this.registerProvider(addon);
+        } else {
+            // Ensure any missing are added
+            for (const addon of ordered) {
+                if (!this.registry.hasProvider(addon.providerId)) {
+                    this.registerProvider(addon);
+                }
+            }
+        }
     }
 
     // ── settings + debrid ─────────────────────────────────────────────────────
@@ -348,7 +472,7 @@ export class AddonManager {
                     : '';
             }
             this.data.settings = { ...settings, debrid };
-            this.bumpRevision();
+            await this.bumpRevision();
             await this.persist();
             this.applyDebrid();
         });
@@ -674,9 +798,22 @@ export class AddonManager {
         const enable = options.enable ?? this.cfg.importEnableOnInstall ?? true;
 
         // Dedupe: same manifest URL or base → update in place (idempotent).
-        const existing = this.data.addons.find(
-            (a) => a.manifestUrl === manifestUrl || a.baseUrl === baseUrl
-        );
+        // Dedupe by normalized fingerprint, not raw string equality.
+        const incomingFp = (() => {
+            try {
+                return parseAddonUrl(manifestUrl).fingerprint;
+            } catch {
+                return manifestUrl;
+            }
+        })();
+        const existing = this.data.addons.find((a) => {
+            if (a.manifestUrl === manifestUrl || a.baseUrl === baseUrl) return true;
+            try {
+                return parseAddonUrl(a.manifestUrl).fingerprint === incomingFp;
+            } catch {
+                return false;
+            }
+        });
         if (existing) {
             existing.name = manifest.name || existing.name;
             existing.manifest = manifest;
@@ -684,15 +821,18 @@ export class AddonManager {
             existing.manifestUrl = manifestUrl;
             existing.originalImportUrl = originalImportUrl;
             existing.validationFindings = findings;
+            existing.capabilities = capabilitiesFor(manifest);
             existing.admissionState = enable
                 ? 'validated'
                 : (existing.admissionState ?? 'validated');
             existing.updatedAt = nowIso();
+            // Reconcile registry: re-register only if stream-capable
             if (existing.enabled) {
                 this.unregisterProvider(existing.providerId);
                 this.registerProvider(existing);
             }
-            this.bumpRevision();
+            this.reconcileRegistry();
+            await this.bumpRevision();
             await this.persist();
             return { ok: true, addon: existing, updated: true, findings };
         }
@@ -712,6 +852,7 @@ export class AddonManager {
             enabled: enable,
             admissionState: enable ? 'validated' : 'pending',
             validationFindings: findings,
+            capabilities: capabilitiesFor(manifest),
             order: maxOrder + 1,
             timeoutMs: DEFAULT_ADDON_TIMEOUT_MS,
             source,
@@ -720,8 +861,8 @@ export class AddonManager {
             updatedAt: nowIso()
         };
         this.data.addons.push(addon);
-        if (addon.enabled) this.registerProvider(addon);
-        this.bumpRevision();
+        this.reconcileRegistry();
+        await this.bumpRevision();
         await this.persist();
         return { ok: true, addon, findings };
     }
@@ -734,7 +875,7 @@ export class AddonManager {
             if (idx === -1) return false;
             this.unregisterProvider(providerId);
             this.data.addons.splice(idx, 1);
-            this.bumpRevision();
+            await this.bumpRevision();
             await this.persist();
             return true;
         });
@@ -750,9 +891,8 @@ export class AddonManager {
             addon.enabled = enabled;
             addon.admissionState = enabled ? 'validated' : 'disabled';
             addon.updatedAt = nowIso();
-            if (enabled) this.registerProvider(addon);
-            else this.unregisterProvider(providerId);
-            this.bumpRevision();
+            this.reconcileRegistry();
+            await this.bumpRevision();
             await this.persist();
             return addon;
         });
@@ -767,11 +907,12 @@ export class AddonManager {
             if (!addon) return undefined;
             addon.timeoutMs = Math.max(1000, Math.min(120_000, timeoutMs));
             addon.updatedAt = nowIso();
-            if (addon.enabled) {
-                this.unregisterProvider(providerId);
-                this.registerProvider(addon);
-            }
-            this.bumpRevision();
+            // Timeout is captured at provider construction, so force re-registration
+            // even when order/membership is unchanged.
+            this.unregisterProvider(providerId);
+            this.registerProvider(addon);
+            this.reconcileRegistry();
+            await this.bumpRevision();
             await this.persist();
             return addon;
         });
@@ -787,7 +928,8 @@ export class AddonManager {
                     : fallbackBase + i;
             });
             sortAddons(this.data.addons).forEach((a, i) => (a.order = i));
-            this.bumpRevision();
+            this.reconcileRegistry();
+            await this.bumpRevision();
             await this.persist();
         });
     }
@@ -802,6 +944,10 @@ export class AddonManager {
     // ── registry sync ────────────────────────────────────────────────────────
 
     private registerProvider(addon: InstalledAddon): void {
+        // Only stream-capable addons participate in the OMSS provider registry.
+        const caps = addon.capabilities ?? capabilitiesFor(addon.manifest);
+        if (!isStreamCapable(caps)) return;
+        if (!addon.enabled) return;
         if (this.registry.hasProvider(addon.providerId)) return;
         const provider = new StremioAddonProvider({
             providerId: addon.providerId,
@@ -887,8 +1033,12 @@ export function toPublicAddon(a: InstalledAddon) {
     const safeUrl = (url: string): string => {
         if (!url) return url;
         if (url.startsWith('enc:v1:')) return '[REDACTED]';
-        return redactUrl(url);
+        // First redact query/fragment, then path-configured opaque segments
+        let r = redactUrl(url);
+        try { r = redactPathForPublic(r); } catch { /* ignore */ }
+        return r;
     };
+    const caps = a.capabilities ?? deriveCapabilities(a.manifest);
     return {
         id: a.providerId,
         slug: a.slug,
@@ -905,6 +1055,15 @@ export function toPublicAddon(a: InstalledAddon) {
         admissionState:
             a.admissionState ?? (a.enabled ? 'validated' : 'disabled'),
         validationFindings: a.validationFindings,
+        capabilities: {
+            stream: caps.stream,
+            subtitles: caps.subtitles,
+            catalog: caps.catalog,
+            meta: caps.meta,
+            status: caps.status,
+            statusReason: caps.statusReason
+        },
+        // Back-compat flat fields for older clients
         types: a.manifest.types ?? [],
         resources: (a.manifest.resources ?? []).map((r) =>
             typeof r === 'string' ? r : r.name
