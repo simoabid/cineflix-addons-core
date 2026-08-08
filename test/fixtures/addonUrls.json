@@ -1,0 +1,38 @@
+{
+  "_comment": "Fixtures for Phase 2.3 — query- and path-configured manifests",
+  "queryConfigured": {
+    "description": "Addon where configuration is in the query string (common for Personalised torrentio/comet instances)",
+    "input": "https://comet.example/manifest.json?token=abc123&config=%7B%22quality%22%3A%221080p%22%7D",
+    "expected": {
+      "pathnameBase": "",
+      "search": "?token=abc123&config=%7B%22quality%22%3A%221080p%22%7D",
+      "manifestUrl": "https://comet.example/manifest.json?token=abc123&config=%7B%22quality%22%3A%221080p%22%7D",
+      "baseUrl": "https://comet.example?token=abc123&config=%7B%22quality%22%3A%221080p%22%7D"
+    }
+  },
+  "pathConfigured": {
+    "description": "Torrentio-style path-configured manifest (base64 config in path)",
+    "input": "https://torrentio.strem.fun/EyJzb3J0IjoiUXVhbGl0eSJ9/manifest.json",
+    "expected": {
+      "pathnameBase": "/EyJzb3J0IjoiUXVhbGl0eSJ9",
+      "search": "",
+      "manifestUrl": "https://torrentio.strem.fun/EyJzb3J0IjoiUXVhbGl0eSJ9/manifest.json",
+      "baseUrl": "https://torrentio.strem.fun/EyJzb3J0IjoiUXVhbGl0eSJ9"
+    }
+  },
+  "combined": {
+    "description": "Path + query combined (e.g., custom debrid token in query plus path config)",
+    "input": "https://torrentio.strem.fun/EyJzb3J0IjoiUXVhbGl0eSJ9/manifest.json?debrid=realdebrid&token=secret123",
+    "expected": {
+      "pathnameBase": "/EyJzb3J0IjoiUXVhbGl0eSJ9",
+      "search": "?debrid=realdebrid&token=secret123"
+    }
+  },
+  "stremioScheme": {
+    "description": "stremio:// scheme should normalize to https",
+    "input": "stremio://torrentio.strem.fun/manifest.json",
+    "expected": {
+      "manifestUrl": "https://torrentio.strem.fun/manifest.json"
+    }
+  }
+}

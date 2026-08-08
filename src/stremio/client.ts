@@ -11,6 +11,7 @@
 import { secureFetch } from '../security/secureFetch.js';
 import { type UrlPolicyOptions } from '../security/urlPolicy.js';
 import { redactUrl } from '../security/redaction.js';
+import { parseAddonUrl, buildResourceUrl } from './url.js';
 import type {
     StremioManifest,
     StremioStream,
@@ -51,44 +52,32 @@ export function normalizeAddonUrl(input: string): {
     baseUrl: string;
     originalUrl: string;
 } {
-    let raw = input.trim();
-    if (!raw) throw new StremioAddonError('Empty addon URL');
-    const originalUrl = raw;
-
-    if (raw.startsWith('stremio://')) {
-        raw = 'https://' + raw.slice('stremio://'.length);
-    }
-    if (!/^https?:\/\//i.test(raw)) {
-        raw = 'https://' + raw;
-    }
-
-    let u: URL;
     try {
-        u = new URL(raw);
-    } catch {
-        throw new StremioAddonError(`Invalid addon URL: ${input}`);
+        const parsed = parseAddonUrl(input);
+        return {
+            manifestUrl: parsed.manifestUrl,
+            baseUrl: parsed.baseUrl,
+            originalUrl: parsed.original
+        };
+    } catch (err) {
+        throw new StremioAddonError(err instanceof Error ? err.message : `Invalid addon URL: ${input}`);
     }
-
-    let path = u.pathname.replace(/\/+$/, '');
-    if (path.toLowerCase().endsWith('/manifest.json')) {
-        path = path.slice(0, -'/manifest.json'.length);
-    } else if (path.toLowerCase() === '/manifest.json') {
-        path = '';
-    }
-
-    const baseUrl = `${u.origin}${path}${u.search}`;
-    const manifestUrl = `${u.origin}${path}/manifest.json${u.search}`;
-    return { manifestUrl, baseUrl, originalUrl };
 }
 
-/** Split a base URL into origin+path and a preserved query string. */
-function splitBase(baseUrl: string): { root: string; query: string } {
-    const qIndex = baseUrl.indexOf('?');
-    if (qIndex === -1) return { root: baseUrl.replace(/\/+$/, ''), query: '' };
-    return {
-        root: baseUrl.slice(0, qIndex).replace(/\/+$/, ''),
-        query: baseUrl.slice(qIndex)
-    };
+/** Split a base URL into origin+path and a preserved query string — delegates to structured parser. */
+// Exported for backwards compat; callers should use buildResourceUrl instead.
+export function splitBase(baseUrl: string): { root: string; query: string } {
+    try {
+        const u = new URL(baseUrl);
+        return { root: `${u.origin}${u.pathname.replace(/\/+$/, '')}`, query: u.search };
+    } catch {
+        const qIndex = baseUrl.indexOf('?');
+        if (qIndex === -1) return { root: baseUrl.replace(/\/+$/, ''), query: '' };
+        return {
+            root: baseUrl.slice(0, qIndex).replace(/\/+$/, ''),
+            query: baseUrl.slice(qIndex)
+        };
+    }
 }
 
 export interface FetchManifestOptions {
@@ -155,6 +144,7 @@ export interface FetchStreamsOptions {
     policy?: UrlPolicyOptions;
     maxBytes?: number;
     maxRedirects?: number;
+    signal?: AbortSignal;
 }
 
 export async function fetchStreams(
@@ -163,12 +153,10 @@ export async function fetchStreams(
     id: string,
     timeoutMs = 20_000,
     options: FetchStreamsOptions = {}
-): Promise<StremioStream[]> {
-    const { root, query } = splitBase(baseUrl);
-    const url = `${root}/stream/${encodeURIComponent(type)}/${encodeURIComponent(id)}.json${query}`;
+): Promise<StremioStream[] & { cacheMaxAge?: number }> {
+    const url = buildResourceUrl(baseUrl, 'stream', type, id);
     const policy = options.policy ?? { allowHttp: true };
-    // Use full outbound policy (DNS, HTTPS, redirects, size) — not just syntax check.
-    // Installed bases were validated at install time, but redirects and rebinding still need checks.
+    if (options.signal?.aborted) throw new StremioAddonError('Aborted', redactUrl(url));
     try {
         const result = await secureFetch(url, {
             headers: DEFAULT_HEADERS,
@@ -177,7 +165,8 @@ export async function fetchStreams(
             maxRedirects: options.maxRedirects ?? 3,
             acceptContentTypes: ['json', 'text/plain', 'javascript'],
             policy,
-            viaProxy: 'auto'
+            viaProxy: 'auto',
+            signal: options.signal
         });
         if (!result.response.ok) {
             throw new StremioAddonError(
@@ -185,8 +174,19 @@ export async function fetchStreams(
                 redactUrl(url)
             );
         }
-        const json = (await result.response.json()) as StremioStreamResponse;
-        return Array.isArray(json?.streams) ? json.streams : [];
+        const json = (await result.response.json()) as StremioStreamResponse & { cacheMaxAge?: number };
+        const streams = Array.isArray(json?.streams) ? json.streams : [];
+        // Preserve response-level cacheMaxAge for source expiry (standard Stremio field)
+        const cacheMaxAge = typeof json?.cacheMaxAge === 'number' ? json.cacheMaxAge : undefined;
+        // Attach as non-enumerable expiring hint so callers can use it without changing array shape
+        if (cacheMaxAge != null) {
+            Object.defineProperty(streams, 'cacheMaxAge', {
+                value: cacheMaxAge,
+                enumerable: false,
+                writable: true
+            });
+        }
+        return streams as StremioStream[] & { cacheMaxAge?: number };
     } catch (err) {
         if (err instanceof StremioAddonError) throw err;
         // Wrap policy errors as StremioAddonError for uniform handling
@@ -202,6 +202,7 @@ export interface FetchSubtitlesOptions {
     policy?: UrlPolicyOptions;
     maxBytes?: number;
     maxRedirects?: number;
+    signal?: AbortSignal;
 }
 
 export async function fetchSubtitles(
@@ -211,9 +212,9 @@ export async function fetchSubtitles(
     timeoutMs = 12_000,
     options: FetchSubtitlesOptions = {}
 ): Promise<StremioSubtitle[]> {
-    const { root, query } = splitBase(baseUrl);
-    const url = `${root}/subtitles/${encodeURIComponent(type)}/${encodeURIComponent(id)}.json${query}`;
+    const url = buildResourceUrl(baseUrl, 'subtitles', type, id);
     const policy = options.policy ?? { allowHttp: true };
+    if (options.signal?.aborted) return [];
     try {
         const result = await secureFetch(url, {
             headers: DEFAULT_HEADERS,
@@ -222,7 +223,8 @@ export async function fetchSubtitles(
             maxRedirects: options.maxRedirects ?? 3,
             acceptContentTypes: ['json', 'text/plain', 'javascript'],
             policy,
-            viaProxy: 'auto'
+            viaProxy: 'auto',
+            signal: options.signal
         });
         if (!result.response.ok) return [];
         const json = (await result.response.json()) as StremioSubtitleResponse;
