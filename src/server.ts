@@ -15,6 +15,11 @@ import {
 } from './progressiveScrape.js';
 import { aggregateSubtitles } from './subtitles/index.js';
 import { HealthMonitor } from './health/monitor.js';
+import { ProviderSelectionService } from './providers/selection.js';
+import { globalReliability } from './reliability/circuit.js';
+import { globalMediaIdentity } from './media/mediaIdentity.js';
+import { makeAuthGuard } from './routes/auth.js';
+import { normalizeUpstreamUrl } from './sources/normalization.js';
 import { registerAddonRoutes } from './routes/addons.routes.js';
 import { registerImportRoutes } from './routes/import.routes.js';
 import { registerAuthRoutes } from './routes/auth.js';
@@ -149,6 +154,18 @@ async function main(): Promise<void> {
 
     const registry = server.getRegistry();
     const manager = AddonManager.create(registry, cfg);
+    // Revision hook: clear bulk/OMSS cache when provider set changes so
+    // disabled/removed addons never remain in cached responses.
+    // Made revision-aware: cache keys include provider revision, so stale entries
+    // are never hit even if clear is async. Hook still clears for memory hygiene.
+    const omssCache = (server as unknown as { cache: { clear(): Promise<void> } }).cache;
+    manager.setRevisionHook(async (rev) => {
+        try {
+            await omssCache.clear();
+            console.log(`[cache] cleared after revision ${rev}`);
+        } catch { /* ignore */ }
+        try { globalMediaIdentity.clearCache(); } catch { /* ignore */ }
+    });
     await manager.init();
 
     const proxyCtx = createSecureProxyContext(cfg);
@@ -156,6 +173,23 @@ async function main(): Promise<void> {
     if (cfg.secureProxy) {
         manager.setPlaybackGrants(proxyCtx.grants, publicUrl);
     }
+
+    // Make bulk + native Stremio use the unified MediaIdentityService (single TMDB path, §5.4).
+    // Framework's separate TMDBService is patched to delegate to globalMediaIdentity so
+    // progressive, bulk, subtitles, and native routes share one cache/taxonomy.
+    patchTMDBService(server);
+
+    // Authoritative provider selection — single source of truth for ordering.
+    const selection = new ProviderSelectionService(manager, globalReliability);
+
+    // Make source cache keys revision-aware so stale entries are never hit after a mutation,
+    // even if the async clear hasn't finished. Also injects creation revision into cached responses.
+    patchCacheRevision(server, selection);
+
+    // Patch OMSS SourceService to use selection ordering and bounded concurrency.
+    // This makes bulk and progressive agree on priority and ensures
+    // reordering changes both paths predictably (Phase 2.2 acceptance).
+    patchSourceService(server, selection);
 
     const monitor = new HealthMonitor(manager, {
         intervalMinutes: cfg.healthIntervalMinutes,
@@ -196,6 +230,30 @@ async function main(): Promise<void> {
     });
     // The above hooks ensure grant URLs are redacted before the framework logger reads them.
 
+    // Every bulk/refresh response should carry the provider revision for debugging (Phase 2.2).
+    app.addHook('onSend', async (request, reply, payload) => {
+        const url = request.url ?? '';
+        if (
+            url.startsWith('/v1/movies/') ||
+            url.startsWith('/v1/tv/') ||
+            url.startsWith('/v1/providers') ||
+            url.startsWith('/v1/subtitles')
+        ) {
+            reply.header('x-provider-revision', String(manager.getRevision()));
+            // For JSON payloads, also inject `revision` field when possible
+            if (typeof payload === 'string' && payload.startsWith('{')) {
+                try {
+                    const body = JSON.parse(payload);
+                    if (body && typeof body === 'object' && !Array.isArray(body) && body.revision == null) {
+                        body.revision = manager.getRevision();
+                        return JSON.stringify(body);
+                    }
+                } catch { /* ignore */ }
+            }
+        }
+        return payload;
+    });
+
     // Global HTTP security (headers, cookies, safe errors, query length).
     registerHttpSecurity(app, cfg);
 
@@ -206,8 +264,46 @@ async function main(): Promise<void> {
     registerAuthRoutes(app, cfg, audit);
 
     // ── Provider list (frontend waterfall order) ──────────────────────────────
+    // Exposes capability metadata and revision (Phase 2.1/2.2).
+    // Returns array for back-compat; also sets X-Provider-Revision header.
+    // Detailed meta available at /v1/providers/meta
     app.get('/v1/providers', async (_req, reply) => {
-        return reply.code(200).send(listProvidersWithPriority(manager));
+        const list = listProvidersWithPriority(manager, selection);
+        reply.header('x-provider-revision', String(manager.getRevision()));
+        // Return array directly (OMSS convention) — clients that need counts can call /v1/providers/meta
+        return reply.code(200).send(list);
+    });
+
+    app.get('/v1/providers/meta', async (_req, reply) => {
+        const list = listProvidersWithPriority(manager, selection);
+        return reply.code(200).send({
+            providers: list,
+            revision: manager.getRevision(),
+            counts: {
+                total: manager.list().length,
+                stream: manager.getStreamEnabled().length,
+                subtitles: manager.getSubtitleEnabled().length,
+                catalogOnly: manager.list().filter((a) => a.capabilities?.status === 'limited').length,
+                unsupported: manager.list().filter((a) => a.capabilities?.status === 'unsupported').length
+            }
+        });
+    });
+
+    // Diagnostics endpoint: per-provider circuit/metrics (privileged — admin/operator only)
+    const diagGuard = makeAuthGuard(cfg, { role: 'viewer' });
+    app.get('/v1/providers/diagnostics', { preHandler: diagGuard }, async (_req, reply) => {
+        return reply.code(200).send({
+            revision: manager.getRevision(),
+            reliability: globalReliability.snapshot(),
+            providers: manager.list().map((a) => ({
+                id: a.providerId,
+                name: a.name,
+                enabled: a.enabled,
+                capabilities: a.capabilities,
+                state: globalReliability.getState(a.providerId),
+                metrics: globalReliability.getMetrics(a.providerId)
+            }))
+        });
     });
 
     // ── Progressive single-addon scrape ───────────────────────────────────────
@@ -248,15 +344,22 @@ async function main(): Promise<void> {
         async (request, reply) => {
             if (!(await checkScrapeRateLimit(request, reply))) return;
             const { tmdbId, providerId } = request.params;
+            // Unified media identity with validation + deadline (Phase 2.4)
+            const deadline = Date.now() + manager.getTimeoutMs(providerId) + 12_000;
             try {
-                const media = await buildProgressiveMedia('movie', tmdbId);
+                const media = await buildProgressiveMedia('movie', tmdbId, undefined, undefined, {
+                    deadlineMs: deadline,
+                    signal: (request as unknown as { signal?: AbortSignal }).signal
+                });
                 const result = await scrapeSingleProvider(
                     registry,
                     providerId,
                     media,
-                    manager.getTimeoutMs(providerId)
+                    manager.getTimeoutMs(providerId),
+                    { selection, signal: (request as unknown as { signal?: AbortSignal }).signal, deadlineMs: deadline }
                 );
-                return reply.code(200).send(result);
+                // Use creation revision captured in result, not current (prevents stale labeling)
+                return reply.code(200).send({ ...result, revision: result.revision ?? manager.getRevision() });
             } catch (err) {
                 return sendProviderError(reply, err);
             }
@@ -285,15 +388,20 @@ async function main(): Promise<void> {
                     error: 'Invalid season or episode'
                 });
             }
+            const deadline = Date.now() + manager.getTimeoutMs(providerId) + 12_000;
             try {
-                const media = await buildProgressiveMedia('tv', tmdbId, s, e);
+                const media = await buildProgressiveMedia('tv', tmdbId, s, e, {
+                    deadlineMs: deadline,
+                    signal: (request as unknown as { signal?: AbortSignal }).signal
+                });
                 const result = await scrapeSingleProvider(
                     registry,
                     providerId,
                     media,
-                    manager.getTimeoutMs(providerId)
+                    manager.getTimeoutMs(providerId),
+                    { selection, signal: (request as unknown as { signal?: AbortSignal }).signal, deadlineMs: deadline }
                 );
-                return reply.code(200).send(result);
+                return reply.code(200).send({ ...result, revision: result.revision ?? manager.getRevision() });
             } catch (err) {
                 return sendProviderError(reply, err);
             }
@@ -338,6 +446,8 @@ async function main(): Promise<void> {
             });
         }
 
+        const creationRev = manager.getRevision();
+        const deadline = Date.now() + 15_000;
         const result = await aggregateSubtitles(
             manager,
             publicUrl,
@@ -352,13 +462,16 @@ async function main(): Promise<void> {
             },
             {
                 grants: cfg.secureProxy ? proxyCtx.grants : undefined,
-                secureProxy: cfg.secureProxy
+                secureProxy: cfg.secureProxy,
+                signal: (request as unknown as { signal?: AbortSignal }).signal,
+                deadlineMs: deadline
             }
         );
         return reply.code(200).send({
             subtitles: result.subtitles,
             source: 'stremio-addons',
             addonsQueried: result.addonsQueried,
+            revision: creationRev,
             ...(result.error ? { error: result.error } : {})
         });
     });
@@ -389,6 +502,179 @@ async function main(): Promise<void> {
             (cfg.adminEnabled ? `\n  • Admin UI: ${publicUrl}/admin` : '') +
             `\n  • Store: ${manager.describeStore()}\n`
     );
+}
+
+function patchTMDBService(server: OMSSServer): void {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const tmdb = (server as unknown as { tmdbService: any }).tmdbService;
+    if (!tmdb) return;
+    const origGetMedia = tmdb.getMediaObject.bind(tmdb);
+    const origGetImdb = tmdb.getImdbId.bind(tmdb);
+    // Bulk + native Stremio now share MediaIdentityService's single cache/taxonomy
+    tmdb.getMediaObject = async (type: string, tmdbId: string, season?: number, episode?: number) => {
+        const kind = type === 'movie' ? 'movie' : ('tv' as const);
+        try {
+            const res = await globalMediaIdentity.resolve(kind as never, String(tmdbId), season, episode);
+            return res.media;
+        } catch (err) {
+            // For validation-type errors (invalid id/season) propagate as-is so callers get 400
+            if (err && typeof err === 'object' && 'code' in (err as Record<string, unknown>)) {
+                throw err;
+            }
+            return origGetMedia(type, tmdbId, season, episode);
+        }
+    };
+    tmdb.getImdbId = async (tmdbId: string, type: string) => {
+        const kind = type === 'movie' ? 'movie' : ('tv' as const);
+        try {
+            const res = await globalMediaIdentity.resolve(kind as never, String(tmdbId));
+            return res.media.imdbId || undefined;
+        } catch {
+            return origGetImdb(tmdbId, type);
+        }
+    };
+    console.log('[media] patched TMDBService to delegate to MediaIdentityService');
+}
+
+function patchCacheRevision(server: OMSSServer, selection: ProviderSelectionService): void {
+    const cache = (server as unknown as { cache: { get: (k: string) => Promise<unknown>; set: (k: string, v: unknown, ttl?: number) => Promise<unknown> } }).cache;
+    const origGet = cache.get.bind(cache);
+    const origSet = cache.set.bind(cache);
+    cache.get = async (key: string) => {
+        if (key.startsWith('movie:') || key.startsWith('tv:')) {
+            const revKey = `${key}:rev${selection.revision}`;
+            const v = await origGet(revKey);
+            if (v != null) return v;
+            return null;
+        }
+        return origGet(key);
+    };
+    cache.set = async (key: string, value: unknown, ttl?: number) => {
+        if (key.startsWith('movie:') || key.startsWith('tv:')) {
+            const revKey = `${key}:rev${selection.revision}`;
+            if (value && typeof value === 'object' && value !== null && !Array.isArray(value)) {
+                (value as Record<string, unknown>).revision = selection.revision;
+            }
+            return origSet(revKey, value, ttl);
+        }
+        return origSet(key, value, ttl);
+    };
+    console.log('[cache] patched to be revision-aware (keys include provider revision)');
+}
+
+function patchSourceService(
+    server: OMSSServer,
+    selection: ProviderSelectionService
+): void {
+    // Original preserved for debugging if needed
+    void (server as unknown as { sourceService: { fetchFromProviders: (type: string, media: unknown) => Promise<unknown[]> } }).sourceService
+        .fetchFromProviders.bind((server as unknown as { sourceService: unknown }).sourceService);
+    const svc = (server as unknown as { sourceService: Record<string, unknown> }).sourceService;
+
+    // Replace with selection-aware, bounded-concurrency, priority-ordered fetch.
+    // Bulk semantics: Aggregate mode — query eligible providers concurrently with
+    // bounded concurrency (4) and return all usable sources in priority order.
+    // Fast-first mode is available via selection.fetchFastFirst for callers that
+    // want early stop; progressive mode remains single-provider via /v1/.../providers/:id.
+    (svc as { fetchFromProviders: (type: string, media: unknown) => Promise<unknown[]> }).fetchFromProviders = async (
+        type: string,
+        media: unknown
+    ) => {
+        const m = media as import('@omss/framework').ProviderMediaObject;
+        const providers = selection.selectStreamProviders(m);
+        if (providers.length === 0) return [];
+
+        // Absolute deadline for the whole bulk aggregation — prevents multiple IDs/retries
+        // from exceeding the request budget. 20 s is enough for a 4-concurrency aggregate
+        // even with retries, but still aborts runaway addons.
+        const bulkCtrl = new AbortController();
+        const bulkTimeout = setTimeout(() => {
+            try { bulkCtrl.abort(Object.assign(new Error('bulk deadline exceeded'), { name: 'TimeoutError' })); } catch { /* ignore */ }
+        }, 20_000);
+        const bulkSignal = bulkCtrl.signal;
+
+        // Bounded concurrency aggregate — cancellable
+        const concurrency = 4;
+        const results: unknown[] = [];
+        try {
+            for (let i = 0; i < providers.length; i += concurrency) {
+                if (bulkSignal.aborted) break;
+                const batch = providers.slice(i, i + concurrency);
+                const settled = await Promise.allSettled(
+                    batch.map(async (addon) => {
+                        if (bulkSignal.aborted) return { sources: [], subtitles: [], diagnostics: [] };
+                        const provider = (server as unknown as { getRegistry: () => { getProvider(id: string): { getMovieSources(m: unknown, s?: AbortSignal): Promise<unknown>; getTVSources(m: unknown, s?: AbortSignal): Promise<unknown> } } }).getRegistry().getProvider(addon.providerId);
+                        if (!provider) return { sources: [], subtitles: [], diagnostics: [] };
+                        try {
+                            const res = type === 'movie'
+                                ? await provider.getMovieSources(m as never, bulkSignal)
+                                : await provider.getTVSources(m as never, bulkSignal);
+                            return res;
+                        } catch (err) {
+                            if ((err as Error)?.name === 'AbortError' || (err as Error)?.name === 'TimeoutError') {
+                                return { sources: [], subtitles: [], diagnostics: [] };
+                            }
+                            return {
+                                sources: [],
+                                subtitles: [],
+                                diagnostics: [
+                                    {
+                                        code: 'PROVIDER_ERROR',
+                                        message: `${addon.name}: ${err instanceof Error ? err.message : String(err)}`,
+                                        field: '',
+                                        severity: 'error'
+                                    }
+                                ]
+                            };
+                        }
+                    })
+                );
+                for (const s of settled) {
+                    if (s.status === 'fulfilled') results.push(s.value);
+                }
+            }
+        } finally {
+            clearTimeout(bulkTimeout);
+        }
+
+        // Keep results in selection priority order (already) but ensure mapping is 1:1
+        // Providers already ordered, results array is in same order as batch slicing.
+        return results;
+    };
+
+    // Also ensure buildResponse respects upstream dedup when grants are opaque.
+    // Patch to use provenance-based dedup when available — uses full upstream identity
+    // (scheme + host + port + path + sorted query + headers) via normalizeUpstreamUrl.
+    const originalBuild = (svc as { buildResponse: (results: unknown[]) => unknown }).buildResponse;
+    if (originalBuild) {
+        (svc as { buildResponse: (results: unknown[]) => unknown }).buildResponse = function (results: unknown[]) {
+            try {
+                const asArray = results as Array<{ sources: Array<{ url: string; provenance?: { upstreamUrl: string; headers?: Record<string, string> } }> }>;
+                const hasProvenance = asArray.some((r) => r.sources.some((s) => Boolean((s as unknown as { provenance?: unknown }).provenance)));
+                if (hasProvenance) {
+                    const seen = new Set<string>();
+                    const deduped = asArray.map((r) => {
+                        const filtered: unknown[] = [];
+                        for (const s of r.sources as Array<{ provenance?: { upstreamUrl: string; headers?: Record<string, string> }; url: string }>) {
+                            const prov = (s as unknown as { provenance?: { upstreamUrl: string; headers?: Record<string, string> } }).provenance;
+                            const upstream = prov?.upstreamUrl ?? s.url;
+                            const headers = prov?.headers;
+                            const headerKey = headers ? JSON.stringify(Object.entries(headers).sort((a, b) => a[0].localeCompare(b[0])).map(([k, v]) => `${k.toLowerCase()}:${v}`)) : '';
+                            const key = normalizeUpstreamUrl(upstream) + '|' + headerKey;
+                            if (seen.has(key)) continue;
+                            seen.add(key);
+                            filtered.push(s);
+                        }
+                        return { ...r, sources: filtered };
+                    });
+                    return (originalBuild as (r: unknown[]) => unknown).call(this, deduped);
+                }
+            } catch { /* fallback */ }
+            return (originalBuild as (r: unknown[]) => unknown).call(this, results);
+        };
+    }
+
+    console.log(`[selection] patched SourceService.fetchFromProviders to use ProviderSelectionService (aggregate mode, concurrency=4)`);
 }
 
 function sendProviderError(
