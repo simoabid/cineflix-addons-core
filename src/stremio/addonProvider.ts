@@ -16,32 +16,36 @@ import type {
     Diagnostic,
     Subtitle
 } from '@omss/framework';
-import type { StremioManifest, StremioResource } from './protocol.js';
+import type { StremioManifest } from './protocol.js';
 import { fetchStreams, fetchSubtitles } from './client.js';
 import { buildIdCandidates, toStremioType } from './ids.js';
-import { mapStreamsToSources, mapSubtitles, type ProxyFn } from './mapper.js';
+import { mapSubtitles, type ProxyFn } from './mapper.js';
 import { resolveTorrentStreams } from '../debrid/torrentSources.js';
 import type { PlaybackGrantStore } from '../security/playbackGrant.js';
-
-function hasResource(manifest: StremioManifest, name: string): boolean {
-    const resources = manifest.resources;
-    if (!Array.isArray(resources)) return false;
-    return resources.some((r: StremioResource) =>
-        typeof r === 'string' ? r === name : r?.name === name
-    );
-}
+import { deriveCapabilities as deriveAddonCapabilities } from '../capabilities/index.js';
+import { globalSourceNormalization } from '../sources/normalization.js';
+import { globalReliability } from '../reliability/circuit.js';
 
 function deriveCapabilities(
     manifest: StremioManifest
 ): ProviderCapabilities['supportedContentTypes'] {
-    const types = manifest.types;
-    if (!Array.isArray(types) || types.length === 0) {
-        return ['movies', 'tv'];
-    }
+    const caps = deriveAddonCapabilities(manifest);
     const out = new Set<'movies' | 'tv'>();
-    for (const t of types) {
-        if (t === 'movie') out.add('movies');
-        if (t === 'series' || t === 'tv') out.add('tv');
+    // Use stream entries' mediaTypes to decide OMSS capabilities; fall back to manifest types
+    if (caps.stream.length > 0) {
+        for (const e of caps.stream) {
+            for (const m of e.mediaTypes) {
+                if (m === 'movie') out.add('movies');
+                if (m === 'series' || m === 'tv') out.add('tv');
+            }
+        }
+    } else {
+        const types = manifest.types;
+        if (!Array.isArray(types) || types.length === 0) return ['movies', 'tv'];
+        for (const t of types) {
+            if (t === 'movie') out.add('movies');
+            if (t === 'series' || t === 'tv') out.add('tv');
+        }
     }
     return out.size ? [...out] : ['movies', 'tv'];
 }
@@ -65,6 +69,7 @@ export class StremioAddonProvider extends BaseProvider {
     private readonly publicBase?: string;
     private readonly secureProxy: boolean;
     private readonly urlPolicy?: import('../security/urlPolicy.js').UrlPolicyOptions;
+    private readonly reliability = globalReliability;
 
     /** Cache of last issued grant URLs so async grant issue can be sync-shaped. */
     private pendingProxy: ProxyFn;
@@ -87,7 +92,8 @@ export class StremioAddonProvider extends BaseProvider {
         this.BASE_URL = opts.baseUrl;
         this.enabled = opts.enabled ?? true;
         this.manifest = opts.manifest;
-        this.supportsSubtitles = hasResource(opts.manifest, 'subtitles');
+        const addonCaps = deriveAddonCapabilities(opts.manifest);
+        this.supportsSubtitles = addonCaps.subtitles.length > 0;
         this.streamTimeoutMs = opts.streamTimeoutMs ?? 20_000;
         this.grants = opts.grants;
         this.publicBase = opts.publicBase;
@@ -113,12 +119,12 @@ export class StremioAddonProvider extends BaseProvider {
         };
     }
 
-    async getMovieSources(media: ProviderMediaObject): Promise<ProviderResult> {
-        return this.resolve(media);
+    async getMovieSources(media: ProviderMediaObject, signal?: AbortSignal): Promise<ProviderResult> {
+        return this.resolve(media, signal);
     }
 
-    async getTVSources(media: ProviderMediaObject): Promise<ProviderResult> {
-        return this.resolve(media);
+    async getTVSources(media: ProviderMediaObject, signal?: AbortSignal): Promise<ProviderResult> {
+        return this.resolve(media, signal);
     }
 
     /**
@@ -150,48 +156,110 @@ export class StremioAddonProvider extends BaseProvider {
         }
     }
 
-    private async resolve(media: ProviderMediaObject): Promise<ProviderResult> {
+    private async resolve(media: ProviderMediaObject, signal?: AbortSignal): Promise<ProviderResult> {
+        if (signal?.aborted) throw Object.assign(new Error('Aborted'), { name: 'AbortError' });
         const stremioType = toStremioType(media.type);
         const candidates = buildIdCandidates(this.manifest, media);
 
         if (candidates.length === 0) {
+            // Classify as no_compatible_id for negative-cache
+            this.reliability.recordFailure(this.id, 'no_compatible_id');
             return this.emptyResult(
                 'No usable id (addon needs an IMDb/TMDB id it supports)'
             );
         }
 
+        // Short-circuit if circuit open and negative-cache says no result recently
+        const circuit = this.reliability.getState(this.id);
+        if (circuit === 'open') {
+            return {
+                sources: [],
+                subtitles: [],
+                diagnostics: [
+                    {
+                        code: 'PROVIDER_ERROR',
+                        message: `${this.name}: circuit open — temporarily skipped`,
+                        field: '',
+                        severity: 'warning'
+                    }
+                ]
+            };
+        }
+
         const diagnostics: Diagnostic[] = [];
+        const dedupSeen = new Set<string>();
 
         for (const id of candidates) {
-            try {
-                const streams = await fetchStreams(
-                    this.BASE_URL,
-                    stremioType,
-                    id,
-                    this.streamTimeoutMs,
-                    { policy: this.urlPolicy }
-                );
-                if (!streams.length) continue;
+            if (signal?.aborted) throw Object.assign(new Error('Aborted'), { name: 'AbortError' });
+            // Short negative cache: if last attempt for this exact id was "no stream" very recently, skip
+            if (this.reliability.hasNegative(this.id, 'no_stream') && this.reliability.hasNegative(`${this.id}:${id}`, 'no_stream' as never)) {
+                continue;
+            }
+            // Half-open single-trial gate
+            const state = this.reliability.getState(this.id);
+            if (state === 'half-open' && !this.reliability.isProbeAllowed(this.id)) {
+                continue;
+            }
 
-                // Async-aware mapping: issue grants per stream.
-                const httpSources = [];
-                for (const stream of streams) {
-                    if (!stream.url || !/^https?:\/\//i.test(stream.url))
-                        continue;
-                    const reqHeaders =
-                        stream.behaviorHints?.proxyHeaders?.request;
-                    const proxied = await this.proxyUrl(stream.url, reqHeaders);
-                    if (!proxied) continue;
-                    // Reuse mapper heuristics via a one-shot proxy fn.
-                    const one: ProxyFn = () => proxied;
-                    const mapped = mapStreamsToSources(
-                        [stream],
-                        this.id,
-                        this.name,
-                        one
-                    );
-                    httpSources.push(...mapped);
+            const host = (() => {
+                try {
+                    return new URL(this.BASE_URL).hostname;
+                } catch {
+                    return undefined;
                 }
+            })();
+
+            let release: (() => void) | null = null;
+            const start = Date.now();
+            try {
+                if (signal?.aborted) throw Object.assign(new Error('Aborted'), { name: 'AbortError' });
+                // Per-provider + per-host concurrency gate — cancellable
+                release = await this.reliability.acquire(this.id, host, signal);
+                const latencyStart = Date.now();
+
+                // Retry only transient failures — cancellable
+                const streams = await this.reliability.withRetry(
+                    () =>
+                        fetchStreams(
+                            this.BASE_URL,
+                            stremioType,
+                            id,
+                            this.streamTimeoutMs,
+                            { policy: this.urlPolicy, signal }
+                        ),
+                    { maxAttempts: 2, baseMs: 150, signal }
+                );
+
+                const latency = Date.now() - latencyStart;
+
+                if (!streams.length) {
+                    this.reliability.recordFailure(this.id, 'no_stream', latency);
+                    // Remember per-id negative cache
+                    // (use a side map via negative cache key trick)
+                    (this.reliability as unknown as { negative: Map<string, unknown> }).negative.set(`${this.id}:${id}:no_stream`, { expiresAt: Date.now() + 30_000 });
+                    continue;
+                }
+
+                this.reliability.recordSuccess(this.id, latency);
+
+                const responseCacheMaxAge = (streams as unknown as { cacheMaxAge?: number }).cacheMaxAge;
+                // Source normalization: http direct streams via centralized service
+                // Provides typing, quality, hdr, codec, dedup, stable ids, grant creation.
+                // Pass probe=true to enable bounded HEAD/range validation without full download.
+                const httpSources = await globalSourceNormalization.normalize(
+                    // Only pass playable http streams; torrents handled separately below
+                    streams.filter((s) => s.url && /^https?:\/\//i.test(s.url)),
+                    {
+                        providerId: this.id,
+                        providerName: this.name,
+                        grants: this.secureProxy ? this.grants : undefined,
+                        publicBase: this.publicBase,
+                        dedupSeen,
+                        probe: true,
+                        signal,
+                        responseCacheMaxAge
+                    }
+                );
 
                 const torrentSources = await resolveTorrentStreams(
                     streams,
@@ -209,7 +277,8 @@ export class StremioAddonProvider extends BaseProvider {
                 const subtitles = await this.collectSubtitles(
                     streams,
                     stremioType,
-                    id
+                    id,
+                    signal
                 );
 
                 if (sources.length === 0) {
@@ -230,6 +299,17 @@ export class StremioAddonProvider extends BaseProvider {
                 );
                 return { sources, subtitles, diagnostics };
             } catch (err) {
+                const isAbort = (err as Error)?.name === 'AbortError' || (err as Error)?.name === 'TimeoutError';
+                const latency = Date.now() - start;
+                // Don't penalize circuit for user-initiated abort/cancellation
+                if (!(isAbort && signal?.aborted)) {
+                    const kind = this.reliability.classifyError(err);
+                    this.reliability.recordFailure(this.id, kind, latency);
+                }
+                if (isAbort && signal?.aborted) {
+                    // Propagate abort so outer deadline handling can stop further IDs
+                    throw err;
+                }
                 const message =
                     err instanceof Error ? err.message : 'Unknown error';
                 diagnostics.push({
@@ -238,6 +318,8 @@ export class StremioAddonProvider extends BaseProvider {
                     field: '',
                     severity: 'error'
                 });
+            } finally {
+                if (release) release();
             }
         }
 
@@ -247,7 +329,8 @@ export class StremioAddonProvider extends BaseProvider {
     private async collectSubtitles(
         streams: import('./protocol.js').StremioStream[],
         stremioType: string,
-        id: string
+        id: string,
+        signal?: AbortSignal
     ): Promise<Subtitle[]> {
         const collected: import('./protocol.js').StremioSubtitle[] = [];
 
@@ -256,17 +339,41 @@ export class StremioAddonProvider extends BaseProvider {
         }
 
         if (this.supportsSubtitles) {
-            try {
-                const subs = await fetchSubtitles(
-                    this.BASE_URL,
-                    stremioType,
-                    id,
-                    12_000,
-                    { policy: this.urlPolicy }
-                );
-                collected.push(...subs);
-            } catch {
-                /* subtitles are best-effort */
+            if (signal?.aborted) return [];
+            // Wrap subtitle fetch in same reliability policy as streams (single trial)
+            if (this.reliability.getState(this.id) === 'open') {
+                // Skip if circuit open
+            } else if (this.reliability.getState(this.id) === 'half-open' && !this.reliability.isProbeAllowed(this.id)) {
+                // Another half-open trial in flight
+            } else {
+                let release: (() => void) | null = null;
+                try {
+                    const host = (() => { try { return new URL(this.BASE_URL).hostname; } catch { return undefined; } })();
+                    release = await this.reliability.acquire(this.id, host, signal);
+                    const start = Date.now();
+                    const subs = await this.reliability.withRetry(
+                        () => fetchSubtitles(
+                            this.BASE_URL,
+                            stremioType,
+                            id,
+                            12_000,
+                            { policy: this.urlPolicy, signal }
+                        ),
+                        { maxAttempts: 2, baseMs: 120, signal }
+                    );
+                    this.reliability.recordSuccess(this.id, Date.now() - start);
+                    collected.push(...subs);
+                } catch (err) {
+                    if ((err as Error)?.name === 'AbortError' && signal?.aborted) {
+                        // cancellation — don't record as failure
+                    } else {
+                        const kind = this.reliability.classifyError(err);
+                        this.reliability.recordFailure(this.id, kind);
+                    }
+                    /* subtitles are best-effort */
+                } finally {
+                    if (release) release();
+                }
             }
         }
 
