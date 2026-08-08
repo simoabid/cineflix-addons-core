@@ -153,6 +153,28 @@ function healthBadge(a) {
     return `<span class="badge ${cls}" title="${escapeAttr(t)}">●</span>`;
 }
 
+function capabilityBadges(a) {
+    const c = a.capabilities;
+    if (!c) return '';
+    const parts = [];
+    if (c.stream && c.stream.length) {
+        const types = c.stream.flatMap((e) => e.mediaTypes).join(',');
+        const prefixes = c.stream.flatMap((e) => e.idPrefixes).join(',');
+        parts.push(`<span class="cap stream" title="stream: ${escapeAttr(types)} · ${escapeAttr(prefixes)}">stream</span>`);
+    }
+    if (c.subtitles && c.subtitles.length) {
+        parts.push('<span class="cap subtitles">subtitles</span>');
+    }
+    if (c.catalog) parts.push('<span class="cap catalog">catalog</span>');
+    if (c.meta) parts.push('<span class="cap meta">meta</span>');
+    if (c.status === 'limited') {
+        parts.push(`<span class="cap limited" title="${escapeAttr(c.statusReason || 'limited')}">limited</span>`);
+    } else if (c.status === 'unsupported') {
+        parts.push(`<span class="cap unsupported" title="${escapeAttr(c.statusReason || 'unsupported')}">unsupported</span>`);
+    }
+    return parts.join(' ');
+}
+
 function render() {
     const list = document.getElementById('addon-list');
     const empty = document.getElementById('empty-msg');
@@ -173,6 +195,7 @@ function render() {
         const logo = a.logo
             ? `<img class="logo-sm" src="${escapeAttr(a.logo)}" alt="" onerror="this.style.visibility='hidden'"/>`
             : `<div class="logo-sm"></div>`;
+        const caps = capabilityBadges(a);
 
         li.innerHTML = `
             <span class="drag" title="Drag to reorder">⠿</span>
@@ -182,6 +205,7 @@ function render() {
                     <span class="tag">${escapeHtml(a.source)}</span>
                 </div>
                 <div class="meta">${escapeHtml(types)}${resources ? ' · ' + escapeHtml(resources) : ''} · ${escapeHtml(a.id)}</div>
+                <div class="caps">${caps}</div>
             </div>
             <div class="actions">
                 <label class="timeout" title="Per-request timeout (ms)">
@@ -235,8 +259,11 @@ async function loadAddons() {
     try {
         const body = await api('/v1/addons');
         addons = body.addons || [];
+        const rev = body.revision != null ? ` · rev ${body.revision}` : '';
+        const streamCnt = addons.filter((a) => a.capabilities && a.capabilities.stream.length).length;
+        const subCnt = addons.filter((a) => a.capabilities && a.capabilities.subtitles.length).length;
         document.getElementById('store-desc').textContent =
-            'Store: ' + (body.store || 'unknown');
+            'Store: ' + (body.store || 'unknown') + rev + ` · stream:${streamCnt} subtitles:${subCnt}`;
         render();
     } catch (err) {
         toast(err.message, 'err');
