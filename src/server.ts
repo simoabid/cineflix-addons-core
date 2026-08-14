@@ -5,7 +5,8 @@ import { promises as fs } from 'node:fs';
 import {
     loadConfig,
     resolvePublicUrl,
-    assertProductionSafe
+    assertProductionSafe,
+    type AppConfig
 } from './config.js';
 import { AddonManager } from './addons/manager.js';
 import {
@@ -23,6 +24,12 @@ import { normalizeUpstreamUrl } from './sources/normalization.js';
 import { registerAddonRoutes } from './routes/addons.routes.js';
 import { registerImportRoutes } from './routes/import.routes.js';
 import { registerAuthRoutes } from './routes/auth.js';
+import { registerJobRoutes } from './routes/jobs.routes.js';
+import { createStorageBackend } from './storage/index.js';
+import { migrateLegacyFileToStorage } from './storage/importer.js';
+import { CacheManager } from './cache/index.js';
+import { buildAggregateResultKey } from './cache/namespaces.js';
+import { JobEngine } from './jobs/index.js';
 import { logScrapeProxyStatus } from './egress/scrapeFetch.js';
 import { installStreamEgress } from './egress/globalDispatcher.js';
 import {
@@ -152,8 +159,38 @@ async function main(): Promise<void> {
         mcp: { enabled: false }
     });
 
+    const storage = createStorageBackend(cfg);
+    await storage.init();
+
+    // If storage is newly initialized and a legacy JSON file exists, migrate it
+    const existingAddons = await storage.listAddons();
+    if (existingAddons.length === 0) {
+        try {
+            const stats = await fs.stat(cfg.dataFile);
+            if (stats.isFile()) {
+                const migRes = await migrateLegacyFileToStorage(
+                    cfg.dataFile,
+                    storage,
+                    { backup: true }
+                );
+                if (migRes.migrated > 0) {
+                    console.log(
+                        `[storage] Migrated ${migRes.migrated} legacy addon(s) to ${storage.describe()}`
+                    );
+                }
+            }
+        } catch {
+            /* ignore ENOENT */
+        }
+    }
+
+    const cacheManager = new CacheManager(cfg, {
+        aggregateResultSec: cfg.cacheTtlSources,
+        aggregateSwrSec: cfg.cacheSwrSec
+    });
+
     const registry = server.getRegistry();
-    const manager = AddonManager.create(registry, cfg);
+    const manager = AddonManager.create(registry, cfg, storage);
     // Revision hook: clear bulk/OMSS cache when provider set changes so
     // disabled/removed addons never remain in cached responses.
     // Made revision-aware: cache keys include provider revision, so stale entries
@@ -161,12 +198,18 @@ async function main(): Promise<void> {
     const omssCache = (server as unknown as { cache: { clear(): Promise<void> } }).cache;
     manager.setRevisionHook(async (rev) => {
         try {
+            await cacheManager.invalidateOnRevisionChange(rev);
             await omssCache.clear();
             console.log(`[cache] cleared after revision ${rev}`);
         } catch { /* ignore */ }
         try { globalMediaIdentity.clearCache(); } catch { /* ignore */ }
     });
     await manager.init();
+
+    const jobEngine = new JobEngine(storage, manager, cfg, {
+        concurrency: cfg.jobWorkerConcurrency,
+        pollIntervalMs: cfg.jobPollIntervalMs
+    });
 
     const proxyCtx = createSecureProxyContext(cfg);
     // Wire grants into providers so sources use /v1/proxy/grant/:id.
@@ -184,7 +227,7 @@ async function main(): Promise<void> {
 
     // Make source cache keys revision-aware so stale entries are never hit after a mutation,
     // even if the async clear hasn't finished. Also injects creation revision into cached responses.
-    patchCacheRevision(server, selection);
+    patchCacheRevision(server, selection, cacheManager, cfg);
 
     // Patch OMSS SourceService to use selection ordering and bounded concurrency.
     // This makes bulk and progressive agree on priority and ensures
@@ -193,7 +236,8 @@ async function main(): Promise<void> {
 
     const monitor = new HealthMonitor(manager, {
         intervalMinutes: cfg.healthIntervalMinutes,
-        autoRefresh: cfg.autoRefresh
+        autoRefresh: cfg.autoRefresh,
+        jobEngine
     });
 
     const app = server.getInstance();
@@ -476,9 +520,10 @@ async function main(): Promise<void> {
         });
     });
 
-    // ── Management + import API ────────────────────────────────────────────────
-    registerAddonRoutes(app, manager, cfg, monitor, audit);
-    registerImportRoutes(app, manager, cfg, audit);
+    // ── Management + import + job API ─────────────────────────────────────────
+    registerAddonRoutes(app, manager, cfg, monitor, audit, storage, cacheManager);
+    registerImportRoutes(app, manager, cfg, audit, jobEngine);
+    registerJobRoutes(app, jobEngine, storage, cfg, audit);
 
     // ── Admin UI (static) ──────────────────────────────────────────────────────
     if (cfg.adminEnabled) {
@@ -489,6 +534,18 @@ async function main(): Promise<void> {
 
     logScrapeProxyStatus();
     monitor.start();
+    jobEngine.start();
+
+    process.on('SIGTERM', () => {
+        jobEngine.stop();
+        monitor.stop();
+        void storage.close();
+    });
+    process.on('SIGINT', () => {
+        jobEngine.stop();
+        monitor.stop();
+        void storage.close();
+    });
 
     const authSummary =
         cfg.authMode === 'disabled'
@@ -500,7 +557,7 @@ async function main(): Promise<void> {
             `\n  • secureProxy=${cfg.secureProxy} legacyProxy=${cfg.allowLegacyProxy}` +
             `\n  • Point CINEFLIX serverUrl / VITE_CINEPRO_URL at this base.` +
             (cfg.adminEnabled ? `\n  • Admin UI: ${publicUrl}/admin` : '') +
-            `\n  • Store: ${manager.describeStore()}\n`
+            `\n  • Store: ${storage.describe()}\n`
     );
 }
 
@@ -536,30 +593,58 @@ function patchTMDBService(server: OMSSServer): void {
     console.log('[media] patched TMDBService to delegate to MediaIdentityService');
 }
 
-function patchCacheRevision(server: OMSSServer, selection: ProviderSelectionService): void {
-    const cache = (server as unknown as { cache: { get: (k: string) => Promise<unknown>; set: (k: string, v: unknown, ttl?: number) => Promise<unknown> } }).cache;
-    const origGet = cache.get.bind(cache);
-    const origSet = cache.set.bind(cache);
+function patchCacheRevision(
+    server: OMSSServer,
+    selection: ProviderSelectionService,
+    cacheManager: CacheManager,
+    cfg: AppConfig
+): void {
+    const cache = (server as unknown as {
+        cache: {
+            get: (k: string) => Promise<unknown>;
+            set: (k: string, v: unknown, ttl?: number) => Promise<unknown>;
+            clear: () => Promise<void>;
+        };
+    }).cache;
+
     cache.get = async (key: string) => {
         if (key.startsWith('movie:') || key.startsWith('tv:')) {
-            const revKey = `${key}:rev${selection.revision}`;
-            const v = await origGet(revKey);
+            const revKey = buildAggregateResultKey(selection.revision, key);
+            const v = await cacheManager.get(revKey);
             if (v != null) return v;
             return null;
         }
-        return origGet(key);
+        return cacheManager.get(key);
     };
+
     cache.set = async (key: string, value: unknown, ttl?: number) => {
         if (key.startsWith('movie:') || key.startsWith('tv:')) {
-            const revKey = `${key}:rev${selection.revision}`;
-            if (value && typeof value === 'object' && value !== null && !Array.isArray(value)) {
+            const revKey = buildAggregateResultKey(selection.revision, key);
+            if (
+                value &&
+                typeof value === 'object' &&
+                value !== null &&
+                !Array.isArray(value)
+            ) {
                 (value as Record<string, unknown>).revision = selection.revision;
             }
-            return origSet(revKey, value, ttl);
+            await cacheManager.set(
+                revKey,
+                value,
+                ttl ?? cfg.cacheTtlSources
+            );
+            return;
         }
-        return origSet(key, value, ttl);
+        await cacheManager.set(key, value, ttl);
     };
-    console.log('[cache] patched to be revision-aware (keys include provider revision)');
+
+    cache.clear = async () => {
+        await cacheManager.invalidateOnRevisionChange(selection.revision);
+    };
+
+    console.log(
+        '[cache] routed OMSS cache through CacheManager (namespaced keys, SWR & SingleFlight active)'
+    );
 }
 
 function patchSourceService(

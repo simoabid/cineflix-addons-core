@@ -2,11 +2,12 @@
  * Background health monitor + optional manifest auto-refresh.
  *
  * Periodically pings each enabled addon's manifest and records health on the
- * addon record (surfaced via /v1/addons + the admin UI). When ADDON_AUTO_REFRESH
- * is on, it also re-fetches the manifest (picking up new resources/types).
+ * addon record (surfaced via /v1/addons + the admin UI). In Phase 3, it can
+ * delegate periodic sweeps to the distributed JobEngine.
  */
 import type { AddonManager } from '../addons/manager.js';
 import { fetchManifest } from '../stremio/client.js';
+import type { JobEngine } from '../jobs/engine.js';
 
 const CONCURRENCY = 4;
 
@@ -24,13 +25,12 @@ export class HealthMonitor {
         private readonly opts: {
             intervalMinutes: number;
             autoRefresh: boolean;
+            jobEngine?: JobEngine;
         }
     ) {}
 
     /** Run a single sweep over all stream-enabled addons (health is readiness). */
     async checkAll(): Promise<HealthCheckSummary & { revision: number }> {
-        // Prioritize stream-capable providers — they determine readiness.
-        // Still count subtitle-only as secondary, but they don't gate degraded.
         const addons = this.manager.getStreamEnabled();
         let healthy = 0;
         for (let i = 0; i < addons.length; i += CONCURRENCY) {
@@ -75,6 +75,23 @@ export class HealthMonitor {
         }
     }
 
+    /** Trigger a sweep via the JobEngine if available, otherwise in-process. */
+    async triggerSweep(): Promise<void> {
+        if (this.opts.jobEngine) {
+            try {
+                await this.opts.jobEngine.enqueue(
+                    'health-sweep',
+                    {},
+                    { dedupKey: 'health-sweep-scheduled' }
+                );
+                return;
+            } catch {
+                /* fall back to direct check */
+            }
+        }
+        await this.checkAll();
+    }
+
     /** Start the periodic sweep (no-op when interval <= 0). */
     start(): void {
         const minutes = this.opts.intervalMinutes;
@@ -84,8 +101,8 @@ export class HealthMonitor {
         }
         const ms = minutes * 60 * 1000;
         // Kick an initial sweep shortly after boot, then on the interval.
-        setTimeout(() => void this.checkAll(), 5000);
-        this.timer = setInterval(() => void this.checkAll(), ms);
+        setTimeout(() => void this.triggerSweep(), 5000);
+        this.timer = setInterval(() => void this.triggerSweep(), ms);
         if (typeof this.timer.unref === 'function') this.timer.unref();
         console.log(
             `[health] monitoring every ${minutes}m` +

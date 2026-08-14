@@ -149,6 +149,35 @@
                     No addons installed yet — import some above.
                 </p>
             </section>
+
+            <section class="panel" id="jobs-panel">
+                <div class="panel-head">
+                    <h2>
+                        Background Jobs & Tasks
+                        <span class="count" id="job-count">0</span>
+                    </h2>
+                    <div class="head-actions">
+                        <button class="ghost" id="jobs-refresh-btn">Refresh</button>
+                    </div>
+                </div>
+                <p class="muted">
+                    Durable asynchronous queue for imports, health sweeps, and background maintenance.
+                </p>
+                <div id="job-list" class="job-list"></div>
+                <p class="empty" id="empty-jobs-msg">No recent background jobs.</p>
+            </section>
+
+            <section class="panel" id="migration-panel">
+                <div class="panel-head">
+                    <h2>Configuration & Migration</h2>
+                </div>
+                <p class="muted">
+                    Export or import sanitized addon configurations (all tokens and credentials stripped).
+                </p>
+                <div class="row">
+                    <button class="ghost" id="export-btn">Export Sanitized JSON</button>
+                </div>
+            </section>
         </main>
 
         <div class="toast" id="toast" hidden></div>

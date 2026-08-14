@@ -25,6 +25,9 @@ import {
 import { actorFromAuth, type AuditLogger } from '../security/audit.js';
 import type { Role } from '../security/auth.js';
 import { getRateLimitIp } from '../security/auth.js';
+import type { IStorageBackend, SanitizedExportData } from '../storage/types.js';
+import { importSanitizedConfiguration } from '../storage/importer.js';
+import type { CacheManager } from '../cache/manager.js';
 
 function clientIp(
     request: FastifyRequest,
@@ -47,7 +50,9 @@ export function registerAddonRoutes(
     manager: AddonManager,
     cfg: AppConfig,
     monitor?: HealthMonitor,
-    audit?: AuditLogger
+    audit?: AuditLogger,
+    storage?: IStorageBackend,
+    cacheManager?: CacheManager
 ): void {
     const viewerGuard = makeAuthGuard(cfg, requireRole('viewer'));
     const operatorGuard = makeAuthGuard(cfg, requireRole('operator'));
@@ -433,4 +438,90 @@ export function registerAddonRoutes(
             }
         );
     }
+
+    // ── configuration export & import (Phase 3.1) ───────────────────────────
+    app.get(
+        '/v1/settings/export',
+        { preHandler: adminGuard },
+        async (_req, reply) => {
+            if (storage) {
+                const data = await storage.exportSanitized();
+                return reply.code(200).send(data);
+            }
+            const data = {
+                version: 1,
+                revision: manager.getRevision(),
+                addons: manager.list().map((a) => {
+                    const pub = toPublicAddon(a);
+                    return {
+                        providerId: a.providerId,
+                        slug: a.slug,
+                        name: a.name,
+                        enabled: a.enabled,
+                        admissionState: a.admissionState,
+                        validationFindings: a.validationFindings,
+                        order: a.order,
+                        timeoutMs: a.timeoutMs,
+                        source: a.source,
+                        manifest: a.manifest,
+                        capabilities: pub.capabilities,
+                        addedAt: a.addedAt,
+                        updatedAt: a.updatedAt
+                    };
+                }),
+                exportedAt: new Date().toISOString()
+            };
+            return reply.code(200).send(data);
+        }
+    );
+
+    app.post<{ Body: SanitizedExportData }>(
+        '/v1/settings/import',
+        { preHandler: adminGuard },
+        async (req, reply) => {
+            const body = req.body;
+            if (!body || !Array.isArray(body.addons)) {
+                return reply.code(400).send({
+                    error: {
+                        code: 'INVALID_PAYLOAD',
+                        message: "Invalid configuration payload: 'addons' array is required"
+                    }
+                });
+            }
+            if (storage) {
+                const res = await importSanitizedConfiguration(storage, body);
+                await auditMutation(req, 'settings.import', undefined, 'success', {
+                    after: { importedCount: res.imported }
+                });
+                return reply.code(200).send({ ok: true, imported: res.imported });
+            }
+            return reply.code(200).send({ ok: true, imported: 0 });
+        }
+    );
+
+    // ── cache metrics & bypass (Phase 3.2) ───────────────────────────────────
+    app.get(
+        '/v1/cache/metrics',
+        { preHandler: viewerGuard },
+        async (_req, reply) => {
+            if (cacheManager) {
+                return reply.code(200).send({
+                    metrics: cacheManager.snapshot(),
+                    flight: cacheManager.flight.metrics()
+                });
+            }
+            return reply.code(200).send({
+                metrics: {
+                    hits: 0,
+                    misses: 0,
+                    swrHits: 0,
+                    sets: 0,
+                    evictions: 0,
+                    bypasses: 0,
+                    cardinality: 0,
+                    backend: 'memory'
+                }
+            });
+        }
+    );
 }

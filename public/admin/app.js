@@ -499,10 +499,120 @@ function wireImports() {
             toast('Signed in (session cookie)', 'ok');
             loadAddons();
             loadSettings();
+            loadJobs();
         } catch (err) {
             toast(err.message || 'Login failed', 'err');
         }
     });
+
+    document.getElementById('jobs-refresh-btn').addEventListener('click', loadJobs);
+    document.getElementById('export-btn').addEventListener('click', exportConfiguration);
+}
+
+// ── jobs (Phase 3) ──────────────────────────────────────────────────────────
+async function loadJobs() {
+    if (!authed) return;
+    try {
+        const body = await api('/v1/jobs?limit=25');
+        const jobs = body.jobs || [];
+        const countEl = document.getElementById('job-count');
+        if (countEl) countEl.textContent = String(jobs.length);
+        const listEl = document.getElementById('job-list');
+        const emptyEl = document.getElementById('empty-jobs-msg');
+        if (!listEl) return;
+
+        if (jobs.length === 0) {
+            listEl.innerHTML = '';
+            if (emptyEl) emptyEl.hidden = false;
+            return;
+        }
+        if (emptyEl) emptyEl.hidden = true;
+
+        listEl.innerHTML = jobs
+            .map((j) => {
+                const statusCls =
+                    j.status === 'completed'
+                        ? 'ok'
+                        : j.status === 'running'
+                          ? 'running'
+                          : j.status === 'failed' || j.status === 'dead_letter'
+                            ? 'bad'
+                            : 'neutral';
+
+                const canCancel = j.status === 'queued' || j.status === 'running';
+                const canRetry =
+                    j.status === 'failed' ||
+                    j.status === 'dead_letter' ||
+                    j.status === 'cancelled';
+
+                return `
+                <div class="job-item" data-id="${escapeAttr(j.id)}">
+                    <div class="job-header">
+                        <span class="badge ${statusCls}">${escapeHtml(j.status)}</span>
+                        <strong>${escapeHtml(j.type)}</strong>
+                        <span class="muted">${new Date(j.createdAt).toLocaleTimeString()}</span>
+                    </div>
+                    <div class="job-body">
+                        ${j.error ? `<div class="job-error">${escapeHtml(j.error)}</div>` : ''}
+                        <div class="job-progress">
+                            <div class="bar" style="width: ${j.progress || 0}%"></div>
+                        </div>
+                    </div>
+                    <div class="job-actions">
+                        ${canCancel ? `<button class="ghost small cancel-job-btn" data-id="${escapeAttr(j.id)}">Cancel</button>` : ''}
+                        ${canRetry ? `<button class="ghost small retry-job-btn" data-id="${escapeAttr(j.id)}">Retry</button>` : ''}
+                    </div>
+                </div>
+            `;
+            })
+            .join('');
+
+        listEl.querySelectorAll('.cancel-job-btn').forEach((btn) => {
+            btn.addEventListener('click', async () => {
+                const id = btn.dataset.id;
+                try {
+                    await api(`/v1/jobs/${id}/cancel`, { method: 'POST' });
+                    toast('Job cancelled', 'ok');
+                    loadJobs();
+                } catch (err) {
+                    toast(err.message, 'err');
+                }
+            });
+        });
+
+        listEl.querySelectorAll('.retry-job-btn').forEach((btn) => {
+            btn.addEventListener('click', async () => {
+                const id = btn.dataset.id;
+                try {
+                    await api(`/v1/jobs/${id}/retry`, { method: 'POST' });
+                    toast('Job queued for retry', 'ok');
+                    loadJobs();
+                } catch (err) {
+                    toast(err.message, 'err');
+                }
+            });
+        });
+    } catch (_) {
+        /* ignore */
+    }
+}
+
+async function exportConfiguration() {
+    try {
+        const data = await api('/v1/settings/export');
+        const blob = new Blob([JSON.stringify(data, null, 2)], {
+            type: 'application/json'
+        });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `addons-config-sanitized-${Date.now()}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+        toast('Configuration exported (sanitized)', 'ok');
+    } catch (err) {
+        toast(err.message || 'Export failed', 'err');
+    }
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -525,5 +635,8 @@ checkHealth();
 ensureSession().then(() => {
     loadAddons();
     loadSettings();
+    loadJobs();
 });
 setInterval(checkHealth, 30000);
+setInterval(loadJobs, 10000);
+

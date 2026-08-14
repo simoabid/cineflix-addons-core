@@ -5,6 +5,7 @@
  *   POST /v1/addons/import/stremio     { email, password } | { authKey } [admin]
  *   POST /v1/addons/import/repository  { url } [admin]
  *
+ * In Phase 3, asynchronous operations and batch imports are backed by the durable JobEngine.
  * All import mutations are rate-limited and audited. Request bodies that may
  * contain credentials are never written to logs.
  */
@@ -14,7 +15,6 @@ import type { AddonManager } from '../addons/manager.js';
 import { toPublicAddon } from '../addons/manager.js';
 import { importFromUrl, importFromUrls } from '../import/url.js';
 import { importFromStremioAccount } from '../import/stremioAccount.js';
-import { importFromRepository } from '../import/repository.js';
 import { makeAuthGuard, enforceRateLimit } from './auth.js';
 import {
     createRateLimiter,
@@ -23,7 +23,7 @@ import {
 } from '../security/rateLimit.js';
 import { actorFromAuth, type AuditLogger } from '../security/audit.js';
 import { redactUrl } from '../security/redaction.js';
-
+import type { JobEngine } from '../jobs/engine.js';
 import { getRateLimitIp } from '../security/auth.js';
 
 function clientIp(
@@ -58,7 +58,8 @@ export function registerImportRoutes(
     app: FastifyInstance,
     manager: AddonManager,
     cfg: AppConfig,
-    audit?: AuditLogger
+    audit?: AuditLogger,
+    jobEngine?: JobEngine
 ): void {
     const adminGuard = makeAuthGuard(cfg, { role: 'admin' });
     const limiter = createRateLimiter();
@@ -68,28 +69,6 @@ export function registerImportRoutes(
         string,
         { body: unknown; status: number; expiresAt: number }
     >();
-    // Job store for background repository imports (shared across status/cancel endpoints)
-    type ImportJobRecord = {
-        id: string;
-        status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
-        createdAt: number;
-        startedAt?: number;
-        finishedAt?: number;
-        url?: string;
-        result?: unknown;
-        error?: string;
-        cancelled?: boolean;
-        // internal — not exposed via API
-        abortController?: AbortController;
-        timeoutHandle?: ReturnType<typeof setTimeout>;
-    };
-    const jobs = new Map<string, ImportJobRecord>();
-
-    function toPublicJob(job: ImportJobRecord): Omit<ImportJobRecord, 'abortController' | 'timeoutHandle'> {
-        // eslint-disable-next-line @typescript-eslint/no-unused-vars
-        const { abortController, timeoutHandle, ...pub } = job as ImportJobRecord & Record<string, unknown>;
-        return pub as Omit<ImportJobRecord, 'abortController' | 'timeoutHandle'>;
-    }
 
     function getIdempotencyKey(req: FastifyRequest): string | undefined {
         const h =
@@ -108,7 +87,7 @@ export function registerImportRoutes(
         if (!key) return false;
         const entry = idempotency.get(key);
         if (!entry) return false;
-        if (Date.now() > entry.expiresAt) {
+        if (entry.expiresAt < Date.now()) {
             idempotency.delete(key);
             return false;
         }
@@ -123,33 +102,28 @@ export function registerImportRoutes(
     ): void {
         if (!key) return;
         idempotency.set(key, {
-            body,
             status,
-            expiresAt: Date.now() + 24 * 60 * 60 * 1000
+            body,
+            expiresAt: Date.now() + 24 * 3600 * 1000
         });
-        // Cap map size
-        if (idempotency.size > 1000) {
-            const first = idempotency.keys().next().value as string | undefined;
-            if (first) idempotency.delete(first);
-        }
     }
 
     async function gate(
         req: FastifyRequest,
         reply: import('fastify').FastifyReply
-    ) {
+    ): Promise<boolean> {
+        const ip = clientIp(req, cfg);
         return enforceRateLimit(
             reply,
             limiter,
-            rateLimitKey('import', req.auth?.actor?.id, clientIp(req, cfg)),
+            rateLimitKey('import', req.auth?.actor?.id, ip),
             RATE_LIMITS.import.limit,
             RATE_LIMITS.import.windowMs
         );
     }
 
-    app.post<{
-        Body: { url?: string; urls?: string[]; enable?: boolean };
-    }>(
+    // ── import from URL (single or batch) ───────────────────────────────────
+    app.post<{ Body: { url?: string; urls?: string[]; enable?: boolean } }>(
         '/v1/addons/import/url',
         { preHandler: adminGuard },
         async (req, reply) => {
@@ -158,92 +132,41 @@ export function registerImportRoutes(
             if (tryIdempotency(idemKey, reply)) return;
             const body = req.body ?? {};
             const enableOpt =
-                typeof body.enable === 'boolean' ? { enable: body.enable } : {};
+                typeof body.enable === 'boolean'
+                    ? { enable: body.enable }
+                    : undefined;
 
-            if (Array.isArray(body.urls) && body.urls.length) {
-                if (body.urls.length > cfg.importMaxUrls) {
-                    return reply.code(400).send({
-                        error: {
-                            code: 'TOO_MANY_URLS',
-                            message: `At most ${cfg.importMaxUrls} URLs per request`
+            // Batch import
+            if (Array.isArray(body.urls) && body.urls.length > 0) {
+                if (jobEngine) {
+                    const job = await jobEngine.enqueue(
+                        'multi-addon-import',
+                        { urls: body.urls, enable: body.enable },
+                        {
+                            idempotencyKey: idemKey,
+                            requester: {
+                                id: req.auth?.actor?.id,
+                                ip: clientIp(req, cfg),
+                                role: req.auth?.actor?.role
+                            }
                         }
-                    });
+                    );
+                    const resp = {
+                        ok: true,
+                        jobId: job.id,
+                        status: job.status,
+                        message: 'Batch import queued on durable job engine'
+                    };
+                    storeIdempotency(idemKey, 202, resp);
+                    return reply.code(202).send(resp);
                 }
-                // Pre-persist guards: estimate before mutating store (P2-14)
-                const urlBytes = Buffer.byteLength(
-                    body.urls.join('\n'),
-                    'utf8'
+
+                // Fallback synchronous import
+                const results = await importFromUrls(
+                    manager,
+                    body.urls,
+                    enableOpt
                 );
-                const estBatchBytes = urlBytes + body.urls.length * 2048;
-                if (estBatchBytes > cfg.importMaxBatchBytes) {
-                    return reply.code(413).send({
-                        error: {
-                            code: 'BATCH_TOO_LARGE',
-                            message:
-                                'Estimated batch size exceeds limit before persistence'
-                        }
-                    });
-                }
-                if (
-                    body.urls.length * cfg.importMaxUrls > 0 &&
-                    estBatchBytes > cfg.importMaxBatchBytes
-                ) {
-                    return reply.code(413).send({
-                        error: {
-                            code: 'BATCH_TOO_LARGE',
-                            message: 'Batch too large'
-                        }
-                    });
-                }
-                const abortController = new AbortController();
-                let timedOut = false;
-                const timeoutId = setTimeout(() => {
-                    timedOut = true;
-                    abortController.abort();
-                }, cfg.importJobTimeoutMs);
-                let results;
-                try {
-                    results = await Promise.race([
-                        importFromUrls(manager, body.urls, enableOpt),
-                        new Promise<never>((_, rej) =>
-                            abortController.signal.addEventListener(
-                                'abort',
-                                () => rej(new Error('Batch import timed out')),
-                                { once: true }
-                            )
-                        )
-                    ]);
-                } catch (err) {
-                    clearTimeout(timeoutId);
-                    const msg =
-                        err instanceof Error ? err.message : 'Batch failed';
-                    if (msg.includes('timed out') || timedOut) {
-                        throw Object.assign(
-                            new Error('Batch import timed out'),
-                            { statusCode: 504 }
-                        );
-                    }
-                    throw err;
-                }
-                clearTimeout(timeoutId);
-                if (timedOut || abortController.signal.aborted) {
-                    return reply.code(504).send({
-                        error: {
-                            code: 'IMPORT_TIMEOUT',
-                            message: 'Batch import exceeded time limit'
-                        }
-                    });
-                }
-                // Post-persist guard: still enforce absolute cap and roll back if exceeded
-                const persistedEstimate = JSON.stringify(manager.list()).length;
-                if (persistedEstimate > cfg.importMaxBatchBytes * 4) {
-                    return reply.code(413).send({
-                        error: {
-                            code: 'BATCH_TOO_LARGE',
-                            message: 'Persisted size exceeds absolute limit'
-                        }
-                    });
-                }
                 const installed = results.filter((r) => r.ok).length;
                 if (audit) {
                     await audit.record({
@@ -272,7 +195,36 @@ export function registerImportRoutes(
                 storeIdempotency(idemKey, 200, resp);
                 return reply.code(200).send(resp);
             }
+
+            // Single URL import
             if (typeof body.url === 'string' && body.url.trim()) {
+                const preferAsync =
+                    req.headers['prefer'] === 'respond-async' ||
+                    req.headers['x-prefer-async'] === 'true';
+
+                if (preferAsync && jobEngine) {
+                    const job = await jobEngine.enqueue(
+                        'multi-addon-import',
+                        { urls: [body.url.trim()], enable: body.enable },
+                        {
+                            idempotencyKey: idemKey,
+                            requester: {
+                                id: req.auth?.actor?.id,
+                                ip: clientIp(req, cfg),
+                                role: req.auth?.actor?.role
+                            }
+                        }
+                    );
+                    const resp = {
+                        ok: true,
+                        jobId: job.id,
+                        status: job.status,
+                        message: 'Import queued'
+                    };
+                    storeIdempotency(idemKey, 202, resp);
+                    return reply.code(202).send(resp);
+                }
+
                 const result = await importFromUrl(
                     manager,
                     body.url.trim(),
@@ -301,6 +253,7 @@ export function registerImportRoutes(
                 storeIdempotency(idemKey, status, resp);
                 return reply.code(status).send(resp);
             }
+
             return reply.code(400).send({
                 error: {
                     code: 'MISSING_PARAMETER',
@@ -310,6 +263,7 @@ export function registerImportRoutes(
         }
     );
 
+    // ── import from Stremio account ─────────────────────────────────────────
     app.post<{
         Body: {
             email?: string;
@@ -334,6 +288,36 @@ export function registerImportRoutes(
                     }
                 });
             }
+
+            if (jobEngine) {
+                const job = await jobEngine.enqueue(
+                    'stremio-account-import',
+                    {
+                        email: body.email,
+                        password: body.password,
+                        authKey: body.authKey,
+                        endpoint: body.endpoint,
+                        enable: body.enable
+                    },
+                    {
+                        idempotencyKey: idemKey,
+                        requester: {
+                            id: req.auth?.actor?.id,
+                            ip: clientIp(req, cfg),
+                            role: req.auth?.actor?.role
+                        }
+                    }
+                );
+                const resp = {
+                    ok: true,
+                    jobId: job.id,
+                    status: job.status,
+                    message: 'Stremio account import queued on durable job engine'
+                };
+                storeIdempotency(idemKey, 202, resp);
+                return reply.code(202).send(resp);
+            }
+
             try {
                 // Credentials must never appear in logs/audit payloads.
                 const result = await importFromStremioAccount(manager, {
@@ -391,6 +375,7 @@ export function registerImportRoutes(
         }
     );
 
+    // ── import from repository (durable queue backed) ───────────────────────
     app.post<{ Body: { url?: string; enable?: boolean } }>(
         '/v1/addons/import/repository',
         { preHandler: adminGuard },
@@ -407,155 +392,81 @@ export function registerImportRoutes(
                     }
                 });
             }
-            // Create a genuinely background job so status/cancellation can interrupt it.
-            // Return 202 immediately; the import runs detached and polls via /v1/import/jobs/:jobId.
-            const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-            const abortController = new AbortController();
-            const job: ImportJobRecord = {
-                id: jobId,
-                status: 'queued',
-                createdAt: Date.now(),
-                url,
-                abortController
-            };
-            jobs.set(jobId, job);
 
-            const timeoutHandle = setTimeout(() => {
-                if (job.status === 'queued' || job.status === 'running') {
-                    abortController.abort();
-                    job.status = 'failed';
-                    job.error = 'Import timed out';
-                    job.finishedAt = Date.now();
-                }
-            }, cfg.importJobTimeoutMs);
-            job.timeoutHandle = timeoutHandle;
-
-            const auditActor = audit ? actorFromAuth(req.auth?.actor, clientIp(req, cfg)) : null;
-            const auditRequestId = req.id;
-            const idemKeyForBg = idemKey;
-
-            void (async () => {
-                job.status = 'running';
-                job.startedAt = Date.now();
-                try {
-                    if (abortController.signal.aborted) {
-                        throw Object.assign(new Error('Import cancelled'), {
-                            code: 'CANCELLED',
-                            name: 'AbortError'
-                        });
-                    }
-                    const result = await importFromRepository(manager, url, {
-                        cfg,
-                        signal: abortController.signal
-                    });
-
-                    if (abortController.signal.aborted || job.cancelled) {
-                        job.status = 'cancelled';
-                        job.error = 'Import cancelled';
-                        job.finishedAt = Date.now();
-                        clearTimeout(timeoutHandle);
-                        if (audit && auditActor) {
-                            await audit.record({
-                                actor: auditActor,
-                                action: 'import.repository',
-                                requestId: auditRequestId,
-                                outcome: 'failure',
-                                reason: 'Import cancelled',
-                                meta: { url: redactUrl(url), jobId, cancelled: true }
-                            });
+            if (jobEngine) {
+                const job = await jobEngine.enqueue(
+                    'repository-import',
+                    { url, enable: req.body?.enable },
+                    {
+                        idempotencyKey: idemKey,
+                        requester: {
+                            id: req.auth?.actor?.id,
+                            ip: clientIp(req, cfg),
+                            role: req.auth?.actor?.role
                         }
-                        return;
                     }
-
-                    job.status = 'completed';
-                    job.result = result;
-                    job.finishedAt = Date.now();
-                    clearTimeout(timeoutHandle);
-
-                    if (audit && auditActor) {
-                        await audit.record({
-                            actor: auditActor,
-                            action: 'import.repository',
-                            requestId: auditRequestId,
-                            revision: manager.getRevision(),
-                            outcome: result.installed > 0 ? 'success' : 'failure',
-                            meta: {
-                                url: redactUrl(url),
-                                discovered: result.discovered,
-                                installed: result.installed,
-                                jobId
-                            }
-                        });
-                    }
-                    if (idemKeyForBg) {
-                        const resp = {
-                            ok: true,
-                            ...result,
-                            jobId,
-                            results: result.results.map(publicInstallResult),
-                            revision: manager.getRevision()
-                        };
-                        storeIdempotency(idemKeyForBg, 200, resp);
-                    }
-                } catch (err) {
-                    clearTimeout(timeoutHandle);
-                    const isCancelled =
-                        abortController.signal.aborted ||
-                        job.cancelled ||
-                        (err as Error)?.name === 'AbortError' ||
-                        (err as { code?: string })?.code === 'CANCELLED' ||
-                        /cancelled/i.test(err instanceof Error ? err.message : String(err));
-
-                    if (isCancelled) {
-                        job.status = 'cancelled';
-                        job.error = 'Import cancelled';
-                    } else {
-                        job.status = 'failed';
-                        job.error = err instanceof Error ? err.message : 'Import failed';
-                    }
-                    job.finishedAt = Date.now();
-
-                    if (audit && auditActor) {
-                        await audit.record({
-                            actor: auditActor,
-                            action: 'import.repository',
-                            requestId: auditRequestId,
-                            outcome: 'failure',
-                            reason: job.error,
-                            meta: { url: redactUrl(url), jobId, cancelled: isCancelled }
-                        });
-                    }
-                    if (idemKeyForBg && !isCancelled) {
-                        const resp = {
-                            ok: false,
-                            error: job.error,
-                            jobId
-                        };
-                        storeIdempotency(idemKeyForBg, 400, resp);
-                    }
+                );
+                if (audit) {
+                    await audit.record({
+                        actor: actorFromAuth(
+                            req.auth?.actor,
+                            clientIp(req, cfg)
+                        ),
+                        action: 'import.repository.queued',
+                        requestId: req.id,
+                        target: job.id,
+                        outcome: 'success',
+                        meta: { url: redactUrl(url), jobId: job.id }
+                    });
                 }
-            })();
-
-            const queuedResp = { ok: true, jobId, status: 'queued' as const, message: 'Import queued' };
-            if (idemKey) {
-                storeIdempotency(idemKey, 202, queuedResp);
+                const queuedResp = {
+                    ok: true,
+                    jobId: job.id,
+                    status: job.status,
+                    message: 'Repository import queued on durable job engine'
+                };
+                if (idemKey) {
+                    storeIdempotency(idemKey, 202, queuedResp);
+                }
+                return reply.code(202).send(queuedResp);
             }
-            return reply.code(202).send(queuedResp);
+
+            return reply.code(503).send({
+                error: {
+                    code: 'JOB_ENGINE_UNAVAILABLE',
+                    message: 'Durable job engine is required for repository imports'
+                }
+            });
         }
     );
 
-    // Job status + cancellation endpoints (P2-14)
+    // ── unified import jobs endpoints (durable query & cancel) ───────────────
     app.get<{ Params: { jobId: string } }>(
         '/v1/import/jobs/:jobId',
         { preHandler: adminGuard },
         async (req, reply) => {
-            const job = jobs.get(req.params.jobId);
+            if (!jobEngine) {
+                return reply.code(404).send({
+                    error: { code: 'NOT_FOUND', message: 'Job not found' }
+                });
+            }
+            const job = await jobEngine.storage.getJob(req.params.jobId);
             if (!job) {
                 return reply.code(404).send({
                     error: { code: 'NOT_FOUND', message: 'Job not found' }
                 });
             }
-            return reply.code(200).send(toPublicJob(job));
+            return reply.code(200).send({
+                id: job.id,
+                type: job.type,
+                status: job.status,
+                progress: job.progress,
+                result: job.result,
+                error: job.error,
+                createdAt: job.createdAt,
+                startedAt: job.startedAt,
+                finishedAt: job.finishedAt
+            });
         }
     );
 
@@ -563,26 +474,19 @@ export function registerImportRoutes(
         '/v1/import/jobs/:jobId',
         { preHandler: adminGuard },
         async (req, reply) => {
-            const job = jobs.get(req.params.jobId);
+            if (!jobEngine) {
+                return reply.code(404).send({
+                    error: { code: 'NOT_FOUND', message: 'Job not found' }
+                });
+            }
+            const job = await jobEngine.storage.getJob(req.params.jobId);
             if (!job) {
                 return reply.code(404).send({
                     error: { code: 'NOT_FOUND', message: 'Job not found' }
                 });
             }
             if (job.status === 'running' || job.status === 'queued') {
-                job.cancelled = true;
-                job.status = 'cancelled';
-                job.finishedAt = Date.now();
-                job.error = 'Import cancelled';
-                try {
-                    job.abortController?.abort();
-                } catch {
-                    /* ignore */
-                }
-                if (job.timeoutHandle) {
-                    clearTimeout(job.timeoutHandle);
-                    job.timeoutHandle = undefined;
-                }
+                await jobEngine.cancel(job.id);
                 if (audit) {
                     await audit.record({
                         actor: actorFromAuth(
@@ -595,7 +499,8 @@ export function registerImportRoutes(
                         outcome: 'success'
                     });
                 }
-                return reply.code(200).send({ ok: true, job: toPublicJob(job) });
+                const updated = await jobEngine.storage.getJob(job.id);
+                return reply.code(200).send({ ok: true, job: updated });
             }
             return reply.code(409).send({
                 error: {
@@ -610,9 +515,23 @@ export function registerImportRoutes(
         '/v1/import/jobs',
         { preHandler: adminGuard },
         async (_req, reply) => {
-            return reply
-                .code(200)
-                .send({ jobs: [...jobs.values()].slice(-50).map(toPublicJob) });
+            if (!jobEngine) {
+                return reply.code(200).send({ jobs: [] });
+            }
+            const jobs = await jobEngine.storage.listJobs({ limit: 50 });
+            return reply.code(200).send({
+                jobs: jobs.map((j) => ({
+                    id: j.id,
+                    type: j.type,
+                    status: j.status,
+                    progress: j.progress,
+                    result: j.result,
+                    error: j.error,
+                    createdAt: j.createdAt,
+                    startedAt: j.startedAt,
+                    finishedAt: j.finishedAt
+                }))
+            });
         }
     );
 }
