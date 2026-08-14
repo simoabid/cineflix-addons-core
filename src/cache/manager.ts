@@ -10,7 +10,7 @@ import {
     type CacheTtlConfig
 } from './namespaces.js';
 import { SingleFlightGroup, globalSingleFlight } from './singleFlight.js';
-import { StaleWhileRevalidate, globalSwr, type SwrCacheStorage } from './swr.js';
+import { StaleWhileRevalidate, type SwrCacheStorage } from './swr.js';
 
 export interface CacheMetrics {
     hits: number;
@@ -167,8 +167,7 @@ export class CacheManager {
 
     async set<T>(key: string, value: T, ttlSec = 3600): Promise<void> {
         this.sets++;
-        const raw =
-            typeof value === 'string' ? value : JSON.stringify(value);
+        const raw = typeof value === 'string' ? value : JSON.stringify(value);
         if (this.backendType === 'redis') {
             const redis = await this.getRedis();
             if (redis) {
@@ -188,16 +187,44 @@ export class CacheManager {
         await this.memory.del(key);
     }
 
-    /** Invalidate all keys matching a prefix. */
+    /** Invalidate all keys matching a prefix using non-blocking SCAN iterator. */
     async invalidatePrefix(prefix: string): Promise<number> {
         let count = 0;
         if (this.backendType === 'redis') {
             const redis = await this.getRedis();
             if (redis) {
                 try {
-                    const keys = await redis.keys(`${prefix}*`);
-                    if (keys.length > 0) {
-                        count += await redis.del(keys);
+                    if (typeof redis.scanIterator === 'function') {
+                        const batch: string[] = [];
+                        for await (const key of redis.scanIterator({
+                            MATCH: `${prefix}*`,
+                            COUNT: 100
+                        })) {
+                            batch.push(key as string);
+                            if (batch.length >= 100) {
+                                count += await redis.del(batch);
+                                batch.length = 0;
+                            }
+                        }
+                        if (batch.length > 0) {
+                            count += await redis.del(batch);
+                        }
+                    } else if (typeof redis.scan === 'function') {
+                        let cursor = '0';
+                        do {
+                            const reply = await redis.scan(
+                                cursor,
+                                'MATCH',
+                                `${prefix}*`,
+                                'COUNT',
+                                100
+                            );
+                            cursor = reply[0];
+                            const keys = reply[1];
+                            if (keys && keys.length > 0) {
+                                count += await redis.del(keys);
+                            }
+                        } while (cursor !== '0');
                     }
                 } catch {
                     /* ignore */
@@ -221,7 +248,9 @@ export class CacheManager {
     async invalidateOnDebridChange(): Promise<void> {
         await this.invalidatePrefix('aggregate-result:v1:');
         await this.invalidatePrefix('provider-result:v1:');
-        console.log('[cache] invalidated provider/aggregate caches on debrid change');
+        console.log(
+            '[cache] invalidated provider/aggregate caches on debrid change'
+        );
     }
 
     /** Event-driven invalidation when a provider becomes quarantined/unhealthy. */
@@ -249,7 +278,9 @@ export class CacheManager {
 
     /** Check if request specifies privileged cache bypass. */
     shouldBypass(
-        auth: { role?: string; isOperator?: boolean; isAdmin?: boolean } | undefined,
+        auth:
+            | { role?: string; isOperator?: boolean; isAdmin?: boolean }
+            | undefined,
         headers: Record<string, string | string[] | undefined>
     ): boolean {
         const bypassHeader =

@@ -9,7 +9,8 @@ dist
 .env.local
 
 # Runtime persistence (installed addons + settings)
-data/*.json
+data/
+data/*
 
 # Logs
 *.log
@@ -22,4 +23,6 @@ Thumbs.db
 # Plans
 PRODUCTION_READINESS_PLAN.md
 Prompts.txt
-Phase-4-plan.md
+Phase-5-plan.md
+phase5_implementation_plan.md
+Phase-6-plan.md
