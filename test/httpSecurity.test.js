@@ -85,3 +85,67 @@ test('assertCorsSafe refuses wildcard in production', () => {
         })
     );
 });
+
+test('registerHttpSecurity handles 404 routes and redacts sensitive query parameters', async () => {
+    const { default: Fastify } = await import('fastify');
+    const { registerHttpSecurity } =
+        await import('../dist/security/httpSecurity.js');
+    const app = Fastify();
+
+    registerHttpSecurity(app, {
+        nodeEnv: 'development',
+        corsOrigin: '*',
+        enableAdminUi: false,
+        adminToken: 'test'
+    });
+
+    await app.ready();
+    const res = await app.inject({
+        method: 'GET',
+        url: '/non-existent-route?token=secret_grant_token&apiKey=12345'
+    });
+    assert.equal(res.statusCode, 404);
+    const body = JSON.parse(res.body);
+    assert.ok(body.error);
+    assert.ok(!res.body.includes('secret_grant_token'));
+    assert.ok(!res.body.includes('12345'));
+});
+
+test('registerHttpSecurity aborts request.signal on global timeout and returns 408', async () => {
+    const { default: Fastify } = await import('fastify');
+    const { registerHttpSecurity } =
+        await import('../dist/security/httpSecurity.js');
+    const app = Fastify();
+    registerHttpSecurity(app, {
+        nodeEnv: 'development',
+        corsOrigin: '*',
+        enableAdminUi: false,
+        adminToken: 'test',
+        globalRequestTimeoutMs: 50,
+        maxBodyBytes: 1_000_000,
+        maxJsonDepth: 10,
+        maxQueryLength: 2048
+    });
+
+    let signalAborted = false;
+    app.get('/slow-route', async (req, reply) => {
+        const signal = req.signal;
+        if (signal) {
+            signal.addEventListener('abort', () => {
+                signalAborted = true;
+            });
+        }
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        if (!reply.sent) {
+            return reply.code(200).send({ done: true });
+        }
+    });
+
+    await app.ready();
+    const res = await app.inject({
+        method: 'GET',
+        url: '/slow-route'
+    });
+    assert.equal(res.statusCode, 408);
+    assert.equal(signalAborted, true);
+});

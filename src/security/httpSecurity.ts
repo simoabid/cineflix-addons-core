@@ -306,12 +306,26 @@ export function registerHttpSecurity(
         // Parser already registered (e.g., in tests) — ignore
     }
 
-    // Global request timeout with abort (P2-12 / P1)
-    if (cfg.globalRequestTimeoutMs > 0) {
-        app.addHook('onRequest', async (request, reply) => {
+    app.addHook('onRequest', async (request, reply) => {
+        const rawSignal = (request.raw as unknown as { signal?: AbortSignal })
+            ?.signal;
+        if (cfg.globalRequestTimeoutMs > 0) {
             const controller = new AbortController();
-            (request as unknown as { signal?: AbortSignal }).signal =
-                controller.signal;
+            (
+                request as unknown as { _timeoutController?: AbortController }
+            )._timeoutController = controller;
+
+            const mergedSignal =
+                rawSignal && typeof AbortSignal.any === 'function'
+                    ? AbortSignal.any([rawSignal, controller.signal])
+                    : controller.signal;
+
+            Object.defineProperty(request, 'signal', {
+                value: mergedSignal,
+                writable: true,
+                configurable: true
+            });
+
             const t = setTimeout(() => {
                 controller.abort();
                 if (!reply.sent) {
@@ -321,13 +335,6 @@ export function registerHttpSecurity(
                             message: 'Request timed out'
                         }
                     });
-                    try {
-                        (
-                            request.raw as unknown as { destroy?: () => void }
-                        ).destroy?.();
-                    } catch (_e) {
-                        void _e;
-                    }
                 }
             }, cfg.globalRequestTimeoutMs);
             reply.raw.on('finish', () => {
@@ -339,8 +346,14 @@ export function registerHttpSecurity(
                 controller.abort();
             });
             (request as unknown as { _timeout?: NodeJS.Timeout })._timeout = t;
-        });
-    }
+        } else if (rawSignal) {
+            Object.defineProperty(request, 'signal', {
+                value: rawSignal,
+                writable: true,
+                configurable: true
+            });
+        }
+    });
 
     // Fallback depth check for already-parsed bodies (e.g., other content types)
     app.addHook('preHandler', async (request, reply) => {
@@ -348,10 +361,10 @@ export function registerHttpSecurity(
         if (body && typeof body === 'object') {
             const depth = jsonDepth(body);
             if (depth > cfg.maxJsonDepth) {
-                await reply.code(400).send({
+                void reply.code(400).send({
                     error: {
                         code: 'JSON_DEPTH_EXCEEDED',
-                        message: `JSON depth ${depth} exceeds limit ${cfg.maxJsonDepth}`
+                        message: `Body depth ${depth} exceeds max of ${cfg.maxJsonDepth}`
                     }
                 });
                 return;
@@ -441,16 +454,32 @@ export function registerHttpSecurity(
         void reply.code(status).send(body);
     });
 
-    // Not-found handler: also redact URLs
-    app.setNotFoundHandler((request, reply) => {
-        const safePath = redactLogPath(request.url ?? '');
-        void reply.code(404).send({
-            error: {
-                code: 'NOT_FOUND',
-                message: `Route ${request.method} ${safePath} not found`
-            },
-            requestId: request.id
+    // Not-found handler: redact query parameters in URLs (proxy grants, tokens)
+    try {
+        app.setNotFoundHandler((request, reply) => {
+            const safePath = redactLogPath(request.url ?? '');
+            void reply.code(404).send({
+                error: {
+                    code: 'NOT_FOUND',
+                    message: `Route ${request.method} ${safePath} not found`
+                },
+                requestId: request.id
+            });
         });
+    } catch {
+        // Fastify prohibits calling setNotFoundHandler twice at the same plugin scope.
+        // The onSend hook below guarantees that 404 responses never leak URL queries.
+    }
+
+    app.addHook('onSend', async (_request, reply, payload) => {
+        if (
+            reply.statusCode === 404 &&
+            typeof payload === 'string' &&
+            payload.includes('?')
+        ) {
+            return redactString(payload);
+        }
+        return payload;
     });
 }
 
