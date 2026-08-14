@@ -23,6 +23,7 @@ import { validateOutboundUrl, UrlPolicyError } from './urlPolicy.js';
 import { createRateLimiter, RATE_LIMITS, rateLimitKey } from './rateLimit.js';
 import { scrapeFetch } from '../egress/scrapeFetch.js';
 import { getRateLimitIp } from './auth.js';
+import { globalMetrics } from '../metrics/index.js';
 
 const HOP_BY_HOP = new Set([
     'connection',
@@ -486,11 +487,15 @@ async function handleGrantRequest(
     cfg: AppConfig,
     publicBase: string
 ): Promise<void> {
+    if (request.headers.range) {
+        globalMetrics.recordProxyRangeRequest();
+    }
     let upstream: Response & { finalUrl?: string };
     try {
         upstream = await fetchGrantUpstream(grant, request, cfg);
     } catch (err) {
         if (err instanceof UrlPolicyError) {
+            globalMetrics.recordProxyDeniedSsrf();
             await reply.code(403).send({
                 error: {
                     code: 'URL_POLICY_VIOLATION',
@@ -501,6 +506,7 @@ async function handleGrantRequest(
         }
         const status = (err as { statusCode?: number }).statusCode ?? 502;
         const code = (err as { code?: string }).code ?? 'PROXY_UPSTREAM_ERROR';
+        globalMetrics.recordProxyUpstreamError(status);
         await reply.code(status).send({
             error: {
                 code,
@@ -515,6 +521,7 @@ async function handleGrantRequest(
         upstream.headers.get('content-type') ?? mimeFromUrl(finalUrl);
 
     if (upstream.status >= 500) {
+        globalMetrics.recordProxyUpstreamError(upstream.status);
         await reply.code(502).send({
             error: {
                 code: 'UPSTREAM_ERROR',
@@ -563,6 +570,7 @@ async function handleGrantRequest(
             contentType
         );
         const out = Buffer.from(rewritten, 'utf8');
+        globalMetrics.recordProxyBytes(out.byteLength);
         await reply
             .code(upstream.status)
             .headers({
@@ -612,10 +620,18 @@ async function handleGrantRequest(
                 return;
             }
         }
+        globalMetrics.incrementActiveProxyStreams();
         const maxStream = cfg.proxyMaxStreamBytes;
         const webStream = upstream.body as import('stream/web').ReadableStream;
         const nodeStream = Readable.fromWeb(webStream);
         let bytesSeen = 0;
+        let streamClosed = false;
+        const cleanupStream = () => {
+            if (!streamClosed) {
+                streamClosed = true;
+                globalMetrics.decrementActiveProxyStreams();
+            }
+        };
         const limited = nodeStream.pipe(
             new Transform({
                 transform(
@@ -624,6 +640,7 @@ async function handleGrantRequest(
                     cb: (err?: Error | null, data?: unknown) => void
                 ) {
                     bytesSeen += chunk.byteLength;
+                    globalMetrics.recordProxyBytes(chunk.byteLength);
                     if (bytesSeen > maxStream) {
                         cb(new Error(`Stream exceeded limit ${maxStream}`));
                     } else {
@@ -634,12 +651,15 @@ async function handleGrantRequest(
         );
         // If limit exceeded, abort the reply
         limited.on('error', () => {
+            cleanupStream();
             try {
                 reply.raw.destroy();
             } catch {
                 void 0;
             }
         });
+        limited.on('close', cleanupStream);
+        limited.on('end', cleanupStream);
         await reply
             .code(upstream.status)
             .headers(headersOut)

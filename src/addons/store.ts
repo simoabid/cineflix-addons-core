@@ -2,8 +2,6 @@
  * Addon persistence. Default: a portable JSON file. Optional: Postgres (transactional),
  * Redis (lazy).
  */
-import { promises as fs } from 'node:fs';
-import path from 'node:path';
 import type { AppConfig } from '../config.js';
 import {
     type AddonStoreData,

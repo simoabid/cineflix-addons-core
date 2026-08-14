@@ -50,6 +50,7 @@ export class MetricsCollector {
     private readonly requestDurations = new Map<string, number>();
     private readonly responseBytes = new Map<string, number>();
     private readonly bucketCounts = new Map<string, number>();
+    private readonly recentDurations: number[] = [];
     private readonly startTime = Date.now();
 
     // Active concurrency gauges
@@ -71,6 +72,7 @@ export class MetricsCollector {
     private readonly providerTimeouts = new Map<string, number>();
     private readonly providerNoResults = new Map<string, number>();
     private readonly providerDurations = new Map<string, number>();
+    private readonly providerBucketCounts = new Map<string, number>();
 
     // Source validation counters
     private readonly sourcesExtracted = new Map<string, number>();
@@ -95,6 +97,7 @@ export class MetricsCollector {
     // Storage telemetry counters
     private readonly storageOperations = new Map<string, number>();
     private readonly storageDurations = new Map<string, number>();
+    private readonly storageBucketCounts = new Map<string, number>();
 
     // Cache job stats to prevent latency spikes in metrics collection hot path
     private cachedJobStats: {
@@ -172,6 +175,11 @@ export class MetricsCollector {
             (this.responseBytes.get(key) ?? 0) + bytesSent
         );
 
+        this.recentDurations.push(durationMs);
+        if (this.recentDurations.length > 2000) {
+            this.recentDurations.shift();
+        }
+
         const durationSec = durationMs / 1000;
         for (const le of HISTOGRAM_BUCKETS) {
             if (durationSec <= le) {
@@ -203,6 +211,23 @@ export class MetricsCollector {
             providerId,
             (this.providerDurations.get(providerId) ?? 0) + durationMs
         );
+
+        const durationSec = durationMs / 1000;
+        for (const le of HISTOGRAM_BUCKETS) {
+            if (durationSec <= le) {
+                const k = `${providerId}#${le}`;
+                this.providerBucketCounts.set(
+                    k,
+                    (this.providerBucketCounts.get(k) ?? 0) + 1
+                );
+            }
+        }
+        const infK = `${providerId}#+Inf`;
+        this.providerBucketCounts.set(
+            infK,
+            (this.providerBucketCounts.get(infK) ?? 0) + 1
+        );
+
         if (outcome === 'success') {
             this.providerSuccesses.set(
                 providerId,
@@ -322,6 +347,22 @@ export class MetricsCollector {
             op,
             (this.storageDurations.get(op) ?? 0) + durationMs
         );
+
+        const durationSec = durationMs / 1000;
+        for (const le of HISTOGRAM_BUCKETS) {
+            if (durationSec <= le) {
+                const bKey = `${op}#${le}`;
+                this.storageBucketCounts.set(
+                    bKey,
+                    (this.storageBucketCounts.get(bKey) ?? 0) + 1
+                );
+            }
+        }
+        const infKey = `${op}#+Inf`;
+        this.storageBucketCounts.set(
+            infKey,
+            (this.storageBucketCounts.get(infKey) ?? 0) + 1
+        );
     }
 
     private async getJobStats(
@@ -361,7 +402,8 @@ export class MetricsCollector {
     evaluateSlo(manager?: AddonManager): SloEvaluation {
         let totalRequests = 0;
         let errorRequests = 0;
-        const latencies: number[] = [];
+        let livenessTotal = 0;
+        let livenessErrors = 0;
 
         for (const [key, count] of this.requestCounts.entries()) {
             const statusStr = key.split('#')[1] || '200';
@@ -370,20 +412,27 @@ export class MetricsCollector {
             if (status >= 500) {
                 errorRequests += count;
             }
-            const dur = this.requestDurations.get(key) ?? 0;
-            if (count > 0) {
-                latencies.push(dur / count);
+            if (key.includes('/health/live')) {
+                livenessTotal += count;
+                if (status >= 500) {
+                    livenessErrors += count;
+                }
             }
         }
 
-        // Latency p95 approximation
-        latencies.sort((a, b) => a - b);
-        const p95Idx = Math.floor(latencies.length * 0.95);
-        const p95LatencyMs = latencies.length ? (latencies[p95Idx] ?? 0) : 0;
+        // Exact P95 from observed samples
+        const sorted = [...this.recentDurations].sort((a, b) => a - b);
+        const p95Idx = Math.floor(sorted.length * 0.95);
+        const p95LatencyMs = sorted.length ? (sorted[p95Idx] ?? 0) : 0;
 
         const errorRate =
             totalRequests > 0 ? (errorRequests / totalRequests) * 100 : 0;
-        const errorBudgetRemainingPercent = Math.max(0, 100 - errorRate * 100);
+        // Target availability is 99.9% -> error budget is 0.1% of total requests
+        const targetBudget = 0.1;
+        const errorBudgetRemainingPercent = Math.max(
+            0,
+            Math.min(100, 100 - (errorRate / targetBudget) * 100)
+        );
 
         let staleCount = 0;
         let totalStreamProviders = 0;
@@ -402,7 +451,9 @@ export class MetricsCollector {
                     );
                     if (hasStream) {
                         totalStreamProviders++;
-                        if (a.health?.healthy) healthyStreamProviders++;
+                        if (a.health?.lastChecked && a.health?.healthy === true) {
+                            healthyStreamProviders++;
+                        }
                     }
                 }
                 if (a.health?.lastChecked) {
@@ -419,18 +470,25 @@ export class MetricsCollector {
         const providerSuccessRate =
             totalStreamProviders > 0
                 ? (healthyStreamProviders / totalStreamProviders) * 100
-                : 100;
+                : 0;
 
         const livenessSuccessRate =
-            errorRate < 0.1 ? 99.99 : Math.max(0, 100 - errorRate);
+            livenessTotal > 0
+                ? Number(
+                      (
+                          ((livenessTotal - livenessErrors) / livenessTotal) *
+                          100
+                      ).toFixed(2)
+                  )
+                : 100.0;
 
         const successfulRequests = totalRequests - errorRequests;
         const availabilityRatio =
             totalRequests > 0 ? successfulRequests / totalRequests : 1.0;
-        const availabilitySloMet = availabilityRatio >= 0.99;
+        const availabilitySloMet = availabilityRatio >= 0.999;
 
         return {
-            livenessSuccessRate: Number(livenessSuccessRate.toFixed(2)),
+            livenessSuccessRate,
             livenessSloTarget: 99.9,
             livenessMet: livenessSuccessRate >= 99.9,
             errorRate: Number(errorRate.toFixed(2)),
@@ -519,7 +577,7 @@ export class MetricsCollector {
                 `addons_http_request_duration_seconds_sum{method="${method}",route="${route}",status="${statusStr}"} ${durationSec}`
             );
             lines.push(
-                `addons_http_request_duration_seconds_count{method="${method}",route="${route}",status="${statusStr}"} ${count}`
+                `addons_http_request_duration_seconds_count{method="${method}",route="${route}",status="${statusStr}"} ${infCount}`
             );
         }
         lines.push('');
@@ -575,6 +633,19 @@ export class MetricsCollector {
             lines.push('');
         }
 
+        if (this.providerNoResults.size > 0) {
+            lines.push(
+                '# HELP addons_core_provider_no_results_total Provider queries returning zero sources.'
+            );
+            lines.push('# TYPE addons_core_provider_no_results_total counter');
+            for (const [pid, count] of this.providerNoResults.entries()) {
+                lines.push(
+                    `addons_core_provider_no_results_total{provider="${pid}"} ${count}`
+                );
+            }
+            lines.push('');
+        }
+
         if (this.providerDurations.size > 0) {
             lines.push(
                 '# HELP addons_provider_successes_total Provider successful lookups.'
@@ -596,20 +667,23 @@ export class MetricsCollector {
                 '# TYPE addons_core_provider_scrape_duration_seconds histogram'
             );
             for (const [pid, totalDur] of this.providerDurations.entries()) {
-                const count = this.providerRequests.get(`${pid}#stream`) ?? 1;
+                const infCount =
+                    this.providerBucketCounts.get(`${pid}#+Inf`) ?? 0;
                 for (const le of HISTOGRAM_BUCKETS) {
+                    const bCount =
+                        this.providerBucketCounts.get(`${pid}#${le}`) ?? 0;
                     lines.push(
-                        `addons_core_provider_scrape_duration_seconds_bucket{provider="${pid}",le="${le}"} ${count}`
+                        `addons_core_provider_scrape_duration_seconds_bucket{provider="${pid}",le="${le}"} ${bCount}`
                     );
                 }
                 lines.push(
-                    `addons_core_provider_scrape_duration_seconds_bucket{provider="${pid}",le="+Inf"} ${count}`
+                    `addons_core_provider_scrape_duration_seconds_bucket{provider="${pid}",le="+Inf"} ${infCount}`
                 );
                 lines.push(
                     `addons_core_provider_scrape_duration_seconds_sum{provider="${pid}"} ${(totalDur / 1000).toFixed(4)}`
                 );
                 lines.push(
-                    `addons_core_provider_scrape_duration_seconds_count{provider="${pid}"} ${count}`
+                    `addons_core_provider_scrape_duration_seconds_count{provider="${pid}"} ${infCount}`
                 );
             }
             lines.push('');
@@ -630,11 +704,39 @@ export class MetricsCollector {
             lines.push('');
         }
 
+        if (this.sourcesDropped.size > 0) {
+            lines.push(
+                '# HELP addons_core_source_dropped_total Sources dropped during validation.'
+            );
+            lines.push('# TYPE addons_core_source_dropped_total counter');
+            for (const [k, count] of this.sourcesDropped.entries()) {
+                const [pid, reason] = k.split('#');
+                lines.push(
+                    `addons_core_source_dropped_total{provider="${pid}",reason="${reason}"} ${count}`
+                );
+            }
+            lines.push('');
+        }
+
+        lines.push(
+            '# HELP addons_core_source_deduped_total Duplicate sources deduped across providers.'
+        );
+        lines.push('# TYPE addons_core_source_deduped_total counter');
+        lines.push(`addons_core_source_deduped_total ${this.sourcesDeduped}`);
+        lines.push('');
+
         // Addons & Providers Gauges
         if (services?.manager) {
             const all = services.manager.list();
             const stream = services.manager.getStreamEnabled();
             const subtitle = services.manager.getSubtitleEnabled();
+            const catalog = all.filter(
+                (a) =>
+                    a.capabilities?.status === 'limited' ||
+                    (a.capabilities?.catalog &&
+                        !stream.includes(a) &&
+                        !subtitle.includes(a))
+            );
             const healthy = all.filter(
                 (a) => a.health?.healthy !== false
             ).length;
@@ -651,6 +753,9 @@ export class MetricsCollector {
             lines.push(
                 `addons_providers_total{type="subtitles"} ${subtitle.length}`
             );
+            lines.push(
+                `addons_providers_total{type="catalog"} ${catalog.length}`
+            );
             lines.push(`addons_providers_total{type="healthy"} ${healthy}`);
             lines.push('');
 
@@ -659,6 +764,14 @@ export class MetricsCollector {
             );
             lines.push('# TYPE addons_provider_revision gauge');
             lines.push(`addons_provider_revision ${rev}`);
+            lines.push('');
+
+            const slo = this.evaluateSlo(services.manager);
+            lines.push(
+                '# HELP addons_core_stale_health_total Total number of stale provider health records.'
+            );
+            lines.push('# TYPE addons_core_stale_health_total gauge');
+            lines.push(`addons_core_stale_health_total ${slo.staleHealthCount}`);
             lines.push('');
         }
 
@@ -715,6 +828,49 @@ export class MetricsCollector {
             lines.push(
                 `addons_cache_operations_total{operation="bypass"} ${cSnap.bypasses}`
             );
+            lines.push('');
+        }
+
+        // Storage Metrics
+        if (this.storageOperations.size > 0) {
+            lines.push(
+                '# HELP addons_storage_operations_total Storage backend operations.'
+            );
+            lines.push('# TYPE addons_storage_operations_total counter');
+            for (const [k, count] of this.storageOperations.entries()) {
+                const [op, status] = k.split('#');
+                lines.push(
+                    `addons_storage_operations_total{op="${op}",status="${status}"} ${count}`
+                );
+            }
+            lines.push('');
+        }
+
+        if (this.storageDurations.size > 0) {
+            lines.push(
+                '# HELP addons_storage_duration_seconds Storage operation latencies in seconds.'
+            );
+            lines.push('# TYPE addons_storage_duration_seconds histogram');
+            for (const [op, totalDur] of this.storageDurations.entries()) {
+                const infCount =
+                    this.storageBucketCounts.get(`${op}#+Inf`) ?? 0;
+                for (const le of HISTOGRAM_BUCKETS) {
+                    const bCount =
+                        this.storageBucketCounts.get(`${op}#${le}`) ?? 0;
+                    lines.push(
+                        `addons_storage_duration_seconds_bucket{op="${op}",le="${le}"} ${bCount}`
+                    );
+                }
+                lines.push(
+                    `addons_storage_duration_seconds_bucket{op="${op}",le="+Inf"} ${infCount}`
+                );
+                lines.push(
+                    `addons_storage_duration_seconds_sum{op="${op}"} ${(totalDur / 1000).toFixed(4)}`
+                );
+                lines.push(
+                    `addons_storage_duration_seconds_count{op="${op}"} ${infCount}`
+                );
+            }
             lines.push('');
         }
 
@@ -826,6 +982,13 @@ export class MetricsCollector {
         lines.push(
             `addons_jobs_total{status="completed"} ${jobData.completed}`
         );
+        lines.push('');
+
+        lines.push(
+            '# HELP addons_http_queue_depth Current background job queue depth.'
+        );
+        lines.push('# TYPE addons_http_queue_depth gauge');
+        lines.push(`addons_http_queue_depth ${jobData.queued}`);
         lines.push('');
 
         if (this.jobExecutions.size > 0) {

@@ -1,9 +1,9 @@
 import { nanoid } from 'nanoid';
 import type { AppConfig } from '../../config.js';
+import { globalMetrics } from '../../metrics/index.js';
 import {
     type IStorageBackend,
     type AddonRecord,
-    type AddonRevisionRecord,
     type AddonHealthRecord,
     type DebridConfigRecord,
     type PlaybackGrantRecord,
@@ -49,12 +49,34 @@ export class PostgresStorageBackend implements IStorageBackend {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const pgMod = (await import(moduleName)) as any;
             const PoolClass = pgMod.default?.Pool ?? pgMod.Pool;
-            this.pool = new PoolClass({
+            const rawPool = new PoolClass({
                 connectionString: this.connectionString,
                 max: 20,
                 idleTimeoutMillis: 30000,
                 connectionTimeoutMillis: 5000
             }) as PgPool;
+
+            const origQuery = rawPool.query.bind(rawPool);
+            rawPool.query = async (sql: string, params?: unknown[]) => {
+                const t0 = Date.now();
+                try {
+                    const res = await origQuery(sql, params);
+                    globalMetrics.recordStorageOperation(
+                        'pg_query',
+                        'ok',
+                        Date.now() - t0
+                    );
+                    return res;
+                } catch (err) {
+                    globalMetrics.recordStorageOperation(
+                        'pg_query',
+                        'error',
+                        Date.now() - t0
+                    );
+                    throw err;
+                }
+            };
+            this.pool = rawPool;
             return this.pool;
         } catch (err) {
             throw new Error(
@@ -163,7 +185,9 @@ export class PostgresStorageBackend implements IStorageBackend {
             timeoutMs: Number(r.timeout_ms),
             source: r.source,
             manifest: JSON.parse(r.manifest),
-            capabilities: r.capabilities ? JSON.parse(r.capabilities) : undefined,
+            capabilities: r.capabilities
+                ? JSON.parse(r.capabilities)
+                : undefined,
             version: Number(r.version),
             addedAt: r.added_at,
             updatedAt: r.updated_at
@@ -185,7 +209,8 @@ export class PostgresStorageBackend implements IStorageBackend {
                 [addon.providerId]
             );
 
-            const existing = existingRes.rows[0] as { version: number } | undefined;
+            const existing = existingRes.rows[0] as
+                { version: number } | undefined;
             const newVersion = (existing ? Number(existing.version) : 0) + 1;
 
             if (expectedVersion !== undefined && existing) {
@@ -507,7 +532,9 @@ export class PostgresStorageBackend implements IStorageBackend {
         return res.rows.length > 0;
     }
 
-    async cleanupExpiredGrants(now = Math.floor(Date.now() / 1000)): Promise<number> {
+    async cleanupExpiredGrants(
+        now = Math.floor(Date.now() / 1000)
+    ): Promise<number> {
         const pool = await this.getPool();
         const res = await pool.query(
             'DELETE FROM playback_grants WHERE expires_at <= $1 RETURNING id',
@@ -529,7 +556,9 @@ export class PostgresStorageBackend implements IStorageBackend {
             maxRedirects: Number(r.max_redirects),
             singleUse: Boolean(r.single_use),
             used: Boolean(r.used),
-            addonRevision: r.addon_revision ? Number(r.addon_revision) : undefined
+            addonRevision: r.addon_revision
+                ? Number(r.addon_revision)
+                : undefined
         };
     }
 
@@ -645,7 +674,10 @@ export class PostgresStorageBackend implements IStorageBackend {
         return this.mapRowToJob(res.rows[0]);
     }
 
-    async getJobByDedupKey(key: string, activeOnly = true): Promise<JobRecord | null> {
+    async getJobByDedupKey(
+        key: string,
+        activeOnly = true
+    ): Promise<JobRecord | null> {
         const pool = await this.getPool();
         const sql = activeOnly
             ? "SELECT * FROM jobs WHERE dedup_key = $1 AND status IN ('queued', 'running') ORDER BY created_at DESC LIMIT 1"
@@ -744,7 +776,11 @@ export class PostgresStorageBackend implements IStorageBackend {
         }
     }
 
-    async updateJobProgress(id: string, progress: number, workerId: string): Promise<void> {
+    async updateJobProgress(
+        id: string,
+        progress: number,
+        workerId: string
+    ): Promise<void> {
         const pool = await this.getPool();
         await pool.query(
             'UPDATE jobs SET progress = $1 WHERE id = $2 AND locked_by = $3',
@@ -752,7 +788,11 @@ export class PostgresStorageBackend implements IStorageBackend {
         );
     }
 
-    async heartbeatJob(id: string, workerId: string, lockDurationMs: number): Promise<boolean> {
+    async heartbeatJob(
+        id: string,
+        workerId: string,
+        lockDurationMs: number
+    ): Promise<boolean> {
         const pool = await this.getPool();
         const lockUntil = Date.now() + lockDurationMs;
         const res = await pool.query(
@@ -762,7 +802,11 @@ export class PostgresStorageBackend implements IStorageBackend {
         return res.rows.length > 0;
     }
 
-    async completeJob(id: string, result: unknown, workerId: string): Promise<void> {
+    async completeJob(
+        id: string,
+        result: unknown,
+        workerId: string
+    ): Promise<void> {
         const pool = await this.getPool();
         await pool.query(
             `
@@ -901,7 +945,9 @@ export class PostgresStorageBackend implements IStorageBackend {
             id: r.id,
             type: r.type,
             payload: JSON.parse(r.payload_json || '{}'),
-            requester: r.requester_json ? JSON.parse(r.requester_json) : undefined,
+            requester: r.requester_json
+                ? JSON.parse(r.requester_json)
+                : undefined,
             status: r.status,
             priority: Number(r.priority),
             attempts: Number(r.attempts),

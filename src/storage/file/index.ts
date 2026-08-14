@@ -1,6 +1,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { nanoid } from 'nanoid';
+import { globalMetrics } from '../../metrics/index.js';
 import {
     type IStorageBackend,
     type AddonRecord,
@@ -74,19 +75,23 @@ export class FileStorageBackend implements IStorageBackend {
     }
 
     private async load(): Promise<void> {
+        const t0 = Date.now();
         try {
             const raw = await fs.readFile(this.file, 'utf-8');
             const parsed = JSON.parse(raw);
             this.data = {
                 version: 1,
-                revision: typeof parsed.revision === 'number' ? parsed.revision : 0,
+                revision:
+                    typeof parsed.revision === 'number' ? parsed.revision : 0,
                 addons: Array.isArray(parsed.addons)
                     ? parsed.addons.map((a: AddonRecord) => ({
                           ...a,
                           version: a.version || 1
                       }))
                     : [],
-                revisions: Array.isArray(parsed.revisions) ? parsed.revisions : [],
+                revisions: Array.isArray(parsed.revisions)
+                    ? parsed.revisions
+                    : [],
                 health:
                     parsed.health && typeof parsed.health === 'object'
                         ? parsed.health
@@ -103,11 +108,14 @@ export class FileStorageBackend implements IStorageBackend {
                         : {},
                 outbox: Array.isArray(parsed.outbox) ? parsed.outbox : []
             };
+            globalMetrics.recordStorageOperation('file_read', 'ok', Date.now() - t0);
         } catch (err) {
             if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+                globalMetrics.recordStorageOperation('file_read', 'ok', Date.now() - t0);
                 await this.persist();
                 return;
             }
+            globalMetrics.recordStorageOperation('file_read', 'error', Date.now() - t0);
             console.warn(
                 `[storage:file] Failed to read ${this.file}, initializing empty:`,
                 err instanceof Error ? err.message : err
@@ -117,11 +125,18 @@ export class FileStorageBackend implements IStorageBackend {
     }
 
     private async persist(): Promise<void> {
-        await fs.mkdir(path.dirname(this.file), { recursive: true });
-        const tmp = `${this.file}.${process.pid}.${fileCounter++}.tmp`;
-        const json = JSON.stringify(this.data, null, 2);
-        await fs.writeFile(tmp, json, 'utf-8');
-        await fs.rename(tmp, this.file);
+        const t0 = Date.now();
+        try {
+            await fs.mkdir(path.dirname(this.file), { recursive: true });
+            const tmp = `${this.file}.${process.pid}.${fileCounter++}.tmp`;
+            const json = JSON.stringify(this.data, null, 2);
+            await fs.writeFile(tmp, json, 'utf-8');
+            await fs.rename(tmp, this.file);
+            globalMetrics.recordStorageOperation('file_write', 'ok', Date.now() - t0);
+        } catch (err) {
+            globalMetrics.recordStorageOperation('file_write', 'error', Date.now() - t0);
+            throw err;
+        }
     }
 
     async getRevision(): Promise<number> {
@@ -447,7 +462,7 @@ export class FileStorageBackend implements IStorageBackend {
     ): Promise<JobRecord | null> {
         return this.runExclusive(async () => {
             const now = Date.now();
-            let candidates = Object.values(this.data.jobs).filter((j) => {
+            const candidates = Object.values(this.data.jobs).filter((j) => {
                 if (types && types.length > 0 && !types.includes(j.type))
                     return false;
                 if (j.status === 'queued') return true;

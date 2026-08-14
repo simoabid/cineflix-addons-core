@@ -1,4 +1,5 @@
 import type { AppConfig } from '../config.js';
+import { globalMetrics } from '../metrics/index.js';
 import {
     buildMediaKey,
     buildProviderResultKey,
@@ -142,49 +143,95 @@ export class CacheManager {
     }
 
     async get<T>(key: string): Promise<T | null> {
-        let raw: string | null = null;
-        if (this.backendType === 'redis') {
-            const redis = await this.getRedis();
-            if (redis) {
-                raw = await redis.get(key);
+        const t0 = Date.now();
+        try {
+            let raw: string | null = null;
+            if (this.backendType === 'redis') {
+                const redis = await this.getRedis();
+                if (redis) {
+                    raw = await redis.get(key);
+                }
             }
-        }
-        if (!raw) {
-            raw = await this.memory.get(key);
-        }
+            if (!raw) {
+                raw = await this.memory.get(key);
+            }
 
-        if (raw) {
-            this.hits++;
-            try {
-                return JSON.parse(raw) as T;
-            } catch {
-                return raw as unknown as T;
+            globalMetrics.recordStorageOperation(
+                'cache_get',
+                'ok',
+                Date.now() - t0
+            );
+
+            if (raw) {
+                this.hits++;
+                try {
+                    return JSON.parse(raw) as T;
+                } catch {
+                    return raw as unknown as T;
+                }
             }
+            this.misses++;
+            return null;
+        } catch (err) {
+            globalMetrics.recordStorageOperation(
+                'cache_get',
+                'error',
+                Date.now() - t0
+            );
+            throw err;
         }
-        this.misses++;
-        return null;
     }
 
     async set<T>(key: string, value: T, ttlSec = 3600): Promise<void> {
+        const t0 = Date.now();
         this.sets++;
-        const raw = typeof value === 'string' ? value : JSON.stringify(value);
-        if (this.backendType === 'redis') {
-            const redis = await this.getRedis();
-            if (redis) {
-                await redis.set(key, raw, { EX: ttlSec });
+        try {
+            const raw = typeof value === 'string' ? value : JSON.stringify(value);
+            if (this.backendType === 'redis') {
+                const redis = await this.getRedis();
+                if (redis) {
+                    await redis.set(key, raw, { EX: ttlSec });
+                }
             }
+            await this.memory.set(key, raw, ttlSec);
+            globalMetrics.recordStorageOperation(
+                'cache_set',
+                'ok',
+                Date.now() - t0
+            );
+        } catch (err) {
+            globalMetrics.recordStorageOperation(
+                'cache_set',
+                'error',
+                Date.now() - t0
+            );
+            throw err;
         }
-        await this.memory.set(key, raw, ttlSec);
     }
 
     async del(key: string): Promise<void> {
-        if (this.backendType === 'redis') {
-            const redis = await this.getRedis();
-            if (redis) {
-                await redis.del(key);
+        const t0 = Date.now();
+        try {
+            if (this.backendType === 'redis') {
+                const redis = await this.getRedis();
+                if (redis) {
+                    await redis.del(key);
+                }
             }
+            await this.memory.del(key);
+            globalMetrics.recordStorageOperation(
+                'cache_del',
+                'ok',
+                Date.now() - t0
+            );
+        } catch (err) {
+            globalMetrics.recordStorageOperation(
+                'cache_del',
+                'error',
+                Date.now() - t0
+            );
+            throw err;
         }
-        await this.memory.del(key);
     }
 
     /** Invalidate all keys matching a prefix using non-blocking SCAN iterator. */
