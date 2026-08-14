@@ -29,6 +29,7 @@ import {
     healthSweepHandler,
     maintenanceCleanupHandler
 } from './handlers/maintenanceHandlers.js';
+import { uncachedTransferHandler } from './handlers/uncachedTransferHandler.js';
 
 export class JobEngine {
     private readonly handlers = new Map<string, JobHandler>();
@@ -63,6 +64,7 @@ export class JobEngine {
         this.registerHandler('manifest-refresh', manifestRefreshHandler);
         this.registerHandler('health-sweep', healthSweepHandler);
         this.registerHandler('maintenance-cleanup', maintenanceCleanupHandler);
+        this.registerHandler('uncached-transfer', uncachedTransferHandler);
     }
 
     registerHandler(type: string, handler: JobHandler): void {

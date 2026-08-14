@@ -25,9 +25,14 @@ import {
 import { actorFromAuth, type AuditLogger } from '../security/audit.js';
 import type { Role } from '../security/auth.js';
 import { getRateLimitIp } from '../security/auth.js';
-import type { IStorageBackend, SanitizedExportData } from '../storage/types.js';
+import type {
+    IStorageBackend,
+    SanitizedExportData,
+    JobRecord
+} from '../storage/types.js';
 import { importSanitizedConfiguration } from '../storage/importer.js';
 import type { CacheManager } from '../cache/manager.js';
+import type { JobEngine } from '../jobs/engine.js';
 
 function clientIp(
     request: FastifyRequest,
@@ -52,7 +57,8 @@ export function registerAddonRoutes(
     monitor?: HealthMonitor,
     audit?: AuditLogger,
     storage?: IStorageBackend,
-    cacheManager?: CacheManager
+    cacheManager?: CacheManager,
+    jobEngine?: JobEngine
 ): void {
     const viewerGuard = makeAuthGuard(cfg, requireRole('viewer'));
     const operatorGuard = makeAuthGuard(cfg, requireRole('operator'));
@@ -64,7 +70,12 @@ export function registerAddonRoutes(
         action: string,
         target: string | undefined,
         outcome: 'success' | 'failure' | 'denied',
-        extra?: { before?: unknown; after?: unknown; reason?: string }
+        extra?: {
+            before?: unknown;
+            after?: unknown;
+            reason?: string;
+            meta?: Record<string, unknown>;
+        }
     ): Promise<void> {
         if (!audit) return;
         await audit.record({
@@ -76,7 +87,8 @@ export function registerAddonRoutes(
             outcome,
             before: extra?.before,
             after: extra?.after,
-            reason: extra?.reason
+            reason: extra?.reason,
+            meta: extra?.meta
         });
     }
 
@@ -366,15 +378,268 @@ export function registerAddonRoutes(
             ) {
                 return;
             }
-            const result = await debridService.check();
+            const result = await debridService.checkCredentials();
             await auditMutation(
                 req,
                 'settings.debrid.check',
                 'debrid',
                 result.ok ? 'success' : 'failure',
-                { reason: result.error }
+                {
+                    reason: result.error,
+                    meta: {
+                        errorKind: result.errorKind,
+                        user: result.user
+                    }
+                }
             );
             return reply.code(result.ok ? 200 : 400).send(result);
+        }
+    );
+
+    // ── debrid transfers (uncached workflows) ─────────────────────────────────
+    app.post<{
+        Body: {
+            infoHash?: string;
+            sources?: string[];
+            fileIdx?: number;
+            season?: number;
+            episode?: number;
+            title?: string;
+            maxWaitSec?: number;
+        };
+    }>(
+        '/v1/debrid/transfers',
+        { preHandler: operatorGuard },
+        async (req, reply) => {
+            const ip = clientIp(req, cfg);
+            if (
+                !(await enforceRateLimit(
+                    reply,
+                    limiter,
+                    rateLimitKey('debrid', req.auth?.actor?.id, ip),
+                    RATE_LIMITS.debrid.limit,
+                    RATE_LIMITS.debrid.windowMs
+                ))
+            ) {
+                return;
+            }
+
+            const body = req.body ?? {};
+            if (!body.infoHash || typeof body.infoHash !== 'string') {
+                return reply.code(400).send({
+                    error: {
+                        code: 'MISSING_PARAMETER',
+                        message: 'Provide { infoHash: string }'
+                    }
+                });
+            }
+
+            if (!jobEngine) {
+                return reply.code(503).send({
+                    error: {
+                        code: 'JOB_ENGINE_UNAVAILABLE',
+                        message: 'Job engine is required for background transfers'
+                    }
+                });
+            }
+
+            if (storage) {
+                const allTransfers = await storage.listJobs({
+                    type: 'uncached-transfer',
+                    limit: 100
+                });
+                const activeTransfers = allTransfers.filter(
+                    (j) => j.status === 'queued' || j.status === 'running'
+                );
+
+                // 1. Account / Global limit
+                const globalLimit = cfg.debridMaxGlobalTransfers ?? 10;
+                if (activeTransfers.length >= globalLimit) {
+                    return reply.code(429).send({
+                        error: {
+                            code: 'GLOBAL_TRANSFER_LIMIT_EXCEEDED',
+                            message: `Active transfer capacity reached (${activeTransfers.length}/${globalLimit} concurrent). Please wait for running transfers to complete.`
+                        }
+                    });
+                }
+
+                // 2. Per-user / requester limit
+                const userLimit = cfg.debridMaxUserTransfers ?? 3;
+                const hasAuthenticatedUser =
+                    req.auth?.actor?.id &&
+                    req.auth.actor.id !== 'anon' &&
+                    req.auth.actor.id !== 'local-dev';
+                const requesterId = hasAuthenticatedUser
+                    ? req.auth?.actor?.id
+                    : undefined;
+
+                const userActiveCount = activeTransfers.filter((j) => {
+                    const r = j.requester;
+                    if (requesterId && r?.id && r.id === requesterId) {
+                        return true;
+                    }
+                    if (ip && r?.ip && r.ip === ip) {
+                        return true;
+                    }
+                    return false;
+                }).length;
+
+                if (userActiveCount >= userLimit) {
+                    return reply.code(429).send({
+                        error: {
+                            code: 'USER_TRANSFER_LIMIT_EXCEEDED',
+                            message: `Per-user transfer limit reached (${userActiveCount}/${userLimit} concurrent).`
+                        }
+                    });
+                }
+            }
+
+            const job = await jobEngine.enqueue(
+                'uncached-transfer',
+                {
+                    infoHash: body.infoHash.trim(),
+                    sources: body.sources,
+                    fileIdx: body.fileIdx,
+                    season: body.season,
+                    episode: body.episode,
+                    title: body.title,
+                    maxWaitSec: body.maxWaitSec
+                },
+                {
+                    dedupKey: `transfer_${body.infoHash.toLowerCase().trim()}`,
+                    requester: {
+                        id: req.auth?.actor?.id,
+                        ip: clientIp(req, cfg),
+                        role: req.auth?.actor?.role
+                    }
+                }
+            );
+
+            await auditMutation(
+                req,
+                'debrid.transfer.queued',
+                job.id,
+                'success',
+                {
+                    meta: {
+                        infoHash: body.infoHash,
+                        jobId: job.id
+                    }
+                }
+            );
+
+            return reply.code(202).send({
+                ok: true,
+                jobId: job.id,
+                status: job.status,
+                message: 'Debrid transfer queued'
+            });
+        }
+    );
+
+    function sanitizeTransferJobView(job: JobRecord) {
+        let result = job.result;
+        if (result && typeof result === 'object') {
+            const r = result as Record<string, unknown>;
+            if (typeof r.url === 'string') {
+                const isGrant = r.url.includes('/v1/proxy/grant/');
+                if (!isGrant) {
+                    result = {
+                        ...r,
+                        url: '[PROTECTED_PLAYBACK_GRANT]'
+                    };
+                }
+            }
+        }
+        return {
+            id: job.id,
+            status: job.status,
+            progress: job.progress,
+            result,
+            error: job.error,
+            createdAt: job.createdAt,
+            startedAt: job.startedAt,
+            finishedAt: job.finishedAt
+        };
+    }
+
+    app.get<{ Params: { jobId: string } }>(
+        '/v1/debrid/transfers/:jobId',
+        { preHandler: operatorGuard },
+        async (req, reply) => {
+            if (!storage) {
+                return reply.code(503).send({
+                    error: {
+                        code: 'STORAGE_UNAVAILABLE',
+                        message: 'Storage unavailable'
+                    }
+                });
+            }
+            const job = await storage.getJob(req.params.jobId);
+            if (!job || job.type !== 'uncached-transfer') {
+                return reply.code(404).send({
+                    error: {
+                        code: 'NOT_FOUND',
+                        message: 'Transfer job not found'
+                    }
+                });
+            }
+            return reply.code(200).send(sanitizeTransferJobView(job));
+        }
+    );
+
+    app.delete<{ Params: { jobId: string } }>(
+        '/v1/debrid/transfers/:jobId',
+        { preHandler: operatorGuard },
+        async (req, reply) => {
+            if (!jobEngine || !storage) {
+                return reply.code(503).send({
+                    error: {
+                        code: 'JOB_ENGINE_UNAVAILABLE',
+                        message: 'Job engine unavailable'
+                    }
+                });
+            }
+            const job = await storage.getJob(req.params.jobId);
+            if (!job || job.type !== 'uncached-transfer') {
+                return reply.code(404).send({
+                    error: {
+                        code: 'NOT_FOUND',
+                        message: 'Transfer job not found'
+                    }
+                });
+            }
+            await jobEngine.cancel(job.id);
+            await auditMutation(
+                req,
+                'debrid.transfer.cancel',
+                job.id,
+                'success'
+            );
+            const updated = await storage.getJob(job.id);
+            return reply
+                .code(200)
+                .send({
+                    ok: true,
+                    job: updated ? sanitizeTransferJobView(updated) : null
+                });
+        }
+    );
+
+    app.get(
+        '/v1/debrid/transfers',
+        { preHandler: operatorGuard },
+        async (_req, reply) => {
+            if (!storage) {
+                return reply.code(200).send({ transfers: [] });
+            }
+            const jobs = await storage.listJobs({
+                type: 'uncached-transfer',
+                limit: 50
+            });
+            return reply.code(200).send({
+                transfers: jobs.map(sanitizeTransferJobView)
+            });
         }
     );
 

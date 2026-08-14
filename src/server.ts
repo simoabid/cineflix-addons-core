@@ -30,6 +30,7 @@ import { migrateLegacyFileToStorage } from './storage/importer.js';
 import { CacheManager } from './cache/index.js';
 import { buildAggregateResultKey } from './cache/namespaces.js';
 import { JobEngine } from './jobs/index.js';
+import { debridService } from './debrid/service.js';
 import { logScrapeProxyStatus } from './egress/scrapeFetch.js';
 import { installStreamEgress } from './egress/globalDispatcher.js';
 import {
@@ -100,6 +101,7 @@ async function main(): Promise<void> {
         filePath: cfg.auditLogFile,
         enabled: cfg.auditEnabled
     });
+    debridService.setAuditLogger(audit);
 
     const corsOrigin = cfg.corsOrigin.includes(',')
         ? cfg.corsOrigin
@@ -521,7 +523,16 @@ async function main(): Promise<void> {
     });
 
     // ── Management + import + job API ─────────────────────────────────────────
-    registerAddonRoutes(app, manager, cfg, monitor, audit, storage, cacheManager);
+    registerAddonRoutes(
+        app,
+        manager,
+        cfg,
+        monitor,
+        audit,
+        storage,
+        cacheManager,
+        jobEngine
+    );
     registerImportRoutes(app, manager, cfg, audit, jobEngine);
     registerJobRoutes(app, jobEngine, storage, cfg, audit);
 

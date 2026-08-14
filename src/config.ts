@@ -89,6 +89,8 @@ export interface AppConfig {
     /** Debrid via env (takes precedence over persisted settings). */
     debridProvider: string;
     debridApiKey: string;
+    debridMaxUserTransfers: number;
+    debridMaxGlobalTransfers: number;
 
     /** Background health/refresh. */
     healthIntervalMinutes: number;
@@ -250,6 +252,8 @@ export function loadConfig(): AppConfig {
 
         debridProvider: envStr('DEBRID_PROVIDER', 'none'),
         debridApiKey: envStr('DEBRID_API_KEY'),
+        debridMaxUserTransfers: envNum('DEBRID_MAX_USER_TRANSFERS', 3),
+        debridMaxGlobalTransfers: envNum('DEBRID_MAX_GLOBAL_TRANSFERS', 10),
 
         healthIntervalMinutes: envNum('ADDON_HEALTH_INTERVAL_MINUTES', 15),
         autoRefresh: envBool('ADDON_AUTO_REFRESH', false),
