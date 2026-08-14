@@ -1,20 +1,21 @@
 /**
  * Addon management REST API (mounted on the OMSS Fastify instance).
  *
- *   GET    /v1/addons                     list all installed addons (operator+)
- *   GET    /v1/addons/:providerId         one addon (operator+)
- *   DELETE /v1/addons/:providerId         uninstall (admin)
- *   PATCH  /v1/addons/:providerId         { enabled?, timeoutMs? } (operator)
- *   POST   /v1/addons/reorder             { order: string[] } (operator)
+ *   GET    /v1/addons                     list all installed addons with pagination, filter, search, sort (operator+)
+ *   GET    /v1/addons/:providerId         one addon (operator+) with protected diagnostic view (admin+)
+ *   DELETE /v1/addons/:providerId         uninstall (admin) with optimistic concurrency
+ *   PATCH  /v1/addons/:providerId         { enabled?, timeoutMs? } (operator) with optimistic concurrency
+ *   POST   /v1/addons/reorder             { order: string[] } (operator) with optimistic concurrency
  *   POST   /v1/addons/:providerId/refresh re-fetch manifest (operator)
+ *   POST   /v1/addons/health/check        synchronous summary or 202 async sweep (?async=true)
  *   GET    /v1/audit                      recent audit events (admin)
  */
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type { AppConfig } from '../config.js';
 import type { AddonManager } from '../addons/manager.js';
 import { toPublicAddon } from '../addons/manager.js';
+import { deriveCapabilities } from '../capabilities/index.js';
 import type { HealthMonitor } from '../health/monitor.js';
-import type { DebridProviderId } from '../debrid/types.js';
 import { debridService } from '../debrid/service.js';
 import { makeAuthGuard, enforceRateLimit } from './auth.js';
 import {
@@ -33,6 +34,19 @@ import type {
 import { importSanitizedConfiguration } from '../storage/importer.js';
 import type { CacheManager } from '../cache/manager.js';
 import type { JobEngine } from '../jobs/engine.js';
+import { globalReliability } from '../reliability/circuit.js';
+import {
+    addonsQueryValidator,
+    providerIdValidator,
+    patchAddonBodyValidator,
+    reorderAddonsBodyValidator,
+    patchDebridBodyValidator,
+    debridTransferBodyValidator
+} from '../validation/schemas.js';
+import {
+    checkOptimisticConcurrency,
+    formatValidationError
+} from '../validation/validator.js';
 
 function clientIp(
     request: FastifyRequest,
@@ -92,31 +106,209 @@ export function registerAddonRoutes(
         });
     }
 
-    app.get('/v1/addons', { preHandler: viewerGuard }, async (_req, reply) => {
-        return reply.code(200).send({
-            addons: manager.list().map(toPublicAddon),
-            store: manager.describeStore(),
-            revision: manager.getRevision()
-        });
-    });
+    // ── GET /v1/addons (paginated, searchable, filterable, sortable) ───────────
+    app.get<{ Querystring: Record<string, unknown> }>(
+        '/v1/addons',
+        { preHandler: viewerGuard },
+        async (req, reply) => {
+            const queryRes = addonsQueryValidator(req.query);
+            if (!queryRes.ok && queryRes.errors) {
+                return reply
+                    .code(400)
+                    .send(formatValidationError(queryRes.errors, req.id));
+            }
+            const q = queryRes.data ?? {};
+            let list = manager.list();
 
-    app.get<{ Params: { providerId: string } }>(
+            // 1. Search filter
+            if (q.search) {
+                const s = q.search.toLowerCase();
+                list = list.filter(
+                    (a) =>
+                        a.name.toLowerCase().includes(s) ||
+                        a.providerId.toLowerCase().includes(s) ||
+                        a.slug.toLowerCase().includes(s) ||
+                        (a.manifest.description &&
+                            a.manifest.description.toLowerCase().includes(s))
+                );
+            }
+
+            // 2. Capability filter
+            if (q.capability && q.capability !== 'all') {
+                list = list.filter((a) => {
+                    const caps =
+                        a.capabilities ?? deriveCapabilities(a.manifest);
+                    const hasStream = Array.isArray(caps.stream)
+                        ? caps.stream.length > 0
+                        : Boolean(caps.stream);
+                    const hasSubtitles = Array.isArray(caps.subtitles)
+                        ? caps.subtitles.length > 0
+                        : Boolean(caps.subtitles);
+                    const hasCatalog = Boolean(caps.catalog);
+                    const hasMeta = Boolean(caps.meta);
+                    if (q.capability === 'stream') return hasStream;
+                    if (q.capability === 'subtitles') return hasSubtitles;
+                    if (q.capability === 'catalog') return hasCatalog;
+                    if (q.capability === 'meta') return hasMeta;
+                    return true;
+                });
+            }
+
+            // 3. Health filter
+            if (q.health && q.health !== 'all') {
+                list = list.filter((a) => {
+                    if (q.health === 'healthy')
+                        return a.health?.healthy === true;
+                    if (q.health === 'unhealthy')
+                        return a.health?.healthy === false;
+                    if (q.health === 'unknown')
+                        return a.health === undefined || a.health === null;
+                    return true;
+                });
+            }
+
+            // 4. Enabled filter
+            if (q.enabled !== undefined) {
+                list = list.filter((a) => a.enabled === q.enabled);
+            }
+
+            // 5. Admission state filter
+            if (q.admissionState && q.admissionState !== 'all') {
+                list = list.filter(
+                    (a) =>
+                        (a.admissionState ??
+                            (a.enabled ? 'validated' : 'disabled')) ===
+                        q.admissionState
+                );
+            }
+
+            // 6. Sorting
+            const sortKey = q.sort ?? 'order';
+            const direction = q.direction === 'desc' ? -1 : 1;
+
+            list.sort((a, b) => {
+                let cmp = 0;
+                if (sortKey === 'order') {
+                    cmp = a.order - b.order;
+                } else if (sortKey === 'name') {
+                    cmp = a.name.localeCompare(b.name);
+                } else if (sortKey === 'addedAt') {
+                    cmp =
+                        new Date(a.addedAt).getTime() -
+                        new Date(b.addedAt).getTime();
+                } else if (sortKey === 'updatedAt') {
+                    cmp =
+                        new Date(a.updatedAt).getTime() -
+                        new Date(b.updatedAt).getTime();
+                } else if (sortKey === 'health') {
+                    const hA =
+                        a.health?.healthy === true
+                            ? 1
+                            : a.health?.healthy === false
+                              ? -1
+                              : 0;
+                    const hB =
+                        b.health?.healthy === true
+                            ? 1
+                            : b.health?.healthy === false
+                              ? -1
+                              : 0;
+                    cmp = hA - hB;
+                }
+                if (cmp === 0) cmp = a.providerId.localeCompare(b.providerId);
+                return cmp * direction;
+            });
+
+            // 7. Pagination
+            const page = q.page ?? 1;
+            const limit = q.limit ?? 50;
+            const total = list.length;
+            const totalPages = Math.ceil(total / limit) || 1;
+            const startIndex = (page - 1) * limit;
+            const paginated = list.slice(startIndex, startIndex + limit);
+
+            reply.header('x-provider-revision', String(manager.getRevision()));
+            reply.header('ETag', `"rev-${manager.getRevision()}"`);
+
+            return reply.code(200).send({
+                addons: paginated.map(toPublicAddon),
+                pagination: {
+                    total,
+                    page,
+                    limit,
+                    totalPages,
+                    hasMore: page < totalPages
+                },
+                store: manager.describeStore(),
+                revision: manager.getRevision()
+            });
+        }
+    );
+
+    // ── GET /v1/addons/:providerId ────────────────────────────────────────────
+    app.get<{
+        Params: { providerId: string };
+        Querystring: { raw?: string; diagnostics?: string };
+    }>(
         '/v1/addons/:providerId',
         { preHandler: viewerGuard },
         async (req, reply) => {
-            const addon = manager.get(req.params.providerId);
+            const paramRes = providerIdValidator(req.params.providerId);
+            if (!paramRes.ok && paramRes.errors) {
+                return reply
+                    .code(400)
+                    .send(formatValidationError(paramRes.errors, req.id));
+            }
+            const providerId = paramRes.data!;
+            const addon = manager.get(providerId);
             if (!addon) {
                 return reply.code(404).send({
-                    error: { code: 'NOT_FOUND', message: 'Addon not found' }
+                    error: { code: 'NOT_FOUND', message: 'Addon not found' },
+                    requestId: req.id
                 });
             }
-            // Redacted public view + non-secret manifest fields only.
+
+            const isRawRequested =
+                req.query.raw === 'true' || req.query.diagnostics === 'true';
+            const isAdmin = req.auth?.actor?.role === 'admin';
+
             const pub = toPublicAddon(addon);
+            reply.header('x-provider-revision', String(manager.getRevision()));
+            reply.header('ETag', `"rev-${manager.getRevision()}"`);
+
+            if (isRawRequested && isAdmin) {
+                const metrics = globalReliability.getMetrics(providerId);
+                const circuitState = globalReliability.getState(providerId);
+                return reply.code(200).send({
+                    ...pub,
+                    admissionState:
+                        addon.admissionState ??
+                        (addon.enabled ? 'validated' : 'disabled'),
+                    timeoutMs: addon.timeoutMs,
+                    health: addon.health,
+                    revision: manager.getRevision(),
+                    manifest: addon.manifest,
+                    diagnostics: {
+                        circuitState,
+                        metrics,
+                        timeoutMs: addon.timeoutMs,
+                        validationFindings: addon.validationFindings
+                    }
+                });
+            }
+
+            const circuitState = globalReliability.getState(providerId);
             return reply.code(200).send({
                 ...pub,
+                admissionState:
+                    addon.admissionState ??
+                    (addon.enabled ? 'validated' : 'disabled'),
+                timeoutMs: addon.timeoutMs,
+                health: addon.health,
+                diagnostics: {
+                    circuitState
+                },
                 revision: manager.getRevision(),
-                // Manifest is useful for operators; strip nothing secret-bearing
-                // beyond what redaction already does on URLs.
                 manifest: {
                     id: addon.manifest.id,
                     name: addon.manifest.name,
@@ -133,10 +325,19 @@ export function registerAddonRoutes(
         }
     );
 
+    // ── DELETE /v1/addons/:providerId ─────────────────────────────────────────
     app.delete<{ Params: { providerId: string } }>(
         '/v1/addons/:providerId',
         { preHandler: adminGuard },
         async (req, reply) => {
+            const paramRes = providerIdValidator(req.params.providerId);
+            if (!paramRes.ok && paramRes.errors) {
+                return reply
+                    .code(400)
+                    .send(formatValidationError(paramRes.errors, req.id));
+            }
+            const providerId = paramRes.data!;
+
             const ip = clientIp(req, cfg);
             if (
                 !(await enforceRateLimit(
@@ -149,46 +350,76 @@ export function registerAddonRoutes(
             ) {
                 return;
             }
-            const before = manager.get(req.params.providerId);
-            const removed = await manager.remove(req.params.providerId);
+
+            // Optimistic concurrency check
+            if (
+                !(await checkOptimisticConcurrency(
+                    req,
+                    reply,
+                    manager.getRevision()
+                ))
+            ) {
+                return;
+            }
+
+            const before = manager.get(providerId);
+            const removed = await manager.remove(providerId);
             if (!removed) {
                 await auditMutation(
                     req,
                     'addon.remove',
-                    req.params.providerId,
+                    providerId,
                     'failure',
                     {
                         reason: 'not found'
                     }
                 );
                 return reply.code(404).send({
-                    error: { code: 'NOT_FOUND', message: 'Addon not found' }
+                    error: { code: 'NOT_FOUND', message: 'Addon not found' },
+                    requestId: req.id
                 });
             }
-            await auditMutation(
-                req,
-                'addon.remove',
-                req.params.providerId,
-                'success',
-                {
-                    before: before ? toPublicAddon(before) : undefined
-                }
-            );
+
+            await auditMutation(req, 'addon.remove', providerId, 'success', {
+                before: before ? toPublicAddon(before) : undefined
+            });
+
+            const rev = manager.getRevision();
+            reply.header('x-provider-revision', String(rev));
+            reply.header('ETag', `"rev-${rev}"`);
+
             return reply.code(200).send({
                 ok: true,
-                removed: req.params.providerId,
-                revision: manager.getRevision()
+                removed: providerId,
+                revision: rev
             });
         }
     );
 
+    // ── PATCH /v1/addons/:providerId ──────────────────────────────────────────
     app.patch<{
         Params: { providerId: string };
-        Body: { enabled?: boolean; timeoutMs?: number };
+        Body: Record<string, unknown>;
     }>(
         '/v1/addons/:providerId',
         { preHandler: operatorGuard },
         async (req, reply) => {
+            const paramRes = providerIdValidator(req.params.providerId);
+            if (!paramRes.ok && paramRes.errors) {
+                return reply
+                    .code(400)
+                    .send(formatValidationError(paramRes.errors, req.id));
+            }
+            const providerId = paramRes.data!;
+
+            const bodyRes = patchAddonBodyValidator(req.body);
+            if (!bodyRes.ok && bodyRes.errors) {
+                return reply
+                    .code(400)
+                    .send(formatValidationError(bodyRes.errors, req.id));
+            }
+            const body = bodyRes.data!;
+
             const ip = clientIp(req, cfg);
             if (
                 !(await enforceRateLimit(
@@ -201,12 +432,23 @@ export function registerAddonRoutes(
             ) {
                 return;
             }
-            const { providerId } = req.params;
-            const body = req.body ?? {};
+
+            // Optimistic concurrency check
+            if (
+                !(await checkOptimisticConcurrency(
+                    req,
+                    reply,
+                    manager.getRevision()
+                ))
+            ) {
+                return;
+            }
+
             let addon = manager.get(providerId);
             if (!addon) {
                 return reply.code(404).send({
-                    error: { code: 'NOT_FOUND', message: 'Addon not found' }
+                    error: { code: 'NOT_FOUND', message: 'Addon not found' },
+                    requestId: req.id
                 });
             }
             const before = toPublicAddon(addon);
@@ -220,45 +462,75 @@ export function registerAddonRoutes(
                 before,
                 after: addon ? toPublicAddon(addon) : undefined
             });
+
+            const rev = manager.getRevision();
+            reply.header('x-provider-revision', String(rev));
+            reply.header('ETag', `"rev-${rev}"`);
+
             return reply.code(200).send({
                 ok: true,
                 addon: addon && toPublicAddon(addon),
-                revision: manager.getRevision()
+                revision: rev
             });
         }
     );
 
-    app.post<{ Body: { order?: string[] } }>(
+    // ── POST /v1/addons/reorder ───────────────────────────────────────────────
+    app.post<{ Body: Record<string, unknown> }>(
         '/v1/addons/reorder',
         { preHandler: operatorGuard },
         async (req, reply) => {
-            const order = req.body?.order;
-            if (!Array.isArray(order)) {
-                return reply.code(400).send({
-                    error: {
-                        code: 'INVALID_PARAMETER',
-                        message: 'Body must be { order: string[] }'
-                    }
-                });
+            const bodyRes = reorderAddonsBodyValidator(req.body);
+            if (!bodyRes.ok && bodyRes.errors) {
+                return reply
+                    .code(400)
+                    .send(formatValidationError(bodyRes.errors, req.id));
             }
+            const { order } = bodyRes.data!;
+
+            // Optimistic concurrency check
+            if (
+                !(await checkOptimisticConcurrency(
+                    req,
+                    reply,
+                    manager.getRevision()
+                ))
+            ) {
+                return;
+            }
+
             const beforeOrder = manager.list().map((a) => a.providerId);
             await manager.reorder(order);
             await auditMutation(req, 'addon.reorder', undefined, 'success', {
                 before: { order: beforeOrder },
                 after: { order }
             });
+
+            const rev = manager.getRevision();
+            reply.header('x-provider-revision', String(rev));
+            reply.header('ETag', `"rev-${rev}"`);
+
             return reply.code(200).send({
                 ok: true,
                 addons: manager.list().map(toPublicAddon),
-                revision: manager.getRevision()
+                revision: rev
             });
         }
     );
 
+    // ── POST /v1/addons/:providerId/refresh ───────────────────────────────────
     app.post<{ Params: { providerId: string } }>(
         '/v1/addons/:providerId/refresh',
         { preHandler: operatorGuard },
         async (req, reply) => {
+            const paramRes = providerIdValidator(req.params.providerId);
+            if (!paramRes.ok && paramRes.errors) {
+                return reply
+                    .code(400)
+                    .send(formatValidationError(paramRes.errors, req.id));
+            }
+            const providerId = paramRes.data!;
+
             const ip = clientIp(req, cfg);
             if (
                 !(await enforceRateLimit(
@@ -271,11 +543,23 @@ export function registerAddonRoutes(
             ) {
                 return;
             }
-            const result = await manager.refresh(req.params.providerId);
+
+            // Optimistic concurrency check
+            if (
+                !(await checkOptimisticConcurrency(
+                    req,
+                    reply,
+                    manager.getRevision()
+                ))
+            ) {
+                return;
+            }
+
+            const result = await manager.refresh(providerId);
             await auditMutation(
                 req,
                 'addon.refresh',
-                req.params.providerId,
+                providerId,
                 result.ok ? 'success' : 'failure',
                 {
                     reason: result.error,
@@ -283,10 +567,14 @@ export function registerAddonRoutes(
                 }
             );
             const status = result.ok ? 200 : 400;
+            const rev = manager.getRevision();
+            reply.header('x-provider-revision', String(rev));
+            reply.header('ETag', `"rev-${rev}"`);
+
             return reply.code(status).send({
                 ...result,
                 addon: result.addon ? toPublicAddon(result.addon) : undefined,
-                revision: manager.getRevision()
+                revision: rev
             });
         }
     );
@@ -308,10 +596,18 @@ export function registerAddonRoutes(
         }
     );
 
-    app.patch<{ Body: { provider?: DebridProviderId; apiKey?: string } }>(
+    app.patch<{ Body: Record<string, unknown> }>(
         '/v1/settings/debrid',
         { preHandler: adminGuard },
         async (req, reply) => {
+            const bodyRes = patchDebridBodyValidator(req.body);
+            if (!bodyRes.ok && bodyRes.errors) {
+                return reply
+                    .code(400)
+                    .send(formatValidationError(bodyRes.errors, req.id));
+            }
+            const body = bodyRes.data!;
+
             const ip = clientIp(req, cfg);
             if (
                 !(await enforceRateLimit(
@@ -324,6 +620,18 @@ export function registerAddonRoutes(
             ) {
                 return;
             }
+
+            // Optimistic concurrency check
+            if (
+                !(await checkOptimisticConcurrency(
+                    req,
+                    reply,
+                    manager.getRevision()
+                ))
+            ) {
+                return;
+            }
+
             if (manager.debridLockedByEnv()) {
                 await auditMutation(
                     req,
@@ -339,10 +647,11 @@ export function registerAddonRoutes(
                         code: 'LOCKED',
                         message:
                             'Debrid is configured via environment (DEBRID_*) and cannot be changed at runtime'
-                    }
+                    },
+                    requestId: req.id
                 });
             }
-            const body = req.body ?? {};
+
             // Never log apiKey — audit redaction also covers it.
             await manager.updateDebridSettings({
                 provider: body.provider,
@@ -354,10 +663,15 @@ export function registerAddonRoutes(
                     apiKeySet: Boolean(body.apiKey)
                 }
             });
+
+            const rev = manager.getRevision();
+            reply.header('x-provider-revision', String(rev));
+            reply.header('ETag', `"rev-${rev}"`);
+
             return reply.code(200).send({
                 ok: true,
                 debrid: debridService.status(),
-                revision: manager.getRevision()
+                revision: rev
             });
         }
     );
@@ -397,20 +711,18 @@ export function registerAddonRoutes(
     );
 
     // ── debrid transfers (uncached workflows) ─────────────────────────────────
-    app.post<{
-        Body: {
-            infoHash?: string;
-            sources?: string[];
-            fileIdx?: number;
-            season?: number;
-            episode?: number;
-            title?: string;
-            maxWaitSec?: number;
-        };
-    }>(
+    app.post<{ Body: Record<string, unknown> }>(
         '/v1/debrid/transfers',
         { preHandler: operatorGuard },
         async (req, reply) => {
+            const bodyRes = debridTransferBodyValidator(req.body);
+            if (!bodyRes.ok && bodyRes.errors) {
+                return reply
+                    .code(400)
+                    .send(formatValidationError(bodyRes.errors, req.id));
+            }
+            const body = bodyRes.data!;
+
             const ip = clientIp(req, cfg);
             if (
                 !(await enforceRateLimit(
@@ -424,22 +736,14 @@ export function registerAddonRoutes(
                 return;
             }
 
-            const body = req.body ?? {};
-            if (!body.infoHash || typeof body.infoHash !== 'string') {
-                return reply.code(400).send({
-                    error: {
-                        code: 'MISSING_PARAMETER',
-                        message: 'Provide { infoHash: string }'
-                    }
-                });
-            }
-
             if (!jobEngine) {
                 return reply.code(503).send({
                     error: {
                         code: 'JOB_ENGINE_UNAVAILABLE',
-                        message: 'Job engine is required for background transfers'
-                    }
+                        message:
+                            'Job engine is required for background transfers'
+                    },
+                    requestId: req.id
                 });
             }
 
@@ -459,7 +763,8 @@ export function registerAddonRoutes(
                         error: {
                             code: 'GLOBAL_TRANSFER_LIMIT_EXCEEDED',
                             message: `Active transfer capacity reached (${activeTransfers.length}/${globalLimit} concurrent). Please wait for running transfers to complete.`
-                        }
+                        },
+                        requestId: req.id
                     });
                 }
 
@@ -489,7 +794,8 @@ export function registerAddonRoutes(
                         error: {
                             code: 'USER_TRANSFER_LIMIT_EXCEEDED',
                             message: `Per-user transfer limit reached (${userActiveCount}/${userLimit} concurrent).`
-                        }
+                        },
+                        requestId: req.id
                     });
                 }
             }
@@ -497,7 +803,7 @@ export function registerAddonRoutes(
             const job = await jobEngine.enqueue(
                 'uncached-transfer',
                 {
-                    infoHash: body.infoHash.trim(),
+                    infoHash: body.infoHash,
                     sources: body.sources,
                     fileIdx: body.fileIdx,
                     season: body.season,
@@ -506,7 +812,7 @@ export function registerAddonRoutes(
                     maxWaitSec: body.maxWaitSec
                 },
                 {
-                    dedupKey: `transfer_${body.infoHash.toLowerCase().trim()}`,
+                    dedupKey: `transfer_${body.infoHash.toLowerCase()}`,
                     requester: {
                         id: req.auth?.actor?.id,
                         ip: clientIp(req, cfg),
@@ -572,7 +878,8 @@ export function registerAddonRoutes(
                     error: {
                         code: 'STORAGE_UNAVAILABLE',
                         message: 'Storage unavailable'
-                    }
+                    },
+                    requestId: req.id
                 });
             }
             const job = await storage.getJob(req.params.jobId);
@@ -581,7 +888,8 @@ export function registerAddonRoutes(
                     error: {
                         code: 'NOT_FOUND',
                         message: 'Transfer job not found'
-                    }
+                    },
+                    requestId: req.id
                 });
             }
             return reply.code(200).send(sanitizeTransferJobView(job));
@@ -597,7 +905,8 @@ export function registerAddonRoutes(
                     error: {
                         code: 'JOB_ENGINE_UNAVAILABLE',
                         message: 'Job engine unavailable'
-                    }
+                    },
+                    requestId: req.id
                 });
             }
             const job = await storage.getJob(req.params.jobId);
@@ -606,7 +915,8 @@ export function registerAddonRoutes(
                     error: {
                         code: 'NOT_FOUND',
                         message: 'Transfer job not found'
-                    }
+                    },
+                    requestId: req.id
                 });
             }
             await jobEngine.cancel(job.id);
@@ -617,12 +927,10 @@ export function registerAddonRoutes(
                 'success'
             );
             const updated = await storage.getJob(job.id);
-            return reply
-                .code(200)
-                .send({
-                    ok: true,
-                    job: updated ? sanitizeTransferJobView(updated) : null
-                });
+            return reply.code(200).send({
+                ok: true,
+                job: updated ? sanitizeTransferJobView(updated) : null
+            });
         }
     );
 
@@ -643,8 +951,8 @@ export function registerAddonRoutes(
         }
     );
 
-    // ── health ───────────────────────────────────────────────────────────────
-    app.post(
+    // ── health check sweep (synchronous or async 202) ─────────────────────────
+    app.post<{ Querystring: { async?: string } }>(
         '/v1/addons/health/check',
         { preHandler: operatorGuard },
         async (req, reply) => {
@@ -665,9 +973,23 @@ export function registerAddonRoutes(
                     error: {
                         code: 'UNAVAILABLE',
                         message: 'Health monitor not enabled'
-                    }
+                    },
+                    requestId: req.id
                 });
             }
+
+            if (req.query.async === 'true') {
+                const res = await monitor.triggerSweep();
+                return reply.code(202).send({
+                    ok: true,
+                    jobId: res.jobId,
+                    status: res.queued ? 'queued' : 'completed',
+                    message: res.queued
+                        ? 'Health check sweep enqueued'
+                        : 'Health check completed synchronously'
+                });
+            }
+
             const summary = await monitor.checkAll();
             await auditMutation(
                 req,
@@ -749,16 +1071,26 @@ export function registerAddonRoutes(
                 return reply.code(400).send({
                     error: {
                         code: 'INVALID_PAYLOAD',
-                        message: "Invalid configuration payload: 'addons' array is required"
-                    }
+                        message:
+                            "Invalid configuration payload: 'addons' array is required"
+                    },
+                    requestId: req.id
                 });
             }
             if (storage) {
                 const res = await importSanitizedConfiguration(storage, body);
-                await auditMutation(req, 'settings.import', undefined, 'success', {
-                    after: { importedCount: res.imported }
-                });
-                return reply.code(200).send({ ok: true, imported: res.imported });
+                await auditMutation(
+                    req,
+                    'settings.import',
+                    undefined,
+                    'success',
+                    {
+                        after: { importedCount: res.imported }
+                    }
+                );
+                return reply
+                    .code(200)
+                    .send({ ok: true, imported: res.imported });
             }
             return reply.code(200).send({ ok: true, imported: 0 });
         }

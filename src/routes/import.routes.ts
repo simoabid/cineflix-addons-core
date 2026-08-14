@@ -25,6 +25,13 @@ import { actorFromAuth, type AuditLogger } from '../security/audit.js';
 import { redactUrl } from '../security/redaction.js';
 import type { JobEngine } from '../jobs/engine.js';
 import { getRateLimitIp } from '../security/auth.js';
+import {
+    importUrlBodyValidator,
+    importStremioBodyValidator,
+    importRepoBodyValidator,
+    jobIdValidator
+} from '../validation/schemas.js';
+import { formatValidationError } from '../validation/validator.js';
 
 function clientIp(
     request: FastifyRequest,
@@ -122,183 +129,33 @@ export function registerImportRoutes(
         );
     }
 
-    // ── import from URL (single or batch) ───────────────────────────────────
-    app.post<{ Body: { url?: string; urls?: string[]; enable?: boolean } }>(
-        '/v1/addons/import/url',
-        { preHandler: adminGuard },
-        async (req, reply) => {
-            if (!(await gate(req, reply))) return;
-            const idemKey = getIdempotencyKey(req);
-            if (tryIdempotency(idemKey, reply)) return;
-            const body = req.body ?? {};
-            const enableOpt =
-                typeof body.enable === 'boolean'
-                    ? { enable: body.enable }
-                    : undefined;
+    // ── import from URL handler (single or batch) ───────────────────────────
+    const handleImportUrl = async (
+        req: FastifyRequest,
+        reply: import('fastify').FastifyReply
+    ) => {
+        if (!(await gate(req, reply))) return;
+        const idemKey = getIdempotencyKey(req);
+        if (tryIdempotency(idemKey, reply)) return;
 
-            // Batch import
-            if (Array.isArray(body.urls) && body.urls.length > 0) {
-                if (jobEngine) {
-                    const job = await jobEngine.enqueue(
-                        'multi-addon-import',
-                        { urls: body.urls, enable: body.enable },
-                        {
-                            idempotencyKey: idemKey,
-                            requester: {
-                                id: req.auth?.actor?.id,
-                                ip: clientIp(req, cfg),
-                                role: req.auth?.actor?.role
-                            }
-                        }
-                    );
-                    const resp = {
-                        ok: true,
-                        jobId: job.id,
-                        status: job.status,
-                        message: 'Batch import queued on durable job engine'
-                    };
-                    storeIdempotency(idemKey, 202, resp);
-                    return reply.code(202).send(resp);
-                }
-
-                // Fallback synchronous import
-                const results = await importFromUrls(
-                    manager,
-                    body.urls,
-                    enableOpt
-                );
-                const installed = results.filter((r) => r.ok).length;
-                if (audit) {
-                    await audit.record({
-                        actor: actorFromAuth(
-                            req.auth?.actor,
-                            clientIp(req, cfg)
-                        ),
-                        action: 'import.url.batch',
-                        requestId: req.id,
-                        revision: manager.getRevision(),
-                        outcome: installed > 0 ? 'success' : 'failure',
-                        meta: {
-                            total: results.length,
-                            installed,
-                            urls: body.urls.map((u) => redactUrl(u))
-                        }
-                    });
-                }
-                const resp = {
-                    ok: true,
-                    installed,
-                    total: results.length,
-                    results: results.map(publicInstallResult),
-                    revision: manager.getRevision()
-                };
-                storeIdempotency(idemKey, 200, resp);
-                return reply.code(200).send(resp);
-            }
-
-            // Single URL import
-            if (typeof body.url === 'string' && body.url.trim()) {
-                const preferAsync =
-                    req.headers['prefer'] === 'respond-async' ||
-                    req.headers['x-prefer-async'] === 'true';
-
-                if (preferAsync && jobEngine) {
-                    const job = await jobEngine.enqueue(
-                        'multi-addon-import',
-                        { urls: [body.url.trim()], enable: body.enable },
-                        {
-                            idempotencyKey: idemKey,
-                            requester: {
-                                id: req.auth?.actor?.id,
-                                ip: clientIp(req, cfg),
-                                role: req.auth?.actor?.role
-                            }
-                        }
-                    );
-                    const resp = {
-                        ok: true,
-                        jobId: job.id,
-                        status: job.status,
-                        message: 'Import queued'
-                    };
-                    storeIdempotency(idemKey, 202, resp);
-                    return reply.code(202).send(resp);
-                }
-
-                const result = await importFromUrl(
-                    manager,
-                    body.url.trim(),
-                    enableOpt
-                );
-                if (audit) {
-                    await audit.record({
-                        actor: actorFromAuth(
-                            req.auth?.actor,
-                            clientIp(req, cfg)
-                        ),
-                        action: 'import.url',
-                        target: result.addon?.providerId,
-                        requestId: req.id,
-                        revision: manager.getRevision(),
-                        outcome: result.ok ? 'success' : 'failure',
-                        reason: result.error,
-                        meta: { url: redactUrl(body.url.trim()) }
-                    });
-                }
-                const resp = {
-                    ...publicInstallResult(result),
-                    revision: manager.getRevision()
-                };
-                const status = result.ok ? 200 : 400;
-                storeIdempotency(idemKey, status, resp);
-                return reply.code(status).send(resp);
-            }
-
-            return reply.code(400).send({
-                error: {
-                    code: 'MISSING_PARAMETER',
-                    message: 'Provide { url } or { urls: string[] }'
-                }
-            });
+        const val = importUrlBodyValidator(req.body);
+        if (!val.ok && val.errors) {
+            return reply
+                .code(400)
+                .send(formatValidationError(val.errors, req.id));
         }
-    );
+        const body = val.data!;
+        const enableOpt =
+            typeof body.enable === 'boolean'
+                ? { enable: body.enable }
+                : undefined;
 
-    // ── import from Stremio account ─────────────────────────────────────────
-    app.post<{
-        Body: {
-            email?: string;
-            password?: string;
-            authKey?: string;
-            endpoint?: string;
-            enable?: boolean;
-        };
-    }>(
-        '/v1/addons/import/stremio',
-        { preHandler: adminGuard },
-        async (req, reply) => {
-            if (!(await gate(req, reply))) return;
-            const idemKey = getIdempotencyKey(req);
-            if (tryIdempotency(idemKey, reply)) return;
-            const body = req.body ?? {};
-            if (!body.authKey && (!body.email || !body.password)) {
-                return reply.code(400).send({
-                    error: {
-                        code: 'MISSING_PARAMETER',
-                        message: 'Provide { authKey } or { email, password }'
-                    }
-                });
-            }
-
+        // Batch import
+        if (Array.isArray(body.urls) && body.urls.length > 0) {
             if (jobEngine) {
                 const job = await jobEngine.enqueue(
-                    'stremio-account-import',
-                    {
-                        email: body.email,
-                        password: body.password,
-                        authKey: body.authKey,
-                        endpoint: body.endpoint,
-                        enable: body.enable
-                    },
+                    'multi-addon-import',
+                    { urls: body.urls, enable: body.enable },
                     {
                         idempotencyKey: idemKey,
                         requester: {
@@ -312,91 +169,52 @@ export function registerImportRoutes(
                     ok: true,
                     jobId: job.id,
                     status: job.status,
-                    message: 'Stremio account import queued on durable job engine'
+                    message: 'Batch import queued on durable job engine'
                 };
                 storeIdempotency(idemKey, 202, resp);
                 return reply.code(202).send(resp);
             }
 
-            try {
-                // Credentials must never appear in logs/audit payloads.
-                const result = await importFromStremioAccount(manager, {
-                    email: body.email,
-                    password: body.password,
-                    authKey: body.authKey,
-                    endpoint: body.endpoint
-                });
-                if (audit) {
-                    await audit.record({
-                        actor: actorFromAuth(
-                            req.auth?.actor,
-                            clientIp(req, cfg)
-                        ),
-                        action: 'import.stremio',
-                        requestId: req.id,
-                        revision: manager.getRevision(),
-                        outcome: 'success',
-                        meta: {
-                            installed: result.installed,
-                            total: result.total,
-                            via: body.authKey ? 'authKey' : 'email'
-                        }
-                    });
-                }
-                const resp = {
-                    ok: true,
-                    ...result,
-                    results: result.results?.map(publicInstallResult),
-                    revision: manager.getRevision()
-                };
-                storeIdempotency(idemKey, 200, resp);
-                return reply.code(200).send(resp);
-            } catch (err) {
-                if (audit) {
-                    await audit.record({
-                        actor: actorFromAuth(
-                            req.auth?.actor,
-                            clientIp(req, cfg)
-                        ),
-                        action: 'import.stremio',
-                        requestId: req.id,
-                        outcome: 'failure',
-                        reason:
-                            err instanceof Error ? err.message : 'Import failed'
-                    });
-                }
-                const resp = {
-                    ok: false,
-                    error: err instanceof Error ? err.message : 'Import failed'
-                };
-                storeIdempotency(idemKey, 400, resp);
-                return reply.code(400).send(resp);
-            }
-        }
-    );
-
-    // ── import from repository (durable queue backed) ───────────────────────
-    app.post<{ Body: { url?: string; enable?: boolean } }>(
-        '/v1/addons/import/repository',
-        { preHandler: adminGuard },
-        async (req, reply) => {
-            if (!(await gate(req, reply))) return;
-            const idemKey = getIdempotencyKey(req);
-            if (tryIdempotency(idemKey, reply)) return;
-            const url = req.body?.url?.trim();
-            if (!url) {
-                return reply.code(400).send({
-                    error: {
-                        code: 'MISSING_PARAMETER',
-                        message: 'Provide { url } pointing at an addon list'
+            // Fallback synchronous import
+            const results = await importFromUrls(manager, body.urls, enableOpt);
+            const installed = results.filter((r) => r.ok).length;
+            if (audit) {
+                await audit.record({
+                    actor: actorFromAuth(req.auth?.actor, clientIp(req, cfg)),
+                    action: 'import.url.batch',
+                    requestId: req.id,
+                    revision: manager.getRevision(),
+                    outcome: installed > 0 ? 'success' : 'failure',
+                    meta: {
+                        total: results.length,
+                        installed,
+                        urls: body.urls.map((u) => redactUrl(u))
                     }
                 });
             }
+            const resp = {
+                ok: true,
+                installed,
+                total: results.length,
+                results: results.map(publicInstallResult),
+                revision: manager.getRevision()
+            };
+            storeIdempotency(idemKey, 200, resp);
+            return reply.code(200).send(resp);
+        }
 
-            if (jobEngine) {
+        // Single URL import
+        if (typeof body.url === 'string' && body.url.trim()) {
+            const query = req.query as Record<string, unknown> | undefined;
+            const preferAsync =
+                query?.async === 'true' ||
+                req.headers['prefer'] === 'respond-async' ||
+                req.headers['x-prefer-async'] === 'true';
+
+            if (preferAsync && jobEngine) {
                 const job = await jobEngine.enqueue(
-                    'repository-import',
-                    { url, enable: req.body?.enable },
+                    'multi-addon-import',
+                    { urls: [body.url.trim()], enable: body.enable },
                     {
                         idempotencyKey: idemKey,
                         requester: {
@@ -406,38 +224,233 @@ export function registerImportRoutes(
                         }
                     }
                 );
-                if (audit) {
-                    await audit.record({
-                        actor: actorFromAuth(
-                            req.auth?.actor,
-                            clientIp(req, cfg)
-                        ),
-                        action: 'import.repository.queued',
-                        requestId: req.id,
-                        target: job.id,
-                        outcome: 'success',
-                        meta: { url: redactUrl(url), jobId: job.id }
-                    });
-                }
-                const queuedResp = {
+                const resp = {
                     ok: true,
                     jobId: job.id,
                     status: job.status,
-                    message: 'Repository import queued on durable job engine'
+                    message: 'Import queued'
                 };
-                if (idemKey) {
-                    storeIdempotency(idemKey, 202, queuedResp);
-                }
-                return reply.code(202).send(queuedResp);
+                storeIdempotency(idemKey, 202, resp);
+                return reply.code(202).send(resp);
             }
 
-            return reply.code(503).send({
-                error: {
-                    code: 'JOB_ENGINE_UNAVAILABLE',
-                    message: 'Durable job engine is required for repository imports'
-                }
-            });
+            const result = await importFromUrl(
+                manager,
+                body.url.trim(),
+                enableOpt
+            );
+            if (audit) {
+                await audit.record({
+                    actor: actorFromAuth(req.auth?.actor, clientIp(req, cfg)),
+                    action: 'import.url',
+                    target: result.addon?.providerId,
+                    requestId: req.id,
+                    revision: manager.getRevision(),
+                    outcome: result.ok ? 'success' : 'failure',
+                    reason: result.error,
+                    meta: { url: redactUrl(body.url.trim()) }
+                });
+            }
+            const resp = {
+                ...publicInstallResult(result),
+                revision: manager.getRevision()
+            };
+            const status = result.ok ? 200 : 400;
+            storeIdempotency(idemKey, status, resp);
+            return reply.code(status).send(resp);
         }
+
+        return reply.code(400).send({
+            error: {
+                code: 'MISSING_PARAMETER',
+                message: 'Provide { url } or { urls: string[] }'
+            }
+        });
+    };
+
+    app.post(
+        '/v1/addons/import/url',
+        { preHandler: adminGuard },
+        handleImportUrl
+    );
+    app.post('/v1/import', { preHandler: adminGuard }, handleImportUrl);
+
+    // ── import from Stremio account ─────────────────────────────────────────
+    const handleImportStremio = async (
+        req: FastifyRequest,
+        reply: import('fastify').FastifyReply
+    ) => {
+        if (!(await gate(req, reply))) return;
+        const idemKey = getIdempotencyKey(req);
+        if (tryIdempotency(idemKey, reply)) return;
+
+        const val = importStremioBodyValidator(req.body);
+        if (!val.ok && val.errors) {
+            return reply
+                .code(400)
+                .send(formatValidationError(val.errors, req.id));
+        }
+        const body = val.data!;
+
+        if (jobEngine) {
+            const job = await jobEngine.enqueue(
+                'stremio-account-import',
+                {
+                    email: body.email,
+                    password: body.password,
+                    authKey: body.authKey,
+                    endpoint: body.endpoint,
+                    enable: body.enable
+                },
+                {
+                    idempotencyKey: idemKey,
+                    requester: {
+                        id: req.auth?.actor?.id,
+                        ip: clientIp(req, cfg),
+                        role: req.auth?.actor?.role
+                    }
+                }
+            );
+            const resp = {
+                ok: true,
+                jobId: job.id,
+                status: job.status,
+                message: 'Stremio account import queued on durable job engine'
+            };
+            storeIdempotency(idemKey, 202, resp);
+            return reply.code(202).send(resp);
+        }
+
+        try {
+            // Credentials must never appear in logs/audit payloads.
+            const result = await importFromStremioAccount(manager, {
+                email: body.email,
+                password: body.password,
+                authKey: body.authKey,
+                endpoint: body.endpoint
+            });
+            if (audit) {
+                await audit.record({
+                    actor: actorFromAuth(req.auth?.actor, clientIp(req, cfg)),
+                    action: 'import.stremio',
+                    requestId: req.id,
+                    revision: manager.getRevision(),
+                    outcome: 'success',
+                    meta: {
+                        installed: result.installed,
+                        total: result.total,
+                        via: body.authKey ? 'authKey' : 'email'
+                    }
+                });
+            }
+            const resp = {
+                ok: true,
+                ...result,
+                results: result.results?.map(publicInstallResult),
+                revision: manager.getRevision()
+            };
+            storeIdempotency(idemKey, 200, resp);
+            return reply.code(200).send(resp);
+        } catch (err) {
+            if (audit) {
+                await audit.record({
+                    actor: actorFromAuth(req.auth?.actor, clientIp(req, cfg)),
+                    action: 'import.stremio',
+                    requestId: req.id,
+                    outcome: 'failure',
+                    reason: err instanceof Error ? err.message : 'Import failed'
+                });
+            }
+            const resp = {
+                ok: false,
+                error: err instanceof Error ? err.message : 'Import failed'
+            };
+            storeIdempotency(idemKey, 400, resp);
+            return reply.code(400).send(resp);
+        }
+    };
+
+    app.post(
+        '/v1/addons/import/stremio',
+        { preHandler: adminGuard },
+        handleImportStremio
+    );
+    app.post(
+        '/v1/import/stremio',
+        { preHandler: adminGuard },
+        handleImportStremio
+    );
+
+    // ── import from repository (durable queue backed) ───────────────────────
+    const handleImportRepo = async (
+        req: FastifyRequest,
+        reply: import('fastify').FastifyReply
+    ) => {
+        if (!(await gate(req, reply))) return;
+        const idemKey = getIdempotencyKey(req);
+        if (tryIdempotency(idemKey, reply)) return;
+
+        const val = importRepoBodyValidator(req.body);
+        if (!val.ok && val.errors) {
+            return reply
+                .code(400)
+                .send(formatValidationError(val.errors, req.id));
+        }
+        const body = val.data!;
+        const url = body.url.trim();
+
+        if (jobEngine) {
+            const job = await jobEngine.enqueue(
+                'repository-import',
+                { url, enable: body.enable },
+                {
+                    idempotencyKey: idemKey,
+                    requester: {
+                        id: req.auth?.actor?.id,
+                        ip: clientIp(req, cfg),
+                        role: req.auth?.actor?.role
+                    }
+                }
+            );
+            if (audit) {
+                await audit.record({
+                    actor: actorFromAuth(req.auth?.actor, clientIp(req, cfg)),
+                    action: 'import.repository.queued',
+                    requestId: req.id,
+                    target: job.id,
+                    outcome: 'success',
+                    meta: { url: redactUrl(url), jobId: job.id }
+                });
+            }
+            const queuedResp = {
+                ok: true,
+                jobId: job.id,
+                status: job.status,
+                message: 'Repository import queued on durable job engine'
+            };
+            if (idemKey) {
+                storeIdempotency(idemKey, 202, queuedResp);
+            }
+            return reply.code(202).send(queuedResp);
+        }
+
+        return reply.code(503).send({
+            error: {
+                code: 'JOB_ENGINE_UNAVAILABLE',
+                message: 'Durable job engine is required for repository imports'
+            }
+        });
+    };
+
+    app.post(
+        '/v1/addons/import/repository',
+        { preHandler: adminGuard },
+        handleImportRepo
+    );
+    app.post(
+        '/v1/import/repository',
+        { preHandler: adminGuard },
+        handleImportRepo
     );
 
     // ── unified import jobs endpoints (durable query & cancel) ───────────────
@@ -445,12 +458,18 @@ export function registerImportRoutes(
         '/v1/import/jobs/:jobId',
         { preHandler: adminGuard },
         async (req, reply) => {
+            const paramVal = jobIdValidator(req.params.jobId);
+            if (!paramVal.ok && paramVal.errors) {
+                return reply
+                    .code(400)
+                    .send(formatValidationError(paramVal.errors, req.id));
+            }
             if (!jobEngine) {
                 return reply.code(404).send({
                     error: { code: 'NOT_FOUND', message: 'Job not found' }
                 });
             }
-            const job = await jobEngine.storage.getJob(req.params.jobId);
+            const job = await jobEngine.storage.getJob(paramVal.data!);
             if (!job) {
                 return reply.code(404).send({
                     error: { code: 'NOT_FOUND', message: 'Job not found' }
@@ -474,12 +493,18 @@ export function registerImportRoutes(
         '/v1/import/jobs/:jobId',
         { preHandler: adminGuard },
         async (req, reply) => {
+            const paramVal = jobIdValidator(req.params.jobId);
+            if (!paramVal.ok && paramVal.errors) {
+                return reply
+                    .code(400)
+                    .send(formatValidationError(paramVal.errors, req.id));
+            }
             if (!jobEngine) {
                 return reply.code(404).send({
                     error: { code: 'NOT_FOUND', message: 'Job not found' }
                 });
             }
-            const job = await jobEngine.storage.getJob(req.params.jobId);
+            const job = await jobEngine.storage.getJob(paramVal.data!);
             if (!job) {
                 return reply.code(404).send({
                     error: { code: 'NOT_FOUND', message: 'Job not found' }
