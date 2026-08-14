@@ -492,6 +492,18 @@ async function main(): Promise<void> {
             ? '/v1/proxy/[REDACTED]'
             : request.url;
 
+        const hostHeader =
+            (request.headers['x-forwarded-host'] as string) ||
+            (request.headers.host as string) ||
+            undefined;
+        const upstreamHost = hostHeader ? hostHeader.split(':')[0] : undefined;
+        const failureClassification =
+            reply.statusCode >= 500
+                ? 'http_5xx'
+                : reply.statusCode >= 400
+                  ? 'http_4xx'
+                  : undefined;
+
         logger.info(
             `${request.method} ${sanitizedUrl} ${reply.statusCode} (${duration}ms)`,
             {
@@ -502,7 +514,9 @@ async function main(): Promise<void> {
                 route: sanitizedUrl,
                 method: request.method,
                 statusCode: reply.statusCode,
-                durationMs: duration
+                durationMs: duration,
+                upstreamHost,
+                failureClassification
             }
         );
     });
@@ -512,12 +526,19 @@ async function main(): Promise<void> {
         if (span) {
             span.recordException(error);
         }
+        const hostHeader =
+            (request.headers['x-forwarded-host'] as string) ||
+            (request.headers.host as string) ||
+            undefined;
+        const upstreamHost = hostHeader ? hostHeader.split(':')[0] : undefined;
         logger.error(error, {
             requestId: request.id,
             traceId: span?.traceId,
             spanId: span?.spanId,
             route: request.url,
-            method: request.method
+            method: request.method,
+            upstreamHost,
+            failureClassification: 'http_5xx'
         });
     });
 

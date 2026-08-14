@@ -1,4 +1,4 @@
-import type { JobRecord, JobStatus, IStorageBackend } from '../storage/types.js';
+import type { JobRecord, IStorageBackend } from '../storage/types.js';
 import type { AddonManager } from '../addons/manager.js';
 import type { AppConfig } from '../config.js';
 
@@ -19,6 +19,7 @@ export interface JobHandlerContext {
     manager: AddonManager;
     storage: IStorageBackend;
     cfg: AppConfig;
+    traceId?: string;
 }
 
 export type JobHandler = (ctx: JobHandlerContext) => Promise<unknown>;

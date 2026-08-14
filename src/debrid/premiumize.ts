@@ -245,7 +245,8 @@ export class PremiumizeResolver implements DebridResolver {
         return null;
     }
 
-    async cleanup(_id: string): Promise<void> {
+    async cleanup(id: string): Promise<void> {
+        void id;
         // Premiumize directdl creates ephemeral items unless added to transfers
     }
 }

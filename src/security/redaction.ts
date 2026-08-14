@@ -56,10 +56,17 @@ const SECRET_PATTERNS: RegExp[] = [
 
 export function redactString(value: string, maxLen = 500): string {
     let out = value;
+    // Scrub embedded user:pass credentials in URLs
+    out = out.replace(/(?:\/\/)[^/\s:@]+:[^@\s/]+@/g, '://[REDACTED]@');
     for (const re of SECRET_PATTERNS) {
         out = out.replace(re, (match) => {
-            // Keep short structural tokens (e.g. UUIDs used as ids) if they look like ids
-            if (/^[0-9a-f-]{36}$/i.test(match)) return match;
+            // Keep structural tokens (UUIDs and 32-hex W3C trace IDs) if they match ID patterns
+            if (
+                /^[0-9a-f-]{36}$/i.test(match) ||
+                /^[0-9a-f]{32}$/i.test(match)
+            ) {
+                return match;
+            }
             if (
                 match.length < 24 &&
                 !/Bearer|Basic|api|token|password|secret/i.test(match)
@@ -165,6 +172,13 @@ export function redactValue(value: unknown, depth = 0): unknown {
                 typeof v === 'string'
             ) {
                 out[k] = redactUrl(v);
+            } else if (
+                k.toLowerCase().includes('host') &&
+                typeof v === 'string'
+            ) {
+                out[k] = redactUrl(v.includes('://') ? v : `http://${v}`)
+                    .replace(/^https?:\/\//, '')
+                    .replace(/\/$/, '');
             } else {
                 out[k] = redactValue(v, depth + 1);
             }

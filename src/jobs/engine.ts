@@ -316,6 +316,7 @@ export class JobEngine {
                         storage: this.storage,
                         manager: this.manager,
                         cfg: this.cfg,
+                        traceId: span.traceId,
                         updateProgress: async (progress: number) => {
                             await this.storage.updateJobProgress(
                                 job.id,
@@ -356,6 +357,7 @@ export class JobEngine {
                             component: 'jobs',
                             jobId: job.id,
                             jobType: job.type,
+                            traceId: span.traceId,
                             durationMs: duration
                         }
                     );
@@ -400,6 +402,7 @@ export class JobEngine {
                             component: 'jobs',
                             jobId: job.id,
                             jobType: job.type,
+                            traceId: span.traceId,
                             durationMs: duration
                         }
                     );

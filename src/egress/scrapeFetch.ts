@@ -25,6 +25,7 @@ import {
     fetch as undiciFetch,
     type RequestInit as UndiciRequestInit
 } from 'undici';
+import { tracer, logger } from '../telemetry/index.js';
 
 export type ScrapeProxyMode = 'off' | 'allowlist' | 'all';
 
@@ -35,6 +36,8 @@ export type ScrapeFetchInit = RequestInit & {
     timeoutMs?: number;
     /** Pin DNS to validated address to prevent rebinding (SSRF defense). */
     pinnedIp?: string;
+    /** Whether to inject W3C traceparent header to upstream host (default false). */
+    propagateTrace?: boolean;
 };
 
 /** Control-plane hosts that are never IP-blocked — keep them off the proxy. */
@@ -177,21 +180,31 @@ export function logScrapeProxyStatus(prefix = '[egress]'): void {
     loggedStatus = true;
     const s = getScrapeProxyStatus();
     if (!s.enabled) {
-        console.log(
-            `${prefix} egress proxy OFF (set PROXY_URL to route around datacenter IP blocks)`
+        logger.info(
+            `${prefix} Scrape egress proxy OFF (set PROXY_URL to route around datacenter IP blocks)`,
+            { component: 'egress', proxyEnabled: false }
         );
         return;
     }
-    console.log(
-        `${prefix} egress proxy ON mode=${s.mode} stream=${s.stream} via ${s.proxyDisplay}`
+    logger.info(
+        `${prefix} Scrape egress proxy ON mode=${s.mode} stream=${s.stream} via ${s.proxyDisplay}`,
+        {
+            component: 'egress',
+            proxyEnabled: true,
+            mode: s.mode,
+            stream: s.stream
+        }
     );
 }
 
 /** Drop hop-by-hop / compressed body headers that confuse undici on replay. */
 function normalizeHeaders(
-    headers?: RequestInit['headers']
+    headers?: RequestInit['headers'],
+    propagateTrace = false
 ): Record<string, string> | undefined {
-    if (!headers) return undefined;
+    if (!headers && !propagateTrace) {
+        return undefined;
+    }
     const out: Record<string, string> = {};
     if (typeof Headers !== 'undefined' && headers instanceof Headers) {
         headers.forEach((v, k) => {
@@ -202,7 +215,7 @@ function normalizeHeaders(
             const [k, v] = pair;
             if (typeof k === 'string' && typeof v === 'string') out[k] = v;
         }
-    } else {
+    } else if (headers) {
         for (const [k, v] of Object.entries(
             headers as Record<string, string>
         )) {
@@ -211,6 +224,9 @@ function normalizeHeaders(
     }
     delete out['accept-encoding'];
     delete out['Accept-Encoding'];
+    if (propagateTrace) {
+        tracer.injectTraceparent(out);
+    }
     return out;
 }
 
@@ -236,85 +252,126 @@ function createPinnedDispatcher(pinnedIp: string): Agent {
 }
 
 export async function scrapeFetch(
-    input: string | URL | Request,
-    init: ScrapeFetchInit = {}
+    input: string | URL | { url: string },
+    init?: ScrapeFetchInit
 ): Promise<Response> {
-    const { viaProxy = 'auto', timeoutMs, pinnedIp, ...rest } = init;
+    const {
+        viaProxy = 'auto',
+        timeoutMs,
+        pinnedIp,
+        propagateTrace: optPropagateTrace,
+        ...rest
+    } = init ?? {};
 
     let urlStr: string;
     if (typeof input === 'string') urlStr = input;
     else if (input instanceof URL) urlStr = input.href;
     else urlStr = input.url;
 
-    let signal = rest.signal;
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    if (!signal && timeoutMs != null && timeoutMs > 0) {
-        const ac = new AbortController();
-        signal = ac.signal;
-        timeout = setTimeout(() => ac.abort(), timeoutMs);
-    }
-
-    const useProxy = shouldProxyUrl(urlStr, viaProxy);
-    const headers = normalizeHeaders(rest.headers);
-
+    let upstreamHost = 'unknown';
     try {
-        // DNS-pinned requests MUST bypass the egress proxy: the proxy would
-        // resolve the hostname itself, ignoring the validated IP and re-introducing
-        // SSRF/DNS-rebinding. When pinnedIp is set, use the pinned dispatcher directly.
-        if (pinnedIp) {
-            const pinnedDispatcher = createPinnedDispatcher(pinnedIp);
-            try {
-                const undiciInit: UndiciRequestInit = {
-                    method: rest.method,
-                    headers,
-                    body: rest.body as UndiciRequestInit['body'],
-                    signal: signal as UndiciRequestInit['signal'],
-                    redirect: rest.redirect,
-                    dispatcher: pinnedDispatcher
-                };
-                return (await undiciFetch(
-                    urlStr,
-                    undiciInit
-                )) as unknown as Response;
-            } finally {
-                void pinnedDispatcher.close?.().catch(() => undefined);
-            }
-        }
-
-        if (useProxy) {
-            const dispatcher = getAgent();
-            if (dispatcher) {
-                const undiciInit: UndiciRequestInit = {
-                    method: rest.method,
-                    headers,
-                    body: rest.body as UndiciRequestInit['body'],
-                    signal: signal as UndiciRequestInit['signal'],
-                    redirect: rest.redirect,
-                    dispatcher
-                };
-                try {
-                    return (await undiciFetch(
-                        urlStr,
-                        undiciInit
-                    )) as unknown as Response;
-                } catch (err) {
-                    const allowFallback = !/^(0|false|off|no)$/i.test(
-                        (
-                            process.env.SCRAPE_PROXY_FALLBACK_DIRECT ?? 'true'
-                        ).trim()
-                    );
-                    if (viaProxy === true || !allowFallback) {
-                        throw wrapProxyError(err, urlStr);
-                    }
-                    // auto mode: fall through to a direct attempt below
-                }
-            }
-        }
-
-        return await fetch(urlStr, { ...rest, headers, signal });
-    } finally {
-        if (timeout) clearTimeout(timeout);
+        upstreamHost = new URL(urlStr).hostname;
+    } catch {
+        // invalid URL string, fallback to 'unknown'
     }
+
+    return tracer.withSpan(
+        'http.client.request',
+        async (span) => {
+            span.setAttribute('http.method', rest.method || 'GET');
+            span.setAttribute('http.url.host', upstreamHost);
+
+            let signal = rest.signal;
+            let timeout: ReturnType<typeof setTimeout> | undefined;
+            if (!signal && timeoutMs != null && timeoutMs > 0) {
+                const ac = new AbortController();
+                signal = ac.signal;
+                timeout = setTimeout(() => ac.abort(), timeoutMs);
+            }
+
+            const propagateTrace =
+                optPropagateTrace ??
+                process.env.TRACING_PROPAGATE_TO_UPSTREAM === 'true';
+            const useProxy = shouldProxyUrl(urlStr, viaProxy);
+            span.setAttribute('http.use_proxy', useProxy);
+            const headers = normalizeHeaders(rest.headers, propagateTrace);
+
+            try {
+                // DNS-pinned requests MUST bypass the egress proxy: the proxy would
+                // resolve the hostname itself, ignoring the validated IP and re-introducing
+                // SSRF/DNS-rebinding. When pinnedIp is set, use the pinned dispatcher directly.
+                if (pinnedIp) {
+                    const pinnedDispatcher = createPinnedDispatcher(pinnedIp);
+                    try {
+                        const undiciInit: UndiciRequestInit = {
+                            method: rest.method,
+                            headers,
+                            body: rest.body as UndiciRequestInit['body'],
+                            signal: signal as UndiciRequestInit['signal'],
+                            redirect: rest.redirect,
+                            dispatcher: pinnedDispatcher
+                        };
+                        const res = (await undiciFetch(
+                            urlStr,
+                            undiciInit
+                        )) as unknown as Response;
+                        span.setAttribute('http.status_code', res.status);
+                        span.setStatus(res.ok ? 'ok' : 'error');
+                        return res;
+                    } finally {
+                        void pinnedDispatcher.close?.().catch(() => undefined);
+                    }
+                }
+
+                if (useProxy) {
+                    const dispatcher = getAgent();
+                    if (dispatcher) {
+                        const undiciInit: UndiciRequestInit = {
+                            method: rest.method,
+                            headers,
+                            body: rest.body as UndiciRequestInit['body'],
+                            signal: signal as UndiciRequestInit['signal'],
+                            redirect: rest.redirect,
+                            dispatcher
+                        };
+                        try {
+                            const res = (await undiciFetch(
+                                urlStr,
+                                undiciInit
+                            )) as unknown as Response;
+                            span.setAttribute('http.status_code', res.status);
+                            span.setStatus(res.ok ? 'ok' : 'error');
+                            return res;
+                        } catch (err) {
+                            const allowFallback = !/^(0|false|off|no)$/i.test(
+                                (
+                                    process.env.SCRAPE_PROXY_FALLBACK_DIRECT ??
+                                    'true'
+                                ).trim()
+                            );
+                            if (viaProxy === true || !allowFallback) {
+                                throw wrapProxyError(err, urlStr);
+                            }
+                            // auto mode: fall through to a direct attempt below
+                        }
+                    }
+                }
+
+                const res = await fetch(urlStr, { ...rest, headers, signal });
+                span.setAttribute('http.status_code', res.status);
+                span.setStatus(res.ok ? 'ok' : 'error');
+                return res;
+            } finally {
+                if (timeout) clearTimeout(timeout);
+            }
+        },
+        {
+            attributes: {
+                'http.method': rest.method || 'GET',
+                'http.url.host': upstreamHost
+            }
+        }
+    );
 }
 
 function wrapProxyError(err: unknown, url: string): Error {

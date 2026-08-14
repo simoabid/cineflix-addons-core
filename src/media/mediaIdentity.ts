@@ -14,6 +14,7 @@
  */
 
 import type { ProviderMediaObject } from '@omss/framework';
+import { tracer } from '../telemetry/tracing.js';
 
 export type MediaKind = 'movie' | 'tv';
 
@@ -33,7 +34,13 @@ export interface MediaIdentityOptions {
 }
 
 export class MediaIdentityError extends Error {
-    readonly code: 'INVALID_TMDB_ID' | 'INVALID_SEASON_EPISODE' | 'TMDB_NOT_FOUND' | 'TMDB_ERROR' | 'TIMEOUT' | 'ABORTED';
+    readonly code:
+        | 'INVALID_TMDB_ID'
+        | 'INVALID_SEASON_EPISODE'
+        | 'TMDB_NOT_FOUND'
+        | 'TMDB_ERROR'
+        | 'TIMEOUT'
+        | 'ABORTED';
     readonly status: number;
 
     constructor(
@@ -51,12 +58,23 @@ export class MediaIdentityError extends Error {
 // In-memory LRU-ish cache for media objects.
 // Key: `movie:tmdbId` or `tv:tmdbId:s:e`
 // TTL 6h for identity (shorter than TMDBService's 24h but still effective).
-const MEDIA_CACHE = new Map<string, { value: ProviderMediaObject; expiresAt: number }>();
+const MEDIA_CACHE = new Map<
+    string,
+    { value: ProviderMediaObject; expiresAt: number }
+>();
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const NEGATIVE_TTL_MS = 60 * 1000; // short for not-found/errors
-const negativeCache = new Map<string, { error: MediaIdentityError; expiresAt: number }>();
+const negativeCache = new Map<
+    string,
+    { error: MediaIdentityError; expiresAt: number }
+>();
 
-function cacheKey(kind: MediaKind, tmdbId: string, s?: number, e?: number): string {
+function cacheKey(
+    kind: MediaKind,
+    tmdbId: string,
+    s?: number,
+    e?: number
+): string {
     return kind === 'movie' ? `movie:${tmdbId}` : `tv:${tmdbId}:s${s}:e${e}`;
 }
 
@@ -66,15 +84,35 @@ function isValidTmdbId(id: string): boolean {
 
 function isValidSeasonEpisode(s?: number, e?: number): boolean {
     if (s == null || e == null) return false;
-    return Number.isInteger(s) && Number.isInteger(e) && s > 0 && s < 100 && e > 0 && e < 1000;
+    return (
+        Number.isInteger(s) &&
+        Number.isInteger(e) &&
+        s > 0 &&
+        s < 100 &&
+        e > 0 &&
+        e < 1000
+    );
 }
 
-async function tmdbFetch<T>(path: string, opts: MediaIdentityOptions = {}): Promise<T> {
+async function tmdbFetch<T>(
+    path: string,
+    opts: MediaIdentityOptions = {}
+): Promise<T> {
     const key = process.env.TMDB_API_KEY?.trim();
-    if (!key) throw new MediaIdentityError('TMDB_ERROR', 'TMDB_API_KEY not configured', 500);
+    if (!key)
+        throw new MediaIdentityError(
+            'TMDB_ERROR',
+            'TMDB_API_KEY not configured',
+            500
+        );
 
     const remaining = opts.deadlineMs ? opts.deadlineMs - Date.now() : 12_000;
-    if (remaining <= 0) throw new MediaIdentityError('TIMEOUT', 'Media identity deadline exceeded', 504);
+    if (remaining <= 0)
+        throw new MediaIdentityError(
+            'TIMEOUT',
+            'Media identity deadline exceeded',
+            504
+        );
 
     const url = `https://api.themoviedb.org/3${path}${path.includes('?') ? '&' : '?'}api_key=${encodeURIComponent(key)}`;
 
@@ -91,24 +129,48 @@ async function tmdbFetch<T>(path: string, opts: MediaIdentityOptions = {}): Prom
             signal
         });
     } catch (err) {
-        if (err instanceof Error && (err.name === 'AbortError' || err.name === 'TimeoutError')) {
+        if (
+            err instanceof Error &&
+            (err.name === 'AbortError' || err.name === 'TimeoutError')
+        ) {
             if (err.name === 'TimeoutError' || !opts.signal?.aborted) {
-                throw new MediaIdentityError('TIMEOUT', 'TMDB request timed out', 504);
+                throw new MediaIdentityError(
+                    'TIMEOUT',
+                    'TMDB request timed out',
+                    504
+                );
             }
             throw new MediaIdentityError('ABORTED', 'Request aborted', 499);
         }
-        throw new MediaIdentityError('TMDB_ERROR', err instanceof Error ? err.message : String(err), 502);
+        throw new MediaIdentityError(
+            'TMDB_ERROR',
+            err instanceof Error ? err.message : String(err),
+            502
+        );
     }
 
     if (!res.ok) {
-        if (res.status === 404) throw new MediaIdentityError('TMDB_NOT_FOUND', `TMDB not found for ${path}`, 404);
-        throw new MediaIdentityError('TMDB_ERROR', `TMDB HTTP ${res.status} for ${path}`, 502);
+        if (res.status === 404)
+            throw new MediaIdentityError(
+                'TMDB_NOT_FOUND',
+                `TMDB not found for ${path}`,
+                404
+            );
+        throw new MediaIdentityError(
+            'TMDB_ERROR',
+            `TMDB HTTP ${res.status} for ${path}`,
+            502
+        );
     }
 
     try {
         return (await res.json()) as T;
     } catch {
-        throw new MediaIdentityError('TMDB_ERROR', 'TMDB returned invalid JSON', 502);
+        throw new MediaIdentityError(
+            'TMDB_ERROR',
+            'TMDB returned invalid JSON',
+            502
+        );
     }
 }
 
@@ -136,45 +198,85 @@ export class MediaIdentityService {
         episode?: number,
         opts: MediaIdentityOptions = {}
     ): Promise<MediaIdentity> {
-        if (!isValidTmdbId(tmdbId)) {
-            throw new MediaIdentityError('INVALID_TMDB_ID', `Invalid TMDB id: ${tmdbId}`, 400);
-        }
-        if (kind === 'tv') {
-            if (!isValidSeasonEpisode(season, episode)) {
-                throw new MediaIdentityError(
-                    'INVALID_SEASON_EPISODE',
-                    `Invalid season/episode: s=${season} e=${episode} (expected s 1..99, e 1..999)`,
-                    400
-                );
-            }
-        }
+        return tracer.withSpan(
+            'media.identity.resolve',
+            async (span) => {
+                span.setAttribute('media.kind', kind);
+                span.setAttribute('media.tmdb_id', tmdbId);
+                if (season !== undefined) span.setAttribute('media.season', season);
+                if (episode !== undefined)
+                    span.setAttribute('media.episode', episode);
 
-        const k = cacheKey(kind, tmdbId, season, episode);
-        const cached = MEDIA_CACHE.get(k);
-        if (cached && Date.now() < cached.expiresAt) {
-            return { media: cached.value, fromCache: true };
-        }
-        const neg = negativeCache.get(k);
-        if (neg && Date.now() < neg.expiresAt) throw neg.error;
+                if (!isValidTmdbId(tmdbId)) {
+                    throw new MediaIdentityError(
+                        'INVALID_TMDB_ID',
+                        `Invalid TMDB id: ${tmdbId}`,
+                        400
+                    );
+                }
+                if (kind === 'tv') {
+                    if (!isValidSeasonEpisode(season, episode)) {
+                        throw new MediaIdentityError(
+                            'INVALID_SEASON_EPISODE',
+                            `Invalid season/episode: s=${season} e=${episode} (expected s 1..99, e 1..999)`,
+                            400
+                        );
+                    }
+                }
 
-        try {
-            const media = await this.fetchMedia(kind, tmdbId, season, episode, opts);
-            MEDIA_CACHE.set(k, { value: media, expiresAt: Date.now() + CACHE_TTL_MS });
-            // Cap cache size
-            if (MEDIA_CACHE.size > 1000) {
-                const first = MEDIA_CACHE.keys().next().value as string | undefined;
-                if (first) MEDIA_CACHE.delete(first);
-            }
-            return { media, fromCache: false };
-        } catch (err) {
-            if (err instanceof MediaIdentityError) {
-                // Negative cache short for 404, longer for timeout? Keep short to allow retry
-                if (err.code === 'TMDB_NOT_FOUND' || err.code === 'INVALID_TMDB_ID') {
-                    negativeCache.set(k, { error: err, expiresAt: Date.now() + NEGATIVE_TTL_MS });
+                const k = cacheKey(kind, tmdbId, season, episode);
+                const cached = MEDIA_CACHE.get(k);
+                if (cached && Date.now() < cached.expiresAt) {
+                    span.setAttribute('media.from_cache', true);
+                    return { media: cached.value, fromCache: true };
+                }
+                const neg = negativeCache.get(k);
+                if (neg && Date.now() < neg.expiresAt) throw neg.error;
+
+                try {
+                    const media = await this.fetchMedia(
+                        kind,
+                        tmdbId,
+                        season,
+                        episode,
+                        opts
+                    );
+                    MEDIA_CACHE.set(k, {
+                        value: media,
+                        expiresAt: Date.now() + CACHE_TTL_MS
+                    });
+                    // Cap cache size
+                    if (MEDIA_CACHE.size > 1000) {
+                        const first = MEDIA_CACHE.keys().next().value as
+                            | string
+                            | undefined;
+                        if (first) MEDIA_CACHE.delete(first);
+                    }
+                    span.setAttribute('media.from_cache', false);
+                    return { media, fromCache: false };
+                } catch (err) {
+                    if (err instanceof MediaIdentityError) {
+                        // Negative cache short for 404, longer for timeout? Keep short to allow retry
+                        if (
+                            err.code === 'TMDB_NOT_FOUND' ||
+                            err.code === 'INVALID_TMDB_ID'
+                        ) {
+                            negativeCache.set(k, {
+                                error: err,
+                                expiresAt: Date.now() + NEGATIVE_TTL_MS
+                            });
+                        }
+                    }
+                    throw err;
+                }
+            },
+            {
+                attributes: {
+                    'media.kind': kind,
+                    'media.tmdb_id': tmdbId
                 }
             }
-            throw err;
-        }
+        );
     }
 
     private async fetchMedia(
@@ -225,7 +327,11 @@ export class MediaIdentityService {
         season?: number,
         episode?: number,
         opts: MediaIdentityOptions = {}
-    ): Promise<{ media?: ProviderMediaObject; error?: MediaIdentityError; fromCache?: boolean }> {
+    ): Promise<{
+        media?: ProviderMediaObject;
+        error?: MediaIdentityError;
+        fromCache?: boolean;
+    }> {
         try {
             const r = await this.resolve(kind, tmdbId, season, episode, opts);
             return { media: r.media, fromCache: r.fromCache };
@@ -256,6 +362,12 @@ export async function buildProgressiveMedia(
     episode?: number,
     opts: MediaIdentityOptions = {}
 ): Promise<ProviderMediaObject> {
-    const r = await globalMediaIdentity.resolve(type, tmdbId, season, episode, opts);
+    const r = await globalMediaIdentity.resolve(
+        type,
+        tmdbId,
+        season,
+        episode,
+        opts
+    );
     return r.media;
 }

@@ -143,6 +143,7 @@ export interface AppConfig {
     logLevel: 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'fatal';
     logFormat: 'json' | 'pretty' | 'text';
     tracingEnabled: boolean;
+    tracingPropagateToUpstream: boolean;
     healthStaleThresholdMinutes: number;
     healthDegradedMinProvidersRatio: number;
 }
@@ -311,6 +312,10 @@ export function loadConfig(): AppConfig {
         logLevel: parseLogLevel(envStr('LOG_LEVEL'), nodeEnv),
         logFormat: parseLogFormat(envStr('LOG_FORMAT'), nodeEnv),
         tracingEnabled: envBool('TRACING_ENABLED', true),
+        tracingPropagateToUpstream: envBool(
+            'TRACING_PROPAGATE_TO_UPSTREAM',
+            false
+        ),
         healthStaleThresholdMinutes: envNum(
             'HEALTH_STALE_THRESHOLD_MINUTES',
             60

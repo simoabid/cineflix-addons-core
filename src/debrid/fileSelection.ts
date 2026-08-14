@@ -35,7 +35,7 @@ const VIDEO_EXTENSIONS: Record<string, number> = {
 };
 
 const SAMPLE_OR_BONUS_REGEX =
-    /(?:^|[\s._\-\[/])(sample|trailer|featurette|bonus|extras?|behind[._ -]?the[._ -]?scenes|deleted[._ -]?scenes?|teaser)(?:$|[\s._\-\]\d/])/i;
+    /(?:^|[\s._\-[/])(sample|trailer|featurette|bonus|extras?|behind[._ -]?the[._ -]?scenes|deleted[._ -]?scenes?|teaser)(?:$|[\s._\-\]\d/])/i;
 
 const NON_VIDEO_EXTENSIONS = new Set([
     'nfo',

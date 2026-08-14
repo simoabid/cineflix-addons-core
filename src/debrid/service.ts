@@ -22,6 +22,8 @@ import type {
     ResolveInput
 } from './types.js';
 import type { AuditLogger } from '../security/audit.js';
+import { globalMetrics } from '../metrics/index.js';
+import { tracer } from '../telemetry/tracing.js';
 
 interface CacheEntry {
     url: string;
@@ -73,7 +75,10 @@ class DebridService {
         this.cache.clear();
     }
 
-    private handleAuthFailure(reason: string, meta?: Record<string, unknown>): void {
+    private handleAuthFailure(
+        reason: string,
+        meta?: Record<string, unknown>
+    ): void {
         const now = Date.now();
         this.authFailureTimestamps.push(now);
         const cutoff = now - DebridService.AUTH_FAILURE_ALERT_WINDOW_MS;
@@ -93,7 +98,9 @@ class DebridService {
         if (this.auditLogger) {
             void this.auditLogger.record({
                 actor: { id: 'system', role: 'admin', method: 'static-token' },
-                action: isAlert ? 'alert.debrid_auth_failure' : 'debrid.auth_failure',
+                action: isAlert
+                    ? 'alert.debrid_auth_failure'
+                    : 'debrid.auth_failure',
                 outcome: 'failure',
                 reason,
                 meta: {
@@ -115,11 +122,17 @@ class DebridService {
         source: string;
         capabilities: DebridCapabilities | null;
         cachedLinksCount: number;
-        activeAlerts: Array<{ code: string; message: string; failuresInWindow: number }>;
+        activeAlerts: Array<{
+            code: string;
+            message: string;
+            failuresInWindow: number;
+        }>;
     } {
         const now = Date.now();
         const cutoff = now - DebridService.AUTH_FAILURE_ALERT_WINDOW_MS;
-        const recentFailures = this.authFailureTimestamps.filter((t) => t >= cutoff).length;
+        const recentFailures = this.authFailureTimestamps.filter(
+            (t) => t >= cutoff
+        ).length;
         const activeAlerts =
             recentFailures >= DebridService.AUTH_FAILURE_ALERT_THRESHOLD
                 ? [
@@ -154,7 +167,9 @@ class DebridService {
         if (res.ok) {
             this.authFailureTimestamps = [];
         } else if (res.errorKind === 'auth_failure') {
-            this.handleAuthFailure(res.error || 'Check failed', { action: 'check' });
+            this.handleAuthFailure(res.error || 'Check failed', {
+                action: 'check'
+            });
         }
         return res;
     }
@@ -165,43 +180,100 @@ class DebridService {
     }
 
     async resolveCached(input: ResolveInput): Promise<DebridResolution> {
-        if (!this.resolver) {
-            return {
-                kind: 'provider-error',
-                code: 'DEBRID_DISABLED',
-                errorKind: 'unsupported',
-                retryable: false,
-                safeMessage: 'Debrid service is disabled or not configured'
-            };
-        }
+        return tracer.withSpan(
+            'debrid.resolve',
+            async (span) => {
+                span.setAttribute('debrid.provider', this.config.provider);
+                if (!this.resolver) {
+                    return {
+                        kind: 'provider-error',
+                        code: 'DEBRID_DISABLED',
+                        errorKind: 'unsupported',
+                        retryable: false,
+                        safeMessage:
+                            'Debrid service is disabled or not configured'
+                    };
+                }
 
-        const key = this.cacheKey(input);
-        const hit = this.cache.get(key);
-        if (hit && hit.expiresAt > Date.now()) {
-            return {
-                kind: 'resolved',
-                url: hit.url,
-                selectedFile: hit.selectedFile,
-                cached: true,
-                expiresAt: new Date(hit.expiresAt)
-            };
-        }
+                const key = this.cacheKey(input);
+                const hit = this.cache.get(key);
+                if (hit && hit.expiresAt > Date.now()) {
+                    span.setAttribute('debrid.cached', true);
+                    return {
+                        kind: 'resolved',
+                        url: hit.url,
+                        selectedFile: hit.selectedFile,
+                        cached: true,
+                        expiresAt: new Date(hit.expiresAt)
+                    };
+                }
+                span.setAttribute('debrid.cached', false);
 
-        const resolution = await this.resolver.resolveCached(input);
+                const t0 = Date.now();
+                const resolution = await this.resolver.resolveCached(input);
+                const durationMs = Date.now() - t0;
+                span.setAttribute('debrid.kind', resolution.kind);
 
-        if (resolution.kind === 'resolved') {
-            this.authFailureTimestamps = [];
-            this.setCache(key, resolution.url, resolution.selectedFile);
-        } else if (
-            resolution.kind === 'provider-error' &&
-            resolution.errorKind === 'auth_failure'
-        ) {
-            this.handleAuthFailure(resolution.safeMessage, {
-                infoHash: input.infoHash
-            });
-        }
+                if (resolution.kind === 'resolved') {
+                    this.authFailureTimestamps = [];
+                    this.setCache(key, resolution.url, resolution.selectedFile);
+                    globalMetrics.recordDebridResolution(
+                        this.config.provider,
+                        'cached',
+                        durationMs
+                    );
+                } else if (resolution.kind === 'uncached') {
+                    globalMetrics.recordDebridResolution(
+                        this.config.provider,
+                        'transferred',
+                        durationMs
+                    );
+                } else if (resolution.kind === 'invalid-torrent') {
+                    globalMetrics.recordDebridResolution(
+                        this.config.provider,
+                        'failed',
+                        durationMs
+                    );
+                    globalMetrics.recordDebridError(
+                        this.config.provider,
+                        'INVALID_TORRENT'
+                    );
+                } else if (
+                    resolution.kind === 'provider-error' &&
+                    resolution.errorKind === 'auth_failure'
+                ) {
+                    globalMetrics.recordDebridResolution(
+                        this.config.provider,
+                        'failed',
+                        durationMs
+                    );
+                    globalMetrics.recordDebridError(
+                        this.config.provider,
+                        'AUTH_FAILURE'
+                    );
+                    this.handleAuthFailure(resolution.safeMessage, {
+                        infoHash: input.infoHash
+                    });
+                } else if (resolution.kind === 'provider-error') {
+                    globalMetrics.recordDebridResolution(
+                        this.config.provider,
+                        'failed',
+                        durationMs
+                    );
+                    globalMetrics.recordDebridError(
+                        this.config.provider,
+                        resolution.code || 'PROVIDER_ERROR'
+                    );
+                }
 
-        return resolution;
+                return resolution;
+            },
+            {
+                attributes: {
+                    'debrid.provider': this.config.provider
+                }
+            }
+        );
     }
 
     async pollTransferStatus(

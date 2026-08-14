@@ -1,5 +1,5 @@
 import type { JobHandlerContext } from '../types.js';
-import { importFromUrls, importFromUrl } from '../../import/url.js';
+import { importFromUrl } from '../../import/url.js';
 import { importFromRepository } from '../../import/repository.js';
 import { importFromStremioAccount } from '../../import/stremioAccount.js';
 import { toPublicAddon } from '../../addons/manager.js';
