@@ -1,9 +1,6 @@
 /**
- * Addon persistence. Default: a portable JSON file. Optional: Redis (lazy —
- * only loaded when ADDONS_STORE=redis, so the default build has zero extra deps).
- *
- * The store is intentionally dumb: it reads/writes the entire AddonStoreData
- * blob. The AddonManager owns all mutation logic and calls save() after changes.
+ * Addon persistence. Default: a portable JSON file. Optional: Postgres (transactional),
+ * Redis (lazy).
  */
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -11,8 +8,15 @@ import type { AppConfig } from '../config.js';
 import {
     type AddonStoreData,
     defaultSettings,
-    emptyStoreData
+    emptyStoreData,
+    type InstalledAddon
 } from './types.js';
+import type {
+    IStorageBackend,
+    AddonRecord
+} from '../storage/types.js';
+import { PostgresStorageBackend } from '../storage/postgres/index.js';
+import { FileStorageBackend } from '../storage/file/index.js';
 
 export interface AddonStore {
     load(): Promise<AddonStoreData>;
@@ -37,41 +41,54 @@ function normalize(data: unknown): AddonStoreData {
     return emptyStoreData();
 }
 
-let saveCounter = 0;
-
-export class FileAddonStore implements AddonStore {
-    private readonly file: string;
-
-    constructor(file: string) {
-        this.file = path.resolve(file);
-    }
+export class BackendAddonStore implements AddonStore {
+    constructor(private readonly backend: IStorageBackend) {}
 
     async load(): Promise<AddonStoreData> {
-        try {
-            const raw = await fs.readFile(this.file, 'utf-8');
-            return normalize(JSON.parse(raw));
-        } catch (err) {
-            if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-                return emptyStoreData();
-            }
-            console.warn(
-                `[store] Failed to read ${this.file}, starting empty:`,
-                err instanceof Error ? err.message : err
-            );
-            return emptyStoreData();
-        }
+        await this.backend.init();
+        const addons = await this.backend.listAddons();
+        const revision = await this.backend.getRevision();
+        const debrid = await this.backend.getDebridConfig();
+
+        return {
+            version: 1,
+            revision,
+            addons: addons as InstalledAddon[],
+            settings: debrid
+                ? {
+                      debrid: {
+                          provider: debrid.provider,
+                          apiKey: debrid.apiKeyCiphertext || ''
+                      }
+                  }
+                : defaultSettings()
+        };
     }
 
     async save(data: AddonStoreData): Promise<void> {
-        await fs.mkdir(path.dirname(this.file), { recursive: true });
-        const tmp = `${this.file}.${process.pid}.${saveCounter++}.tmp`;
-        const json = JSON.stringify(data, null, 2);
-        await fs.writeFile(tmp, json, 'utf-8');
-        await fs.rename(tmp, this.file); // atomic replace
+        // Reconcile deleted addons
+        const existing = await this.backend.listAddons();
+        const currentIds = new Set(data.addons.map((a) => a.providerId));
+        for (const prev of existing) {
+            if (!currentIds.has(prev.providerId)) {
+                await this.backend.removeAddon(prev.providerId);
+            }
+        }
+        for (const a of data.addons) {
+            await this.backend.saveAddon(a as AddonRecord);
+        }
+        if (data.settings?.debrid) {
+            await this.backend.saveDebridConfig({
+                id: 'default',
+                provider: data.settings.debrid.provider,
+                apiKeyCiphertext: data.settings.debrid.apiKey,
+                updatedAt: new Date().toISOString()
+            });
+        }
     }
 
     describe(): string {
-        return `file:${this.file}`;
+        return this.backend.describe();
     }
 }
 
@@ -101,8 +118,6 @@ export class RedisAddonStore implements AddonStore {
         }
         let mod: { createClient: (opts: { url: string }) => unknown };
         try {
-            // Indirection keeps this an optional, runtime-only dependency:
-            // TypeScript won't try to resolve 'redis' at build time.
             const moduleName = 'redis';
             mod = (await import(moduleName)) as {
                 createClient: (opts: { url: string }) => unknown;
@@ -145,7 +160,14 @@ export class RedisAddonStore implements AddonStore {
     }
 }
 
-export function createAddonStore(cfg: AppConfig): AddonStore {
+export function createAddonStore(
+    cfg: AppConfig,
+    backend?: IStorageBackend
+): AddonStore {
+    if (backend) return new BackendAddonStore(backend);
+    if (cfg.store === 'postgres') {
+        return new BackendAddonStore(new PostgresStorageBackend(cfg));
+    }
     if (cfg.store === 'redis') return new RedisAddonStore(cfg);
-    return new FileAddonStore(cfg.dataFile);
+    return new BackendAddonStore(new FileStorageBackend(cfg.dataFile));
 }

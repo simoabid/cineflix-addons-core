@@ -20,6 +20,7 @@ import {
     type InstalledAddon,
     defaultSettings
 } from './types.js';
+import type { IStorageBackend } from '../storage/types.js';
 import { DEFAULT_ADDON_TIMEOUT_MS, sortAddons } from '../priority.js';
 import { debridService } from '../debrid/service.js';
 import type { DebridProviderId } from '../debrid/types.js';
@@ -150,8 +151,12 @@ export class AddonManager {
         this.secrets = createSecretBox(cfg.secretsMasterKey);
     }
 
-    static create(registry: ProviderRegistry, cfg: AppConfig): AddonManager {
-        return new AddonManager(registry, createAddonStore(cfg), cfg);
+    static create(
+        registry: ProviderRegistry,
+        cfg: AppConfig,
+        storage?: IStorageBackend
+    ): AddonManager {
+        return new AddonManager(registry, createAddonStore(cfg, storage), cfg);
     }
 
     /** Wire secure playback grants used when providers create source URLs. */
