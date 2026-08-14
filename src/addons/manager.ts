@@ -97,12 +97,18 @@ function redactPathForPublic(url: string): string {
             if (!seg) return seg;
             if (seg === 'manifest.json') return seg;
             // Heuristic: long opaque token
-            if (seg.length >= 20 && /^[A-Za-z0-9_-]+={0,2}$/.test(seg) && /[A-Za-z0-9_-]{20,}/.test(seg)) {
+            if (
+                seg.length >= 20 &&
+                /^[A-Za-z0-9_-]+={0,2}$/.test(seg) &&
+                /[A-Za-z0-9_-]{20,}/.test(seg)
+            ) {
                 // Additional check: contains mixed case + digits or padding, not a plain word
-                if (!/^[a-z]+$/.test(seg) && !/^[A-Z]+$/.test(seg)) return '[REDACTED]';
+                if (!/^[a-z]+$/.test(seg) && !/^[A-Z]+$/.test(seg))
+                    return '[REDACTED]';
             }
             // Hex-like long token
-            if (seg.length >= 20 && /^[0-9a-fA-F]{20,}$/.test(seg)) return '[REDACTED]';
+            if (seg.length >= 20 && /^[0-9a-fA-F]{20,}$/.test(seg))
+                return '[REDACTED]';
             return seg;
         });
         u.pathname = parts.join('/') || '/';
@@ -321,7 +327,11 @@ export class AddonManager {
         }
         // Register ONLY stream-capable enabled addons as OMSS providers.
         for (const addon of this.data.addons) {
-            if (addon.enabled && addon.capabilities && isStreamCapable(addon.capabilities)) {
+            if (
+                addon.enabled &&
+                addon.capabilities &&
+                isStreamCapable(addon.capabilities)
+            ) {
                 this.registerProvider(addon);
             }
         }
@@ -358,7 +368,12 @@ export class AddonManager {
 
     orderedEnabledProviderIds(): string[] {
         return sortAddons(this.data.addons)
-            .filter((a) => a.enabled && a.capabilities && isStreamCapable(a.capabilities))
+            .filter(
+                (a) =>
+                    a.enabled &&
+                    a.capabilities &&
+                    isStreamCapable(a.capabilities)
+            )
             .map((a) => a.providerId);
     }
 
@@ -369,14 +384,16 @@ export class AddonManager {
     /** Enabled AND stream-capable — the authoritative stream waterfall set. */
     getStreamEnabled(): InstalledAddon[] {
         return sortAddons(this.data.addons).filter(
-            (a) => a.enabled && a.capabilities && isStreamCapable(a.capabilities)
+            (a) =>
+                a.enabled && a.capabilities && isStreamCapable(a.capabilities)
         );
     }
 
     /** Enabled AND subtitle-capable — used by subtitle aggregation. */
     getSubtitleEnabled(): InstalledAddon[] {
         return sortAddons(this.data.addons).filter(
-            (a) => a.enabled && a.capabilities && isSubtitleCapable(a.capabilities)
+            (a) =>
+                a.enabled && a.capabilities && isSubtitleCapable(a.capabilities)
         );
     }
 
@@ -385,7 +402,9 @@ export class AddonManager {
         // Ensure registry exactly matches the desired stream-enabled set,
         // in priority order. This avoids windows where storage, registry,
         // and cache disagree.
-        const desired = new Set(this.getStreamEnabled().map((a) => a.providerId));
+        const desired = new Set(
+            this.getStreamEnabled().map((a) => a.providerId)
+        );
         // Remove stale
         for (const pid of this.registry.listProviders()) {
             if (!desired.has(pid) && pid.startsWith('addon:')) {
@@ -483,14 +502,80 @@ export class AddonManager {
         });
     }
 
-    setHealth(providerId: string, healthy: boolean, error?: string): void {
+    setHealth(
+        providerId: string,
+        healthy: boolean,
+        detailsOrError?: string | Partial<NonNullable<InstalledAddon['health']>>
+    ): void {
         const addon = this.get(providerId);
         if (!addon) return;
-        addon.health = {
-            healthy,
-            lastChecked: nowIso(),
-            ...(error ? { error } : {})
-        };
+
+        const prevHealth = addon.health;
+        const consecutiveSuccesses = healthy
+            ? (prevHealth?.consecutiveSuccesses ?? 0) + 1
+            : 0;
+        const consecutiveFailures = !healthy
+            ? (prevHealth?.consecutiveFailures ?? 0) + 1
+            : 0;
+        const defaultFreshnessWindowMs =
+            (this.cfg.healthStaleThresholdMinutes || 60) * 60 * 1000;
+
+        const lastChecked =
+            typeof detailsOrError === 'object' && detailsOrError.lastChecked
+                ? detailsOrError.lastChecked
+                : nowIso();
+        const freshnessWindowMs =
+            typeof detailsOrError === 'object' &&
+            typeof detailsOrError.freshnessWindowMs === 'number'
+                ? detailsOrError.freshnessWindowMs
+                : defaultFreshnessWindowMs;
+        const isFresh =
+            Date.now() - new Date(lastChecked).getTime() <= freshnessWindowMs;
+
+        if (typeof detailsOrError === 'string') {
+            addon.health = {
+                healthy,
+                lastChecked,
+                checkType: 'manifest',
+                consecutiveSuccesses,
+                consecutiveFailures,
+                latencyMs: prevHealth?.latencyMs ?? 0,
+                failureClassification: healthy ? 'none' : 'network',
+                freshnessWindowMs,
+                isFresh,
+                error: detailsOrError
+            };
+        } else if (detailsOrError && typeof detailsOrError === 'object') {
+            addon.health = {
+                healthy,
+                lastChecked,
+                checkType: detailsOrError.checkType || 'manifest',
+                consecutiveSuccesses:
+                    detailsOrError.consecutiveSuccesses ?? consecutiveSuccesses,
+                consecutiveFailures:
+                    detailsOrError.consecutiveFailures ?? consecutiveFailures,
+                latencyMs: detailsOrError.latencyMs ?? 0,
+                failureClassification:
+                    detailsOrError.failureClassification ||
+                    (healthy ? 'none' : 'network'),
+                freshnessWindowMs,
+                isFresh: detailsOrError.isFresh ?? isFresh,
+                circuitState: detailsOrError.circuitState,
+                error: detailsOrError.error
+            };
+        } else {
+            addon.health = {
+                healthy,
+                lastChecked,
+                checkType: 'manifest',
+                consecutiveSuccesses,
+                consecutiveFailures,
+                latencyMs: prevHealth?.latencyMs ?? 0,
+                failureClassification: healthy ? 'none' : 'network',
+                freshnessWindowMs,
+                isFresh
+            };
+        }
         void this.persist();
     }
 
@@ -525,10 +610,10 @@ export class AddonManager {
             // for fetches is handled by installInternal's own awaits.
             for (const url of capped) {
                 if (options.signal?.aborted) {
-                    throw Object.assign(
-                        new Error('Import cancelled'),
-                        { code: 'CANCELLED', name: 'AbortError' }
-                    );
+                    throw Object.assign(new Error('Import cancelled'), {
+                        code: 'CANCELLED',
+                        name: 'AbortError'
+                    });
                 }
                 results.push(await this.installInternal(url, source, options));
             }
@@ -712,7 +797,13 @@ export class AddonManager {
             return {
                 ok: false,
                 error: 'Import cancelled',
-                findings: [{ code: 'invalid_manifest', message: 'Import cancelled', severity: 'error' }]
+                findings: [
+                    {
+                        code: 'invalid_manifest',
+                        message: 'Import cancelled',
+                        severity: 'error'
+                    }
+                ]
             };
         }
         // Pre-validate URL syntax before any network call.
@@ -812,7 +903,8 @@ export class AddonManager {
             }
         })();
         const existing = this.data.addons.find((a) => {
-            if (a.manifestUrl === manifestUrl || a.baseUrl === baseUrl) return true;
+            if (a.manifestUrl === manifestUrl || a.baseUrl === baseUrl)
+                return true;
             try {
                 return parseAddonUrl(a.manifestUrl).fingerprint === incomingFp;
             } catch {
@@ -1040,7 +1132,11 @@ export function toPublicAddon(a: InstalledAddon) {
         if (url.startsWith('enc:v1:')) return '[REDACTED]';
         // First redact query/fragment, then path-configured opaque segments
         let r = redactUrl(url);
-        try { r = redactPathForPublic(r); } catch { /* ignore */ }
+        try {
+            r = redactPathForPublic(r);
+        } catch {
+            /* ignore */
+        }
         return r;
     };
     const caps = a.capabilities ?? deriveCapabilities(a.manifest);

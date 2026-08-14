@@ -78,10 +78,18 @@ export interface InstalledAddon {
     /** ISO timestamps. */
     addedAt: string;
     updatedAt: string;
-    /** Last background health-check result. */
+    /** Last background health-check result (Phase 6 rich telemetry). */
     health?: {
         healthy: boolean;
         lastChecked: string;
+        checkType?: 'manifest' | 'stream_probe' | 'subtitle_probe';
+        consecutiveSuccesses?: number;
+        consecutiveFailures?: number;
+        latencyMs?: number;
+        failureClassification?: string;
+        freshnessWindowMs?: number;
+        isFresh?: boolean;
+        circuitState?: 'closed' | 'open' | 'half-open';
         error?: string;
     };
     /** Normalized capabilities derived from manifest (cached for fast filtering). */

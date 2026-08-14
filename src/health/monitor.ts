@@ -3,6 +3,7 @@
  * Phase 6.4: Redesigned 3-level health semantics (Liveness, Readiness, Service Status)
  * with provider freshness windows, degraded mode thresholds, and incident alarms.
  */
+import { monitorEventLoopDelay } from 'node:perf_hooks';
 import type { AddonManager } from '../addons/manager.js';
 import { fetchManifest } from '../stremio/client.js';
 import type { JobEngine } from '../jobs/engine.js';
@@ -22,6 +23,15 @@ import type {
 } from './types.js';
 
 const CONCURRENCY = 4;
+let eventLoopMonitor: ReturnType<typeof monitorEventLoopDelay> | null = null;
+
+function getEventLoopMonitor(): ReturnType<typeof monitorEventLoopDelay> {
+    if (!eventLoopMonitor) {
+        eventLoopMonitor = monitorEventLoopDelay({ resolution: 10 });
+        eventLoopMonitor.enable();
+    }
+    return eventLoopMonitor;
+}
 
 export interface HealthCheckSummary {
     checked: number;
@@ -57,12 +67,19 @@ export class HealthMonitor {
      */
     getLiveness(): LivenessReport {
         const mem = process.memoryUsage();
+        const monitor = getEventLoopMonitor();
+        const rawMean = monitor.mean;
+        const eventLoopLagMs =
+            isNaN(rawMean) || rawMean < 0
+                ? 0
+                : Number((rawMean / 1_000_000).toFixed(2));
         return {
             status: 'ok',
             uptimeSec: Math.floor((Date.now() - this.bootTime) / 1000),
             timestamp: new Date().toISOString(),
             pid: process.pid,
             version: this.opts.version ?? '1.0.0',
+            eventLoopLagMs,
             memory: {
                 heapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
                 heapTotalMb: Math.round(mem.heapTotal / 1024 / 1024),
@@ -219,7 +236,9 @@ export class HealthMonitor {
                 const lastCheck = addon.health?.lastChecked
                     ? new Date(addon.health.lastChecked).getTime()
                     : 0;
-                if (!lastCheck || now - lastCheck > staleThresholdMs) {
+                const windowMs =
+                    addon.health?.freshnessWindowMs ?? staleThresholdMs;
+                if (!lastCheck || now - lastCheck > windowMs) {
                     staleCount++;
                 }
             }
@@ -227,18 +246,20 @@ export class HealthMonitor {
 
         for (const addon of streamEnabled) {
             const h = addon.health as unknown as
-                | { healthy?: boolean; status?: string; circuitState?: string }
+                | {
+                      healthy?: boolean;
+                      status?: string;
+                      circuitState?: string;
+                      lastChecked?: string;
+                  }
                 | undefined;
             const isCircuitOpen =
                 globalReliability.getState(addon.providerId) === 'open' ||
                 h?.circuitState === 'open';
             const isHealthy =
                 !isCircuitOpen &&
-                (h?.healthy === true ||
-                    h?.status === 'healthy' ||
-                    (h?.healthy !== false &&
-                        h?.status !== 'down' &&
-                        h?.status !== 'unhealthy'));
+                Boolean(h?.lastChecked) &&
+                (h?.healthy === true || h?.status === 'healthy');
             if (isHealthy) {
                 healthyStream++;
             }
@@ -256,17 +277,10 @@ export class HealthMonitor {
         if (streamEnabled.length > 0 && healthyStream === 0) {
             degradedReasons.push('No healthy stream providers available');
             activeIncidents.push({
-                code: 'ALL_STREAM_PROVIDERS_DOWN',
+                code: 'PROVIDERS_DEGRADED',
                 severity: 'critical',
                 message:
                     'All configured stream providers are currently unhealthy or circuit-broken',
-                detectedAt: new Date().toISOString(),
-                runbook: '/docs/runbooks/provider-failing.md'
-            });
-            activeIncidents.push({
-                code: 'PROVIDERS_DEGRADED',
-                severity: 'critical',
-                message: 'All configured stream providers are currently down',
                 detectedAt: new Date().toISOString(),
                 runbook: '/docs/runbooks/provider-failing.md'
             });
@@ -276,13 +290,6 @@ export class HealthMonitor {
             );
             activeIncidents.push({
                 code: 'PROVIDERS_DEGRADED',
-                severity: 'warning',
-                message: `Stream provider pool degraded: only ${healthyStream}/${streamEnabled.length} usable`,
-                detectedAt: new Date().toISOString(),
-                runbook: '/docs/runbooks/provider-failing.md'
-            });
-            activeIncidents.push({
-                code: 'HIGH_PROVIDER_FAILURE_RATE',
                 severity: 'warning',
                 message: `Stream provider pool degraded: only ${healthyStream}/${streamEnabled.length} usable`,
                 detectedAt: new Date().toISOString(),
@@ -299,14 +306,6 @@ export class HealthMonitor {
                 code: 'STALE_PROVIDER_HEALTH',
                 severity: 'warning',
                 message: `${staleCount} enabled providers have stale health checks`,
-                detectedAt: new Date().toISOString(),
-                runbook: '/docs/runbooks/stuck-jobs.md'
-            });
-            activeIncidents.push({
-                code: 'STALE_HEALTH_CHECKS',
-                severity: 'warning',
-                message:
-                    'Provider health sweeps are not running or failing to execute',
                 detectedAt: new Date().toISOString(),
                 runbook: '/docs/runbooks/stuck-jobs.md'
             });
@@ -593,7 +592,12 @@ export class HealthMonitor {
         for (let i = 0; i < addons.length; i += CONCURRENCY) {
             const batch = addons.slice(i, i + CONCURRENCY);
             const results = await Promise.all(
-                batch.map((a) => this.checkOne(a.providerId, a.manifestUrl))
+                batch.map((a) => {
+                    const checkType: CheckType = a.capabilities?.subtitles?.length && !a.capabilities?.stream?.length
+                        ? 'subtitle_probe'
+                        : 'stream_probe';
+                    return this.checkOne(a.providerId, a.manifestUrl, checkType);
+                })
             );
             healthy += results.filter(Boolean).length;
         }
@@ -703,6 +707,10 @@ export class HealthMonitor {
         if (this.timer) {
             clearInterval(this.timer);
             this.timer = null;
+        }
+        if (eventLoopMonitor) {
+            eventLoopMonitor.disable();
+            eventLoopMonitor = null;
         }
     }
 }
