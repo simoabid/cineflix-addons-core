@@ -55,7 +55,7 @@ export async function resolveTorrentStreams(
         const resolved = await Promise.all(
             batch.map(async (stream) => {
                 try {
-                    const url = await debridService.resolve({
+                    const res = await debridService.resolveCached({
                         infoHash: stream.infoHash as string,
                         sources: Array.isArray(stream.sources)
                             ? (stream.sources as string[])
@@ -63,15 +63,21 @@ export async function resolveTorrentStreams(
                         fileIdx: stream.fileIdx,
                         season: ctx.season,
                         episode: ctx.episode,
-                        title: ctx.title
+                        title: ctx.title,
+                        allowUncached: false
                     });
-                    if (!url) return null;
-                    const proxied = await Promise.resolve(proxy(url));
+
+                    if (res.kind !== 'resolved' || !res.url) {
+                        return null;
+                    }
+
+                    const proxied = await Promise.resolve(proxy(res.url));
                     if (!proxied) return null;
+
                     const label = torrentLabel(stream);
                     const source: Source = {
                         url: proxied,
-                        type: inferTypeFromUrl(url) ?? 'mp4',
+                        type: inferTypeFromUrl(res.url) ?? 'mp4',
                         quality: inferQuality(stream),
                         audioTracks: [{ language: 'und', label }],
                         provider: {
