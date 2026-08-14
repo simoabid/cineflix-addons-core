@@ -57,9 +57,16 @@ export interface AppConfig {
     cacheType: 'memory' | 'redis';
     redis: { host: string; port: number; password?: string };
 
-    store: 'file' | 'redis';
+    store: 'file' | 'redis' | 'postgres';
+    databaseUrl?: string;
     dataFile: string;
     seedUrls: string[];
+
+    /** Phase 3: Job engine & caching controls */
+    jobWorkerConcurrency: number;
+    jobPollIntervalMs: number;
+    cacheTtlSources: number;
+    cacheSwrSec: number;
 
     adminEnabled: boolean;
     /** @deprecated Prefer authMode + adminToken. Still populated for compat. */
@@ -201,9 +208,20 @@ export function loadConfig(): AppConfig {
             password: envStr('REDIS_PASSWORD') || undefined
         },
 
-        store: envStr('ADDONS_STORE', 'file') === 'redis' ? 'redis' : 'file',
+        store: (() => {
+            const s = envStr('ADDONS_STORE', 'file').toLowerCase();
+            if (s === 'redis') return 'redis';
+            if (s === 'postgres' || s === 'postgresql') return 'postgres';
+            return 'file';
+        })(),
+        databaseUrl: envStr('DATABASE_URL') || undefined,
         dataFile,
         seedUrls: envList('ADDONS_SEED_URLS'),
+
+        jobWorkerConcurrency: envNum('JOB_WORKER_CONCURRENCY', 4),
+        jobPollIntervalMs: envNum('JOB_POLL_INTERVAL_MS', 1000),
+        cacheTtlSources: envNum('CACHE_TTL_SOURCES', 3600),
+        cacheSwrSec: envNum('CACHE_SWR_SEC', 300),
 
         adminEnabled: envBool('ADMIN_ENABLED', true),
         adminToken,
