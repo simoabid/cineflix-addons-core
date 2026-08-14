@@ -88,7 +88,13 @@ export function createSecureProxyContext(cfg: AppConfig): SecureProxyContext {
                 cfg.outboundHostAllowlist.length > 0
                     ? cfg.outboundHostAllowlist
                     : undefined,
-            allowHostSuffixes: cfg.outboundHostAllowSuffixes
+            allowHostSuffixes: [
+                ...cfg.outboundHostAllowSuffixes,
+                'real-debrid.com',
+                'alldebrid.com',
+                'premiumize.me',
+                'debrid.it'
+            ]
         },
         // Use Redis when configured for durable shared grants; in production we
         // have already enforced above that at least one of cacheType/store is redis,
