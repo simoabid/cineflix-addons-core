@@ -8,7 +8,8 @@ import {
     assertProductionSafe,
     type AppConfig
 } from './config.js';
-import { AddonManager } from './addons/manager.js';
+import { AddonManager, toPublicAddon } from './addons/manager.js';
+import { redactString } from './security/redaction.js';
 import {
     buildProgressiveMedia,
     listProvidersWithPriority,
@@ -48,6 +49,22 @@ import {
     rateLimitKey as scrapeRateLimitKey
 } from './security/rateLimit.js';
 import { getRateLimitIp } from './security/auth.js';
+import { registerOpenApiRoutes } from './routes/openapi.routes.js';
+import { globalMetrics } from './metrics/index.js';
+import {
+    logger,
+    configureLogger,
+    tracer,
+    globalTraceRecorder,
+    type Span
+} from './telemetry/index.js';
+import {
+    subtitlesQueryValidator,
+    tmdbIdValidator,
+    providerIdValidator,
+    seasonEpisodeValidator
+} from './validation/schemas.js';
+import { formatValidationError } from './validation/validator.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -64,6 +81,14 @@ const CONTENT_TYPES: Record<string, string> = {
 
 async function main(): Promise<void> {
     const cfg = loadConfig();
+
+    configureLogger({
+        level: cfg.logLevel,
+        format: cfg.logFormat,
+        serviceName: cfg.name,
+        serviceVersion: cfg.version
+    });
+    tracer.setEnabled(cfg.tracingEnabled);
 
     if (!cfg.tmdbApiKey) {
         console.error(
@@ -197,14 +222,22 @@ async function main(): Promise<void> {
     // disabled/removed addons never remain in cached responses.
     // Made revision-aware: cache keys include provider revision, so stale entries
     // are never hit even if clear is async. Hook still clears for memory hygiene.
-    const omssCache = (server as unknown as { cache: { clear(): Promise<void> } }).cache;
+    const omssCache = (
+        server as unknown as { cache: { clear(): Promise<void> } }
+    ).cache;
     manager.setRevisionHook(async (rev) => {
         try {
             await cacheManager.invalidateOnRevisionChange(rev);
             await omssCache.clear();
             console.log(`[cache] cleared after revision ${rev}`);
-        } catch { /* ignore */ }
-        try { globalMediaIdentity.clearCache(); } catch { /* ignore */ }
+        } catch {
+            /* ignore */
+        }
+        try {
+            globalMediaIdentity.clearCache();
+        } catch {
+            /* ignore */
+        }
     });
     await manager.init();
 
@@ -239,7 +272,10 @@ async function main(): Promise<void> {
     const monitor = new HealthMonitor(manager, {
         intervalMinutes: cfg.healthIntervalMinutes,
         autoRefresh: cfg.autoRefresh,
-        jobEngine
+        jobEngine,
+        staleThresholdMinutes: cfg.healthStaleThresholdMinutes,
+        degradedMinProvidersRatio: cfg.healthDegradedMinProvidersRatio,
+        version: cfg.version
     });
 
     const app = server.getInstance();
@@ -290,11 +326,18 @@ async function main(): Promise<void> {
             if (typeof payload === 'string' && payload.startsWith('{')) {
                 try {
                     const body = JSON.parse(payload);
-                    if (body && typeof body === 'object' && !Array.isArray(body) && body.revision == null) {
+                    if (
+                        body &&
+                        typeof body === 'object' &&
+                        !Array.isArray(body) &&
+                        body.revision == null
+                    ) {
                         body.revision = manager.getRevision();
                         return JSON.stringify(body);
                     }
-                } catch { /* ignore */ }
+                } catch {
+                    /* ignore */
+                }
             }
         }
         return payload;
@@ -329,28 +372,37 @@ async function main(): Promise<void> {
                 total: manager.list().length,
                 stream: manager.getStreamEnabled().length,
                 subtitles: manager.getSubtitleEnabled().length,
-                catalogOnly: manager.list().filter((a) => a.capabilities?.status === 'limited').length,
-                unsupported: manager.list().filter((a) => a.capabilities?.status === 'unsupported').length
+                catalogOnly: manager
+                    .list()
+                    .filter((a) => a.capabilities?.status === 'limited').length,
+                unsupported: manager
+                    .list()
+                    .filter((a) => a.capabilities?.status === 'unsupported')
+                    .length
             }
         });
     });
 
     // Diagnostics endpoint: per-provider circuit/metrics (privileged — admin/operator only)
     const diagGuard = makeAuthGuard(cfg, { role: 'viewer' });
-    app.get('/v1/providers/diagnostics', { preHandler: diagGuard }, async (_req, reply) => {
-        return reply.code(200).send({
-            revision: manager.getRevision(),
-            reliability: globalReliability.snapshot(),
-            providers: manager.list().map((a) => ({
-                id: a.providerId,
-                name: a.name,
-                enabled: a.enabled,
-                capabilities: a.capabilities,
-                state: globalReliability.getState(a.providerId),
-                metrics: globalReliability.getMetrics(a.providerId)
-            }))
-        });
-    });
+    app.get(
+        '/v1/providers/diagnostics',
+        { preHandler: diagGuard },
+        async (_req, reply) => {
+            return reply.code(200).send({
+                revision: manager.getRevision(),
+                reliability: globalReliability.snapshot(),
+                providers: manager.list().map((a) => ({
+                    id: a.providerId,
+                    name: a.name,
+                    enabled: a.enabled,
+                    capabilities: a.capabilities,
+                    state: globalReliability.getState(a.providerId),
+                    metrics: globalReliability.getMetrics(a.providerId)
+                }))
+            });
+        }
+    );
 
     // ── Progressive single-addon scrape ───────────────────────────────────────
     const scrapeLimiter = {
@@ -385,27 +437,140 @@ async function main(): Promise<void> {
         return true;
     }
 
+    // Tracing & Structured Telemetry hooks (Phase 6.1 & 6.3)
+    const requestSpans = new WeakMap<import('fastify').FastifyRequest, Span>();
+
+    app.addHook('onRequest', async (request, reply) => {
+        (request as unknown as { _reqStartTime?: number })._reqStartTime =
+            Date.now();
+        globalMetrics.incrementActiveRequests();
+
+        const parentContext = tracer.extractTraceparent(request.headers);
+        const span = tracer.startSpan('http.server.request', {
+            parentContext,
+            attributes: {
+                'http.method': request.method,
+                'http.route': request.url,
+                'http.client_ip': request.ip
+            }
+        });
+        requestSpans.set(request, span);
+
+        reply.header('x-trace-id', span.traceId);
+        reply.header('traceparent', `00-${span.traceId}-${span.spanId}-01`);
+    });
+
+    app.addHook('onResponse', async (request, reply) => {
+        globalMetrics.decrementActiveRequests();
+        const start = (request as unknown as { _reqStartTime?: number })
+            ._reqStartTime;
+        const duration = start ? Date.now() - start : 0;
+        const responseBytes = Number(reply.getHeader('content-length')) || 0;
+
+        globalMetrics.recordHttpRequest(
+            request.method,
+            request.url ?? '',
+            reply.statusCode,
+            duration,
+            responseBytes
+        );
+
+        const span = requestSpans.get(request);
+        if (span) {
+            span.setAttribute('http.status_code', reply.statusCode);
+            span.setStatus(reply.statusCode < 500 ? 'ok' : 'error');
+            span.end();
+        }
+
+        const reqAuth = (
+            request as unknown as {
+                authUser?: { id?: string; role?: string };
+            }
+        ).authUser;
+        const actorId = reqAuth?.id;
+        const sanitizedUrl = request.url?.startsWith('/v1/proxy/')
+            ? '/v1/proxy/[REDACTED]'
+            : request.url;
+
+        logger.info(
+            `${request.method} ${sanitizedUrl} ${reply.statusCode} (${duration}ms)`,
+            {
+                requestId: request.id,
+                traceId: span?.traceId,
+                spanId: span?.spanId,
+                actorId,
+                route: sanitizedUrl,
+                method: request.method,
+                statusCode: reply.statusCode,
+                durationMs: duration
+            }
+        );
+    });
+
+    app.addHook('onError', async (request, _reply, error) => {
+        const span = requestSpans.get(request);
+        if (span) {
+            span.recordException(error);
+        }
+        logger.error(error, {
+            requestId: request.id,
+            traceId: span?.traceId,
+            spanId: span?.spanId,
+            route: request.url,
+            method: request.method
+        });
+    });
+
     app.get<{ Params: { tmdbId: string; providerId: string } }>(
         '/v1/movies/:tmdbId/providers/:providerId',
         async (request, reply) => {
             if (!(await checkScrapeRateLimit(request, reply))) return;
             const { tmdbId, providerId } = request.params;
+            const tRes = tmdbIdValidator(tmdbId);
+            if (!tRes.ok && tRes.errors) {
+                return reply
+                    .code(400)
+                    .send(formatValidationError(tRes.errors, request.id));
+            }
+            const pRes = providerIdValidator(providerId);
+            if (!pRes.ok && pRes.errors) {
+                return reply
+                    .code(400)
+                    .send(formatValidationError(pRes.errors, request.id));
+            }
+
             // Unified media identity with validation + deadline (Phase 2.4)
-            const deadline = Date.now() + manager.getTimeoutMs(providerId) + 12_000;
+            const deadline =
+                Date.now() + manager.getTimeoutMs(providerId) + 12_000;
             try {
-                const media = await buildProgressiveMedia('movie', tmdbId, undefined, undefined, {
-                    deadlineMs: deadline,
-                    signal: (request as unknown as { signal?: AbortSignal }).signal
-                });
+                const media = await buildProgressiveMedia(
+                    'movie',
+                    tmdbId,
+                    undefined,
+                    undefined,
+                    {
+                        deadlineMs: deadline,
+                        signal: (request as unknown as { signal?: AbortSignal })
+                            .signal
+                    }
+                );
                 const result = await scrapeSingleProvider(
                     registry,
                     providerId,
                     media,
                     manager.getTimeoutMs(providerId),
-                    { selection, signal: (request as unknown as { signal?: AbortSignal }).signal, deadlineMs: deadline }
+                    {
+                        selection,
+                        signal: (request as unknown as { signal?: AbortSignal })
+                            .signal,
+                        deadlineMs: deadline
+                    }
                 );
                 // Use creation revision captured in result, not current (prevents stale labeling)
-                return reply.code(200).send({ ...result, revision: result.revision ?? manager.getRevision() });
+                return reply.code(200).send({
+                    ...result,
+                    revision: result.revision ?? manager.getRevision()
+                });
             } catch (err) {
                 return sendProviderError(reply, err);
             }
@@ -424,30 +589,51 @@ async function main(): Promise<void> {
         async (request, reply) => {
             if (!(await checkScrapeRateLimit(request, reply))) return;
             const { tmdbId, season, episode, providerId } = request.params;
-            const s = Number(season);
-            const e = Number(episode);
-            if (!Number.isFinite(s) || !Number.isFinite(e)) {
-                return reply.code(400).send({
-                    sources: [],
-                    subtitles: [],
-                    diagnostics: [],
-                    error: 'Invalid season or episode'
-                });
+            const tRes = tmdbIdValidator(tmdbId);
+            if (!tRes.ok && tRes.errors) {
+                return reply
+                    .code(400)
+                    .send(formatValidationError(tRes.errors, request.id));
             }
-            const deadline = Date.now() + manager.getTimeoutMs(providerId) + 12_000;
+            const seRes = seasonEpisodeValidator(season, episode);
+            if (!seRes.ok && seRes.errors) {
+                return reply
+                    .code(400)
+                    .send(formatValidationError(seRes.errors, request.id));
+            }
+            const pRes = providerIdValidator(providerId);
+            if (!pRes.ok && pRes.errors) {
+                return reply
+                    .code(400)
+                    .send(formatValidationError(pRes.errors, request.id));
+            }
+
+            const s = seRes.data!.season;
+            const e = seRes.data!.episode;
+            const deadline =
+                Date.now() + manager.getTimeoutMs(providerId) + 12_000;
             try {
                 const media = await buildProgressiveMedia('tv', tmdbId, s, e, {
                     deadlineMs: deadline,
-                    signal: (request as unknown as { signal?: AbortSignal }).signal
+                    signal: (request as unknown as { signal?: AbortSignal })
+                        .signal
                 });
                 const result = await scrapeSingleProvider(
                     registry,
                     providerId,
                     media,
                     manager.getTimeoutMs(providerId),
-                    { selection, signal: (request as unknown as { signal?: AbortSignal }).signal, deadlineMs: deadline }
+                    {
+                        selection,
+                        signal: (request as unknown as { signal?: AbortSignal })
+                            .signal,
+                        deadlineMs: deadline
+                    }
                 );
-                return reply.code(200).send({ ...result, revision: result.revision ?? manager.getRevision() });
+                return reply.code(200).send({
+                    ...result,
+                    revision: result.revision ?? manager.getRevision()
+                });
             } catch (err) {
                 return sendProviderError(reply, err);
             }
@@ -456,41 +642,16 @@ async function main(): Promise<void> {
 
     // ── Dedicated subtitle aggregation ─────────────────────────────────────────
     app.get<{
-        Querystring: {
-            tmdbId?: string;
-            imdbId?: string;
-            id?: string;
-            season?: string;
-            episode?: string;
-            s?: string;
-            e?: string;
-            language?: string;
-        };
+        Querystring: Record<string, unknown>;
     }>('/v1/subtitles', async (request, reply) => {
         if (!(await checkScrapeRateLimit(request, reply))) return;
-        const q = request.query;
-        const id = (q.id || '').trim();
-        const imdbId = (q.imdbId || (id.startsWith('tt') ? id : '')).trim();
-        const tmdbId = (
-            q.tmdbId || (!imdbId && /^\d+$/.test(id) ? id : '')
-        ).trim();
-        const seasonRaw = q.season ?? q.s;
-        const episodeRaw = q.episode ?? q.e;
-        const season =
-            seasonRaw != null && seasonRaw !== ''
-                ? Number(seasonRaw)
-                : undefined;
-        const episode =
-            episodeRaw != null && episodeRaw !== ''
-                ? Number(episodeRaw)
-                : undefined;
-
-        if (!imdbId && !tmdbId) {
-            return reply.code(400).send({
-                subtitles: [],
-                error: 'Provide tmdbId, imdbId, or id'
-            });
+        const valRes = subtitlesQueryValidator(request.query);
+        if (!valRes.ok && valRes.errors) {
+            return reply
+                .code(400)
+                .send(formatValidationError(valRes.errors, request.id));
         }
+        const q = valRes.data!;
 
         const creationRev = manager.getRevision();
         const deadline = Date.now() + 15_000;
@@ -498,12 +659,10 @@ async function main(): Promise<void> {
             manager,
             publicUrl,
             {
-                imdbId: imdbId || undefined,
-                tmdbId: tmdbId || undefined,
-                season: Number.isFinite(season as number) ? season : undefined,
-                episode: Number.isFinite(episode as number)
-                    ? episode
-                    : undefined,
+                imdbId: q.imdbId,
+                tmdbId: q.tmdbId,
+                season: q.season,
+                episode: q.episode,
                 language: q.language
             },
             {
@@ -521,6 +680,176 @@ async function main(): Promise<void> {
             ...(result.error ? { error: result.error } : {})
         });
     });
+
+    // ── Health Probes & Metrics (Phase 6.4) ───────────────────────────────────
+    app.get('/health/live', async (_req, reply) => {
+        const live = monitor.getLiveness();
+        return reply.code(200).send(live);
+    });
+
+    app.get('/health/ready', async (_req, reply) => {
+        const report = await monitor.getReadiness({
+            storage,
+            cache: cacheManager,
+            jobEngine
+        });
+        const code = report.ready ? 200 : 503;
+        return reply.code(code).send(report);
+    });
+
+    app.get('/health/status', async (_req, reply) => {
+        const status = await monitor.getServiceStatus({
+            storage,
+            cache: cacheManager,
+            jobEngine,
+            tmdbKey: cfg.tmdbApiKey
+        });
+        const code = status.status === 'down' ? 503 : 200;
+        return reply.code(code).send(status);
+    });
+
+    app.get('/health', async (_req, reply) => {
+        const status = await monitor.getServiceStatus({
+            storage,
+            cache: cacheManager,
+            jobEngine,
+            tmdbKey: cfg.tmdbApiKey
+        });
+        const code = status.status === 'down' ? 503 : 200;
+        return reply.code(code).send(status);
+    });
+
+    app.get('/health/dependencies', async (_req, reply) => {
+        const deps = await monitor.getDependencies({
+            storage,
+            cache: cacheManager,
+            jobEngine,
+            tmdbKey: cfg.tmdbApiKey
+        });
+        const code = deps.status === 'down' ? 503 : 200;
+        return reply.code(code).send(deps);
+    });
+
+    const metricsGuard = makeAuthGuard(cfg, { role: 'admin' });
+    app.get<{ Querystring: { format?: string } }>(
+        '/metrics',
+        { preHandler: metricsGuard },
+        async (req, reply) => {
+            const format = req.query.format?.toLowerCase();
+            const accept = req.headers.accept?.toLowerCase() ?? '';
+            const wantsJson =
+                format === 'json' || accept.includes('application/json');
+
+            if (wantsJson) {
+                const snap = await globalMetrics.snapshot({
+                    manager,
+                    circuit: globalReliability,
+                    cache: cacheManager,
+                    jobs: jobEngine,
+                    storage
+                });
+                return reply
+                    .header('Content-Type', 'application/json; charset=utf-8')
+                    .code(200)
+                    .send(snap);
+            }
+
+            const prom = await globalMetrics.toPrometheusText({
+                manager,
+                circuit: globalReliability,
+                cache: cacheManager,
+                jobs: jobEngine,
+                storage
+            });
+            return reply
+                .header(
+                    'Content-Type',
+                    'text/plain; version=0.0.4; charset=utf-8'
+                )
+                .code(200)
+                .send(prom);
+        }
+    );
+
+    // ── Protected Provider Debug Trace ────────────────────────────────────────
+    const debugGuard = makeAuthGuard(cfg, { role: 'admin' });
+    app.get<{ Params: { id: string } }>(
+        '/debug/providers/:id',
+        { preHandler: debugGuard },
+        async (req, reply) => {
+            const providerId = req.params.id;
+            const addon = manager.get(providerId);
+            if (!addon) {
+                return reply.code(404).send({
+                    error: { code: 'NOT_FOUND', message: 'Provider not found' },
+                    requestId: req.id
+                });
+            }
+            const pub = toPublicAddon(addon);
+            const metrics = globalReliability.getMetrics(providerId);
+            const state = globalReliability.getState(providerId);
+            return reply.code(200).send({
+                id: addon.providerId,
+                name: addon.name,
+                enabled: addon.enabled,
+                admissionState:
+                    addon.admissionState ??
+                    (addon.enabled ? 'validated' : 'disabled'),
+                order: addon.order,
+                timeoutMs: addon.timeoutMs,
+                source: addon.source,
+                manifestUrl: pub.manifestUrl,
+                baseUrl: pub.baseUrl,
+                capabilities: pub.capabilities,
+                validationFindings: addon.validationFindings?.map((f) => ({
+                    ...f,
+                    message: redactString(f.message)
+                })),
+                health: addon.health,
+                reliability: {
+                    state,
+                    metrics
+                },
+                revision: manager.getRevision(),
+                addedAt: addon.addedAt,
+                updatedAt: addon.updatedAt
+            });
+        }
+    );
+
+    // ── Protected Tracing Debug endpoint (Phase 6.3) ──────────────────────────
+    app.get<{
+        Querystring: {
+            traceId?: string;
+            hasError?: string;
+            minDurationMs?: string;
+            limit?: string;
+        };
+    }>('/debug/traces', { preHandler: debugGuard }, async (req, reply) => {
+        const { traceId, hasError, minDurationMs, limit } = req.query;
+        let spans = globalTraceRecorder.getRecent(Number(limit) || 100);
+
+        if (traceId) {
+            spans = globalTraceRecorder.findByTraceId(traceId);
+        }
+        if (hasError === 'true') {
+            spans = spans.filter((s) => s.status === 'error');
+        }
+        if (minDurationMs) {
+            const minMs = Number(minDurationMs);
+            if (Number.isFinite(minMs)) {
+                spans = spans.filter((s) => (s.durationMs ?? 0) >= minMs);
+            }
+        }
+
+        return reply.code(200).send({
+            total: spans.length,
+            spans
+        });
+    });
+
+    // ── OpenAPI & Interactive Docs ────────────────────────────────────────────
+    registerOpenApiRoutes(app, cfg, publicUrl);
 
     // ── Management + import + job API ─────────────────────────────────────────
     registerAddonRoutes(
@@ -579,14 +908,28 @@ function patchTMDBService(server: OMSSServer): void {
     const origGetMedia = tmdb.getMediaObject.bind(tmdb);
     const origGetImdb = tmdb.getImdbId.bind(tmdb);
     // Bulk + native Stremio now share MediaIdentityService's single cache/taxonomy
-    tmdb.getMediaObject = async (type: string, tmdbId: string, season?: number, episode?: number) => {
+    tmdb.getMediaObject = async (
+        type: string,
+        tmdbId: string,
+        season?: number,
+        episode?: number
+    ) => {
         const kind = type === 'movie' ? 'movie' : ('tv' as const);
         try {
-            const res = await globalMediaIdentity.resolve(kind as never, String(tmdbId), season, episode);
+            const res = await globalMediaIdentity.resolve(
+                kind as never,
+                String(tmdbId),
+                season,
+                episode
+            );
             return res.media;
         } catch (err) {
             // For validation-type errors (invalid id/season) propagate as-is so callers get 400
-            if (err && typeof err === 'object' && 'code' in (err as Record<string, unknown>)) {
+            if (
+                err &&
+                typeof err === 'object' &&
+                'code' in (err as Record<string, unknown>)
+            ) {
                 throw err;
             }
             return origGetMedia(type, tmdbId, season, episode);
@@ -595,13 +938,18 @@ function patchTMDBService(server: OMSSServer): void {
     tmdb.getImdbId = async (tmdbId: string, type: string) => {
         const kind = type === 'movie' ? 'movie' : ('tv' as const);
         try {
-            const res = await globalMediaIdentity.resolve(kind as never, String(tmdbId));
+            const res = await globalMediaIdentity.resolve(
+                kind as never,
+                String(tmdbId)
+            );
             return res.media.imdbId || undefined;
         } catch {
             return origGetImdb(tmdbId, type);
         }
     };
-    console.log('[media] patched TMDBService to delegate to MediaIdentityService');
+    console.log(
+        '[media] patched TMDBService to delegate to MediaIdentityService'
+    );
 }
 
 function patchCacheRevision(
@@ -610,13 +958,15 @@ function patchCacheRevision(
     cacheManager: CacheManager,
     cfg: AppConfig
 ): void {
-    const cache = (server as unknown as {
-        cache: {
-            get: (k: string) => Promise<unknown>;
-            set: (k: string, v: unknown, ttl?: number) => Promise<unknown>;
-            clear: () => Promise<void>;
-        };
-    }).cache;
+    const cache = (
+        server as unknown as {
+            cache: {
+                get: (k: string) => Promise<unknown>;
+                set: (k: string, v: unknown, ttl?: number) => Promise<unknown>;
+                clear: () => Promise<void>;
+            };
+        }
+    ).cache;
 
     cache.get = async (key: string) => {
         if (key.startsWith('movie:') || key.startsWith('tv:')) {
@@ -637,13 +987,10 @@ function patchCacheRevision(
                 value !== null &&
                 !Array.isArray(value)
             ) {
-                (value as Record<string, unknown>).revision = selection.revision;
+                (value as Record<string, unknown>).revision =
+                    selection.revision;
             }
-            await cacheManager.set(
-                revKey,
-                value,
-                ttl ?? cfg.cacheTtlSources
-            );
+            await cacheManager.set(revKey, value, ttl ?? cfg.cacheTtlSources);
             return;
         }
         await cacheManager.set(key, value, ttl);
@@ -663,19 +1010,35 @@ function patchSourceService(
     selection: ProviderSelectionService
 ): void {
     // Original preserved for debugging if needed
-    void (server as unknown as { sourceService: { fetchFromProviders: (type: string, media: unknown) => Promise<unknown[]> } }).sourceService
-        .fetchFromProviders.bind((server as unknown as { sourceService: unknown }).sourceService);
-    const svc = (server as unknown as { sourceService: Record<string, unknown> }).sourceService;
+    void (
+        server as unknown as {
+            sourceService: {
+                fetchFromProviders: (
+                    type: string,
+                    media: unknown
+                ) => Promise<unknown[]>;
+            };
+        }
+    ).sourceService.fetchFromProviders.bind(
+        (server as unknown as { sourceService: unknown }).sourceService
+    );
+    const svc = (
+        server as unknown as { sourceService: Record<string, unknown> }
+    ).sourceService;
 
     // Replace with selection-aware, bounded-concurrency, priority-ordered fetch.
     // Bulk semantics: Aggregate mode — query eligible providers concurrently with
     // bounded concurrency (4) and return all usable sources in priority order.
     // Fast-first mode is available via selection.fetchFastFirst for callers that
     // want early stop; progressive mode remains single-provider via /v1/.../providers/:id.
-    (svc as { fetchFromProviders: (type: string, media: unknown) => Promise<unknown[]> }).fetchFromProviders = async (
-        type: string,
-        media: unknown
-    ) => {
+    (
+        svc as {
+            fetchFromProviders: (
+                type: string,
+                media: unknown
+            ) => Promise<unknown[]>;
+        }
+    ).fetchFromProviders = async (type: string, media: unknown) => {
         const m = media as import('@omss/framework').ProviderMediaObject;
         const providers = selection.selectStreamProviders(m);
         if (providers.length === 0) return [];
@@ -685,7 +1048,15 @@ function patchSourceService(
         // even with retries, but still aborts runaway addons.
         const bulkCtrl = new AbortController();
         const bulkTimeout = setTimeout(() => {
-            try { bulkCtrl.abort(Object.assign(new Error('bulk deadline exceeded'), { name: 'TimeoutError' })); } catch { /* ignore */ }
+            try {
+                bulkCtrl.abort(
+                    Object.assign(new Error('bulk deadline exceeded'), {
+                        name: 'TimeoutError'
+                    })
+                );
+            } catch {
+                /* ignore */
+            }
         }, 20_000);
         const bulkSignal = bulkCtrl.signal;
 
@@ -698,17 +1069,58 @@ function patchSourceService(
                 const batch = providers.slice(i, i + concurrency);
                 const settled = await Promise.allSettled(
                     batch.map(async (addon) => {
-                        if (bulkSignal.aborted) return { sources: [], subtitles: [], diagnostics: [] };
-                        const provider = (server as unknown as { getRegistry: () => { getProvider(id: string): { getMovieSources(m: unknown, s?: AbortSignal): Promise<unknown>; getTVSources(m: unknown, s?: AbortSignal): Promise<unknown> } } }).getRegistry().getProvider(addon.providerId);
-                        if (!provider) return { sources: [], subtitles: [], diagnostics: [] };
+                        if (bulkSignal.aborted)
+                            return {
+                                sources: [],
+                                subtitles: [],
+                                diagnostics: []
+                            };
+                        const provider = (
+                            server as unknown as {
+                                getRegistry: () => {
+                                    getProvider(id: string): {
+                                        getMovieSources(
+                                            m: unknown,
+                                            s?: AbortSignal
+                                        ): Promise<unknown>;
+                                        getTVSources(
+                                            m: unknown,
+                                            s?: AbortSignal
+                                        ): Promise<unknown>;
+                                    };
+                                };
+                            }
+                        )
+                            .getRegistry()
+                            .getProvider(addon.providerId);
+                        if (!provider)
+                            return {
+                                sources: [],
+                                subtitles: [],
+                                diagnostics: []
+                            };
                         try {
-                            const res = type === 'movie'
-                                ? await provider.getMovieSources(m as never, bulkSignal)
-                                : await provider.getTVSources(m as never, bulkSignal);
+                            const res =
+                                type === 'movie'
+                                    ? await provider.getMovieSources(
+                                          m as never,
+                                          bulkSignal
+                                      )
+                                    : await provider.getTVSources(
+                                          m as never,
+                                          bulkSignal
+                                      );
                             return res;
                         } catch (err) {
-                            if ((err as Error)?.name === 'AbortError' || (err as Error)?.name === 'TimeoutError') {
-                                return { sources: [], subtitles: [], diagnostics: [] };
+                            if (
+                                (err as Error)?.name === 'AbortError' ||
+                                (err as Error)?.name === 'TimeoutError'
+                            ) {
+                                return {
+                                    sources: [],
+                                    subtitles: [],
+                                    diagnostics: []
+                                };
                             }
                             return {
                                 sources: [],
@@ -741,36 +1153,92 @@ function patchSourceService(
     // Also ensure buildResponse respects upstream dedup when grants are opaque.
     // Patch to use provenance-based dedup when available — uses full upstream identity
     // (scheme + host + port + path + sorted query + headers) via normalizeUpstreamUrl.
-    const originalBuild = (svc as { buildResponse: (results: unknown[]) => unknown }).buildResponse;
+    const originalBuild = (
+        svc as { buildResponse: (results: unknown[]) => unknown }
+    ).buildResponse;
     if (originalBuild) {
-        (svc as { buildResponse: (results: unknown[]) => unknown }).buildResponse = function (results: unknown[]) {
+        (
+            svc as { buildResponse: (results: unknown[]) => unknown }
+        ).buildResponse = function (results: unknown[]) {
             try {
-                const asArray = results as Array<{ sources: Array<{ url: string; provenance?: { upstreamUrl: string; headers?: Record<string, string> } }> }>;
-                const hasProvenance = asArray.some((r) => r.sources.some((s) => Boolean((s as unknown as { provenance?: unknown }).provenance)));
+                const asArray = results as Array<{
+                    sources: Array<{
+                        url: string;
+                        provenance?: {
+                            upstreamUrl: string;
+                            headers?: Record<string, string>;
+                        };
+                    }>;
+                }>;
+                const hasProvenance = asArray.some((r) =>
+                    r.sources.some((s) =>
+                        Boolean(
+                            (s as unknown as { provenance?: unknown })
+                                .provenance
+                        )
+                    )
+                );
                 if (hasProvenance) {
                     const seen = new Set<string>();
                     const deduped = asArray.map((r) => {
                         const filtered: unknown[] = [];
-                        for (const s of r.sources as Array<{ provenance?: { upstreamUrl: string; headers?: Record<string, string> }; url: string }>) {
-                            const prov = (s as unknown as { provenance?: { upstreamUrl: string; headers?: Record<string, string> } }).provenance;
+                        for (const s of r.sources as Array<{
+                            provenance?: {
+                                upstreamUrl: string;
+                                headers?: Record<string, string>;
+                            };
+                            url: string;
+                        }>) {
+                            const prov = (
+                                s as unknown as {
+                                    provenance?: {
+                                        upstreamUrl: string;
+                                        headers?: Record<string, string>;
+                                    };
+                                }
+                            ).provenance;
                             const upstream = prov?.upstreamUrl ?? s.url;
                             const headers = prov?.headers;
-                            const headerKey = headers ? JSON.stringify(Object.entries(headers).sort((a, b) => a[0].localeCompare(b[0])).map(([k, v]) => `${k.toLowerCase()}:${v}`)) : '';
-                            const key = normalizeUpstreamUrl(upstream) + '|' + headerKey;
+                            const headerKey = headers
+                                ? JSON.stringify(
+                                      Object.entries(headers)
+                                          .sort((a, b) =>
+                                              a[0].localeCompare(b[0])
+                                          )
+                                          .map(
+                                              ([k, v]) =>
+                                                  `${k.toLowerCase()}:${v}`
+                                          )
+                                  )
+                                : '';
+                            const key =
+                                normalizeUpstreamUrl(upstream) +
+                                '|' +
+                                headerKey;
                             if (seen.has(key)) continue;
                             seen.add(key);
                             filtered.push(s);
                         }
                         return { ...r, sources: filtered };
                     });
-                    return (originalBuild as (r: unknown[]) => unknown).call(this, deduped);
+                    return (originalBuild as (r: unknown[]) => unknown).call(
+                        this,
+                        deduped
+                    );
                 }
-            } catch { /* fallback */ }
-            return (originalBuild as (r: unknown[]) => unknown).call(this, results);
+            } catch {
+                /* fallback */
+            }
+            return (originalBuild as (r: unknown[]) => unknown).call(
+                this,
+                results
+            );
         };
     }
 
-    console.log(`[selection] patched SourceService.fetchFromProviders to use ProviderSelectionService (aggregate mode, concurrency=4)`);
+    console.log(
+        `[selection] patched SourceService.fetchFromProviders to use ProviderSelectionService (aggregate mode, concurrency=4)`
+    );
 }
 
 function sendProviderError(

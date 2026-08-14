@@ -138,6 +138,13 @@ export interface AppConfig {
 
     /** CSRF. */
     csrfEnabled: boolean;
+
+    /** Phase 6: Telemetry, Observability, and Health Semantics */
+    logLevel: 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'fatal';
+    logFormat: 'json' | 'pretty' | 'text';
+    tracingEnabled: boolean;
+    healthStaleThresholdMinutes: number;
+    healthDegradedMinProvidersRatio: number;
 }
 
 function parseAuthMode(
@@ -299,8 +306,42 @@ export function loadConfig(): AppConfig {
         auditEnabled: envBool('AUDIT_ENABLED', true),
         importMaxBatchBytes: envNum('IMPORT_MAX_BATCH_BYTES', 5_242_880),
         importJobTimeoutMs: envNum('IMPORT_JOB_TIMEOUT_MS', 60_000),
-        csrfEnabled: envBool('CSRF_ENABLED', true)
+        csrfEnabled: envBool('CSRF_ENABLED', true),
+
+        logLevel: parseLogLevel(envStr('LOG_LEVEL'), nodeEnv),
+        logFormat: parseLogFormat(envStr('LOG_FORMAT'), nodeEnv),
+        tracingEnabled: envBool('TRACING_ENABLED', true),
+        healthStaleThresholdMinutes: envNum(
+            'HEALTH_STALE_THRESHOLD_MINUTES',
+            60
+        ),
+        healthDegradedMinProvidersRatio: Math.max(
+            0.1,
+            Math.min(1.0, envNum('HEALTH_DEGRADED_MIN_RATIO', 0.5))
+        )
     };
+}
+
+function parseLogLevel(
+    raw: string,
+    nodeEnv: string
+): 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'fatal' {
+    const v = raw.trim().toLowerCase();
+    if (['trace', 'debug', 'info', 'warn', 'error', 'fatal'].includes(v)) {
+        return v as 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'fatal';
+    }
+    return nodeEnv === 'production' ? 'info' : 'debug';
+}
+
+function parseLogFormat(
+    raw: string,
+    nodeEnv: string
+): 'json' | 'pretty' | 'text' {
+    const v = raw.trim().toLowerCase();
+    if (['json', 'pretty', 'text'].includes(v)) {
+        return v as 'json' | 'pretty' | 'text';
+    }
+    return nodeEnv === 'production' ? 'json' : 'pretty';
 }
 
 /**

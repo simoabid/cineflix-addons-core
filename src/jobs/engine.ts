@@ -30,6 +30,8 @@ import {
     maintenanceCleanupHandler
 } from './handlers/maintenanceHandlers.js';
 import { uncachedTransferHandler } from './handlers/uncachedTransferHandler.js';
+import { tracer, logger } from '../telemetry/index.js';
+import { globalMetrics } from '../metrics/index.js';
 
 export class JobEngine {
     private readonly handlers = new Map<string, JobHandler>();
@@ -53,14 +55,18 @@ export class JobEngine {
     ) {
         this.workerId = opts?.workerId || `worker_${process.pid}_${nanoid(6)}`;
         this.concurrency = opts?.concurrency || cfg.jobWorkerConcurrency || 4;
-        this.pollIntervalMs = opts?.pollIntervalMs || cfg.jobPollIntervalMs || 1000;
+        this.pollIntervalMs =
+            opts?.pollIntervalMs || cfg.jobPollIntervalMs || 1000;
         this.lockDurationMs = opts?.lockDurationMs || 60_000;
         this.locks = new DistributedLockService(cfg);
 
         // Register default handlers
         this.registerHandler('multi-addon-import', multiAddonImportHandler);
         this.registerHandler('repository-import', repositoryImportHandler);
-        this.registerHandler('stremio-account-import', stremioAccountImportHandler);
+        this.registerHandler(
+            'stremio-account-import',
+            stremioAccountImportHandler
+        );
         this.registerHandler('manifest-refresh', manifestRefreshHandler);
         this.registerHandler('health-sweep', healthSweepHandler);
         this.registerHandler('maintenance-cleanup', maintenanceCleanupHandler);
@@ -220,10 +226,7 @@ export class JobEngine {
     private async pollLoop(): Promise<void> {
         if (!this.running) return;
         try {
-            while (
-                this.running &&
-                this.activeWorkerCount < this.concurrency
-            ) {
+            while (this.running && this.activeWorkerCount < this.concurrency) {
                 const acquired = await this.pollNext();
                 if (!acquired) break;
             }
@@ -279,85 +282,141 @@ export class JobEngine {
             return;
         }
 
-        let heartbeatTimer: NodeJS.Timeout | null = null;
-        try {
-            // Setup lease renewal heartbeat (every 1/3 of lease duration)
-            const heartbeatIntervalMs = this.lockDurationMs / 3;
-            heartbeatTimer = setInterval(async () => {
-                if (abortController.signal.aborted) return;
-                try {
-                    await this.storage.heartbeatJob(
-                        job.id,
-                        this.workerId,
-                        this.lockDurationMs
-                    );
-                } catch {
-                    /* ignore */
-                }
-            }, heartbeatIntervalMs);
-            if (typeof heartbeatTimer.unref === 'function') {
-                heartbeatTimer.unref();
-            }
+        const t0 = Date.now();
+        await tracer.withSpan(
+            'job.execution',
+            async (span) => {
+                span.setAttribute('job.id', job.id);
+                span.setAttribute('job.type', job.type);
+                span.setAttribute('worker.id', this.workerId);
 
-            const ctx: JobHandlerContext = {
-                job,
-                signal: abortController.signal,
-                storage: this.storage,
-                manager: this.manager,
-                cfg: this.cfg,
-                updateProgress: async (progress: number) => {
-                    await this.storage.updateJobProgress(
+                let heartbeatTimer: NodeJS.Timeout | null = null;
+                try {
+                    // Setup lease renewal heartbeat (every 1/3 of lease duration)
+                    const heartbeatIntervalMs = this.lockDurationMs / 3;
+                    heartbeatTimer = setInterval(async () => {
+                        if (abortController.signal.aborted) return;
+                        try {
+                            await this.storage.heartbeatJob(
+                                job.id,
+                                this.workerId,
+                                this.lockDurationMs
+                            );
+                        } catch {
+                            /* ignore */
+                        }
+                    }, heartbeatIntervalMs);
+                    if (typeof heartbeatTimer.unref === 'function') {
+                        heartbeatTimer.unref();
+                    }
+
+                    const ctx: JobHandlerContext = {
+                        job,
+                        signal: abortController.signal,
+                        storage: this.storage,
+                        manager: this.manager,
+                        cfg: this.cfg,
+                        updateProgress: async (progress: number) => {
+                            await this.storage.updateJobProgress(
+                                job.id,
+                                progress,
+                                this.workerId
+                            );
+                        },
+                        heartbeat: async () => {
+                            return this.storage.heartbeatJob(
+                                job.id,
+                                this.workerId,
+                                this.lockDurationMs
+                            );
+                        }
+                    };
+
+                    const result = await handler(ctx);
+
+                    if (abortController.signal.aborted) {
+                        return;
+                    }
+
+                    const duration = Date.now() - t0;
+                    globalMetrics.recordJobExecution(
+                        job.type,
+                        'completed',
+                        duration
+                    );
+                    await this.storage.completeJob(
                         job.id,
-                        progress,
+                        result,
                         this.workerId
                     );
-                },
-                heartbeat: async () => {
-                    return this.storage.heartbeatJob(
-                        job.id,
-                        this.workerId,
-                        this.lockDurationMs
+
+                    logger.info(
+                        `Job ${job.id} (${job.type}) completed in ${duration}ms`,
+                        {
+                            component: 'jobs',
+                            jobId: job.id,
+                            jobType: job.type,
+                            durationMs: duration
+                        }
                     );
+                } catch (err) {
+                    const duration = Date.now() - t0;
+                    if (abortController.signal.aborted) {
+                        return;
+                    }
+
+                    const isAbort =
+                        (err as { name?: string })?.name === 'AbortError' ||
+                        (err as { code?: string })?.code === 'CANCELLED' ||
+                        /cancelled/i.test(
+                            err instanceof Error ? err.message : String(err)
+                        );
+
+                    if (isAbort) {
+                        await this.storage.cancelJob(job.id);
+                        return;
+                    }
+
+                    globalMetrics.recordJobExecution(
+                        job.type,
+                        'failed',
+                        duration
+                    );
+                    const errorMsg =
+                        err instanceof Error ? err.message : String(err);
+                    const canRetry = job.attempts < job.maxAttempts;
+
+                    span.recordException(err as Error);
+                    await this.storage.failJob(
+                        job.id,
+                        errorMsg,
+                        this.workerId,
+                        canRetry
+                    );
+
+                    logger.error(
+                        `Job ${job.id} (${job.type}) failed: ${errorMsg}`,
+                        {
+                            component: 'jobs',
+                            jobId: job.id,
+                            jobType: job.type,
+                            durationMs: duration
+                        }
+                    );
+                } finally {
+                    if (heartbeatTimer) {
+                        clearInterval(heartbeatTimer);
+                        heartbeatTimer = null;
+                    }
                 }
-            };
-
-            const result = await handler(ctx);
-
-            if (abortController.signal.aborted) {
-                return;
+            },
+            {
+                attributes: {
+                    'job.id': job.id,
+                    'job.type': job.type
+                }
             }
-
-            await this.storage.completeJob(job.id, result, this.workerId);
-        } catch (err) {
-            if (abortController.signal.aborted) {
-                return;
-            }
-
-            const isAbort =
-                (err as { name?: string })?.name === 'AbortError' ||
-                (err as { code?: string })?.code === 'CANCELLED' ||
-                /cancelled/i.test(err instanceof Error ? err.message : String(err));
-
-            if (isAbort) {
-                await this.storage.cancelJob(job.id);
-                return;
-            }
-
-            const errorMsg = err instanceof Error ? err.message : String(err);
-            const canRetry = job.attempts < job.maxAttempts;
-
-            await this.storage.failJob(
-                job.id,
-                errorMsg,
-                this.workerId,
-                canRetry
-            );
-        } finally {
-            if (heartbeatTimer) {
-                clearInterval(heartbeatTimer);
-                heartbeatTimer = null;
-            }
-        }
+        );
     }
 
     private scheduleOutboxPoll(delayMs = 2000): void {
@@ -398,5 +457,19 @@ export class JobEngine {
                 );
             }
         }
+    }
+
+    getStats(): {
+        running: boolean;
+        workers: number;
+        activeJobs: number;
+        registeredTypes: string[];
+    } {
+        return {
+            running: this.running,
+            workers: this.concurrency,
+            activeJobs: this.activeJobs.size,
+            registeredTypes: this.getRegisteredTypes()
+        };
     }
 }
