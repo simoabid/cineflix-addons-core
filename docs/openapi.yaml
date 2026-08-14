@@ -1,0 +1,1290 @@
+openapi: 3.1.0
+info:
+  title: addons-core — Stremio-Addon Aggregator & OMSS API
+  version: 1.0.0
+  description: Production-grade Stremio-addon aggregator exposing an OMSS-compliant streaming backend, progressive waterfall scraping, dynamic addon management, debrid caching, and health observability.
+servers:
+  - url: http://localhost:3006
+    description: addons-core API Server
+tags:
+  - name: OMSS Content
+    description: Standard OMSS movie, TV, and subtitle aggregation endpoints
+  - name: Progressive Scrape
+    description: Single-provider waterfall scraping for fast streaming playback
+  - name: Addon Management
+    description: Addon lifecycle, ordering, configuration, and diagnostics
+  - name: Imports
+    description: Import addons from URL, Stremio account, or repository
+  - name: Debrid & Settings
+    description: Debrid configuration, account checks, and background transfers
+  - name: Jobs
+    description: Durable background job management and task execution
+  - name: Health & Metrics
+    description: Liveness probes, readiness checks, dependencies, and Prometheus metrics
+  - name: Authentication
+    description: Session management, login, logout, and CSRF protection
+  - name: Cache & Audit
+    description: Cache status, purge operations, and operator audit trail
+  - name: Proxy & Playback
+    description: Secure tokenized playback proxy and range requests
+  - name: Native Stremio
+    description: Native Stremio protocol compatibility endpoints
+paths:
+  /v1/movies/{id}:
+    get:
+      tags:
+        - OMSS Content
+      summary: Get bulk movie stream sources
+      description: Aggregates stream sources from all eligible providers in priority order for a movie by TMDB/IMDb ID.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: TMDB numeric ID or IMDb ID (e.g. 550 or tt0137523)
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Successful OMSS movie response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OMSSMovieResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /v1/tv/{id}/seasons/{season}/episodes/{episode}:
+    get:
+      tags:
+        - OMSS Content
+      summary: Get bulk TV episode stream sources
+      description: Aggregates stream sources from all eligible providers for a TV series episode.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: season
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+        - name: episode
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        '200':
+          description: Successful OMSS TV response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OMSSTVResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/movies/{tmdbId}/providers/{providerId}:
+    get:
+      tags:
+        - Progressive Scrape
+      summary: Scrape movie sources from single provider
+      parameters:
+        - name: tmdbId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: providerId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Single provider scrape result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProgressiveProviderResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/tv/{tmdbId}/seasons/{season}/episodes/{episode}/providers/{providerId}:
+    get:
+      tags:
+        - Progressive Scrape
+      summary: Scrape TV episode sources from single provider
+      parameters:
+        - name: tmdbId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: season
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+        - name: episode
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+        - name: providerId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Single provider scrape result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProgressiveProviderResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/subtitles:
+    get:
+      tags:
+        - OMSS Content
+      summary: Aggregate subtitles across providers
+      parameters:
+        - name: tmdbId
+          in: query
+          schema:
+            type: string
+        - name: imdbId
+          in: query
+          schema:
+            type: string
+        - name: season
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+        - name: episode
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+        - name: language
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Subtitles collection
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubtitlesResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+  /v1/providers:
+    get:
+      tags:
+        - Progressive Scrape
+      summary: List available providers with priority and diagnostics
+      responses:
+        '200':
+          description: Ordered list of providers
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ProviderSummary'
+  /v1/providers/meta:
+    get:
+      tags:
+        - Progressive Scrape
+      summary: Get metadata about registered providers
+      responses:
+        '200':
+          description: Provider metadata mapping
+          content:
+            application/json:
+              schema:
+                type: object
+  /v1/providers/diagnostics:
+    get:
+      tags:
+        - Progressive Scrape
+      summary: Get circuit breaker diagnostics across all providers
+      responses:
+        '200':
+          description: Diagnostics summary
+          content:
+            application/json:
+              schema:
+                type: object
+  /debug/providers/{id}:
+    get:
+      tags:
+        - Health & Metrics
+      summary: Protected provider diagnostic trace (Admin only)
+      security:
+        - BearerAuth: []
+        - SessionAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Provider diagnostic trace
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Forbidden
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/addons:
+    get:
+      tags:
+        - Addon Management
+      summary: List installed addons with pagination, filters, and sorting
+      security:
+        - BearerAuth: []
+        - SessionAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - name: search
+          in: query
+          schema:
+            type: string
+        - name: capability
+          in: query
+          schema:
+            type: string
+            enum:
+              - all
+              - stream
+              - subtitles
+              - catalog
+              - meta
+        - name: health
+          in: query
+          schema:
+            type: string
+            enum:
+              - all
+              - healthy
+              - unhealthy
+              - unknown
+        - name: enabled
+          in: query
+          schema:
+            type: boolean
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum:
+              - order
+              - name
+              - addedAt
+              - updatedAt
+              - health
+        - name: direction
+          in: query
+          schema:
+            type: string
+            enum:
+              - asc
+              - desc
+      responses:
+        '200':
+          description: Paginated list of addons
+          headers:
+            x-provider-revision:
+              schema:
+                type: integer
+            ETag:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AddonListResponse'
+    post:
+      tags:
+        - Addon Management
+      summary: Install an addon from manifest URL
+      security:
+        - BearerAuth: []
+        - SessionAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InstallAddonBody'
+      responses:
+        '200':
+          description: Addon installed successfully
+        '400':
+          $ref: '#/components/responses/BadRequest'
+  /v1/addons/{providerId}:
+    get:
+      tags:
+        - Addon Management
+      summary: Get single addon details
+      parameters:
+        - name: providerId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: raw
+          in: query
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Addon details
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags:
+        - Addon Management
+      summary: Update addon configuration
+      parameters:
+        - name: providerId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: If-Match
+          in: header
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchAddonBody'
+      responses:
+        '200':
+          description: Addon updated
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+    delete:
+      tags:
+        - Addon Management
+      summary: Uninstall an addon
+      parameters:
+        - name: providerId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: If-Match
+          in: header
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Addon deleted
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+  /v1/addons/{providerId}/refresh:
+    post:
+      tags:
+        - Addon Management
+      summary: Re-fetch manifest for an addon
+      parameters:
+        - name: providerId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: If-Match
+          in: header
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Manifest refreshed
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+  /v1/addons/reorder:
+    post:
+      tags:
+        - Addon Management
+      summary: Reorder installed addons
+      parameters:
+        - name: If-Match
+          in: header
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReorderAddonsBody'
+      responses:
+        '200':
+          description: Addons reordered
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+  /v1/addons/health/check:
+    post:
+      tags:
+        - Addon Management
+      summary: Trigger health check sweep
+      parameters:
+        - name: async
+          in: query
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Health check completed synchronously
+        '202':
+          description: Health check queued asynchronously on job engine
+  /v1/import/url:
+    post:
+      tags:
+        - Imports
+      summary: Import addons from URL or array of URLs
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImportUrlBody'
+      responses:
+        '200':
+          description: Imported synchronously
+        '202':
+          description: Queued on job engine
+  /v1/import/stremio:
+    post:
+      tags:
+        - Imports
+      summary: Import addons from Stremio user account
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImportStremioBody'
+      responses:
+        '200':
+          description: Imported synchronously
+        '202':
+          description: Queued on job engine
+  /v1/import/repository:
+    post:
+      tags:
+        - Imports
+      summary: Import addons from an addon repository index
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImportRepoBody'
+      responses:
+        '202':
+          description: Repository import task queued
+  /v1/import/jobs:
+    get:
+      tags:
+        - Imports
+      summary: List import background jobs
+      responses:
+        '200':
+          description: List of jobs
+  /v1/import/jobs/{jobId}:
+    get:
+      tags:
+        - Imports
+      summary: Get import job status
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Job record
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags:
+        - Imports
+      summary: Cancel an import job
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Job cancelled
+  /v1/jobs:
+    get:
+      tags:
+        - Jobs
+      summary: List durable jobs
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+        - name: status
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Jobs list
+    post:
+      tags:
+        - Jobs
+      summary: Create and enqueue a background job
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateJobBody'
+      responses:
+        '201':
+          description: Job created
+  /v1/jobs/{id}:
+    get:
+      tags:
+        - Jobs
+      summary: Get job status by ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Job details
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/jobs/{id}/cancel:
+    post:
+      tags:
+        - Jobs
+      summary: Cancel a running or queued job
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Job cancelled
+  /v1/debrid/status:
+    get:
+      tags:
+        - Debrid & Settings
+      summary: Get debrid provider connection and account status
+      responses:
+        '200':
+          description: Debrid status
+  /v1/debrid/transfers:
+    get:
+      tags:
+        - Debrid & Settings
+      summary: List active and recent debrid transfers
+      responses:
+        '200':
+          description: List of transfers
+    post:
+      tags:
+        - Debrid & Settings
+      summary: Submit torrent infoHash for debrid download
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DebridTransferBody'
+      responses:
+        '202':
+          description: Transfer queued
+  /v1/debrid/transfers/{jobId}:
+    get:
+      tags:
+        - Debrid & Settings
+      summary: Get status of debrid transfer job
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Transfer details
+    delete:
+      tags:
+        - Debrid & Settings
+      summary: Cancel a debrid transfer job
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Transfer cancelled
+  /v1/settings/debrid:
+    get:
+      tags:
+        - Debrid & Settings
+      summary: Get debrid configuration settings
+      responses:
+        '200':
+          description: Debrid settings
+    patch:
+      tags:
+        - Debrid & Settings
+      summary: Update debrid configuration settings
+      parameters:
+        - name: If-Match
+          in: header
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchDebridBody'
+      responses:
+        '200':
+          description: Settings updated
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+  /v1/cache/metrics:
+    get:
+      tags:
+        - Cache & Audit
+      summary: Get cache hit/miss and cardinality metrics
+      responses:
+        '200':
+          description: Cache statistics
+  /v1/cache/purge:
+    post:
+      tags:
+        - Cache & Audit
+      summary: Purge cache namespaces
+      responses:
+        '200':
+          description: Cache purged
+  /v1/audit:
+    get:
+      tags:
+        - Cache & Audit
+      summary: Query audit logs for administrative actions
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+        - name: action
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Audit events
+  /v1/auth/login:
+    post:
+      tags:
+        - Authentication
+      summary: Authenticate and receive session cookie or token
+      responses:
+        '200':
+          description: Logged in
+  /v1/auth/logout:
+    post:
+      tags:
+        - Authentication
+      summary: Log out and invalidate current session
+      responses:
+        '200':
+          description: Logged out
+  /v1/auth/session:
+    get:
+      tags:
+        - Authentication
+      summary: Get current authenticated session information
+      responses:
+        '200':
+          description: Session information
+  /v1/proxy/grant/{id}:
+    get:
+      tags:
+        - Proxy & Playback
+      summary: Stream media through secure tokenized proxy by grant ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Full media stream response
+        '206':
+          description: Partial content / HTTP byte range stream
+  /v1/proxy/token/{token}:
+    get:
+      tags:
+        - Proxy & Playback
+      summary: Stream media through stateless signed grant token
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Full media stream response
+        '206':
+          description: Partial content / HTTP byte range stream
+  /health/live:
+    get:
+      tags:
+        - Health & Metrics
+      summary: Liveness probe for process uptime
+      responses:
+        '200':
+          description: Service is alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LivenessResponse'
+  /health/ready:
+    get:
+      tags:
+        - Health & Metrics
+      summary: Readiness probe for core subsystems
+      responses:
+        '200':
+          description: Service is ready to handle traffic
+        '503':
+          description: Service is degraded or starting up
+  /health/dependencies:
+    get:
+      tags:
+        - Health & Metrics
+      summary: Deep dependency health inspection
+      responses:
+        '200':
+          description: All external dependencies operational
+        '503':
+          description: One or more dependencies are down
+  /metrics:
+    get:
+      tags:
+        - Health & Metrics
+      summary: Prometheus metrics or JSON snapshot
+      security:
+        - BearerAuth: []
+        - SessionAuth: []
+      parameters:
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum:
+              - prometheus
+              - json
+      responses:
+        '200':
+          description: Prometheus text exposition or JSON metrics snapshot
+  /manifest.json:
+    get:
+      tags:
+        - Native Stremio
+      summary: Native Stremio addon manifest
+      responses:
+        '200':
+          description: Stremio manifest object
+  /stream/{type}/{id}.json:
+    get:
+      tags:
+        - Native Stremio
+      summary: Native Stremio stream resolution endpoint
+      parameters:
+        - name: type
+          in: path
+          required: true
+          schema:
+            type: string
+            enum:
+              - movie
+              - series
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 'Stremio stream response ({ streams: [...] })'
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT or API Key
+    SessionAuth:
+      type: apiKey
+      in: cookie
+      name: cineflix_session
+  schemas:
+    OMSSMovieResponse:
+      type: object
+      required:
+        - sources
+      properties:
+        sources:
+          type: array
+          items:
+            $ref: '#/components/schemas/OMSSSource'
+        subtitles:
+          type: array
+          items:
+            $ref: '#/components/schemas/OMSSSubtitle'
+        source:
+          type: string
+          example: stremio-addons
+        addonsQueried:
+          type: integer
+          example: 3
+        revision:
+          type: integer
+          example: 12
+    OMSSTVResponse:
+      type: object
+      required:
+        - sources
+      properties:
+        sources:
+          type: array
+          items:
+            $ref: '#/components/schemas/OMSSSource'
+        subtitles:
+          type: array
+          items:
+            $ref: '#/components/schemas/OMSSSubtitle'
+        source:
+          type: string
+          example: stremio-addons
+        addonsQueried:
+          type: integer
+          example: 3
+        revision:
+          type: integer
+          example: 12
+    ProgressiveProviderResponse:
+      type: object
+      required:
+        - sources
+        - providerId
+      properties:
+        sources:
+          type: array
+          items:
+            $ref: '#/components/schemas/OMSSSource'
+        subtitles:
+          type: array
+          items:
+            $ref: '#/components/schemas/OMSSSubtitle'
+        diagnostics:
+          type: array
+          items:
+            type: object
+        providerId:
+          type: string
+          example: addon:torrentio
+        revision:
+          type: integer
+          example: 12
+    OMSSSource:
+      type: object
+      required:
+        - id
+        - name
+        - url
+        - quality
+        - type
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        url:
+          type: string
+          format: uri
+        quality:
+          type: string
+          example: 1080p
+        type:
+          type: string
+          enum:
+            - direct
+            - hls
+            - dash
+            - torrent
+        format:
+          type: string
+          enum:
+            - mp4
+            - mkv
+            - hls
+            - dash
+        size:
+          type: integer
+        providerId:
+          type: string
+        addonName:
+          type: string
+        seeders:
+          type: integer
+    OMSSSubtitle:
+      type: object
+      required:
+        - id
+        - language
+        - url
+      properties:
+        id:
+          type: string
+        language:
+          type: string
+          example: eng
+        url:
+          type: string
+          format: uri
+        format:
+          type: string
+          example: vtt
+    SubtitlesResponse:
+      type: object
+      required:
+        - subtitles
+      properties:
+        subtitles:
+          type: array
+          items:
+            $ref: '#/components/schemas/OMSSSubtitle'
+        revision:
+          type: integer
+    ProviderSummary:
+      type: object
+      required:
+        - id
+        - name
+        - enabled
+        - priority
+        - revision
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        enabled:
+          type: boolean
+        priority:
+          type: integer
+        admissionState:
+          type: string
+          enum:
+            - validated
+            - disabled
+            - quarantined
+        capabilities:
+          type: object
+        health:
+          type: object
+        diagnostics:
+          type: object
+        revision:
+          type: integer
+    AddonListResponse:
+      type: object
+      required:
+        - addons
+        - pagination
+        - revision
+      properties:
+        addons:
+          type: array
+          items:
+            type: object
+        pagination:
+          type: object
+          properties:
+            total:
+              type: integer
+            page:
+              type: integer
+            limit:
+              type: integer
+            totalPages:
+              type: integer
+            hasMore:
+              type: boolean
+        store:
+          type: string
+        revision:
+          type: integer
+    InstallAddonBody:
+      type: object
+      required:
+        - url
+      properties:
+        url:
+          type: string
+          format: uri
+        enable:
+          type: boolean
+          default: true
+    PatchAddonBody:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+        timeoutMs:
+          type: integer
+          minimum: 1000
+          maximum: 120000
+    ReorderAddonsBody:
+      type: object
+      required:
+        - order
+      properties:
+        order:
+          type: array
+          items:
+            type: string
+    ImportUrlBody:
+      type: object
+      properties:
+        url:
+          type: string
+          format: uri
+        urls:
+          type: array
+          items:
+            type: string
+            format: uri
+        enable:
+          type: boolean
+    ImportStremioBody:
+      type: object
+      properties:
+        authKey:
+          type: string
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+        enable:
+          type: boolean
+    ImportRepoBody:
+      type: object
+      required:
+        - url
+      properties:
+        url:
+          type: string
+          format: uri
+        enable:
+          type: boolean
+    CreateJobBody:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+        payload:
+          type: object
+        priority:
+          type: integer
+          minimum: 1
+          maximum: 10
+        idempotencyKey:
+          type: string
+    DebridTransferBody:
+      type: object
+      required:
+        - infoHash
+      properties:
+        infoHash:
+          type: string
+        provider:
+          type: string
+          enum:
+            - realdebrid
+            - alldebrid
+            - premiumize
+        name:
+          type: string
+        season:
+          type: integer
+        episode:
+          type: integer
+    PatchDebridBody:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+        apiKey:
+          type: string
+        provider:
+          type: string
+          enum:
+            - realdebrid
+            - alldebrid
+            - premiumize
+        autoDownloadUncached:
+          type: boolean
+        rateLimitPerMin:
+          type: integer
+          minimum: 10
+          maximum: 600
+    LivenessResponse:
+      type: object
+      required:
+        - status
+        - uptimeSec
+        - timestamp
+        - memory
+      properties:
+        status:
+          type: string
+          example: ok
+        uptimeSec:
+          type: integer
+          example: 120
+        timestamp:
+          type: string
+          format: date-time
+        memory:
+          type: object
+          properties:
+            heapUsedMb:
+              type: integer
+            rssMb:
+              type: integer
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          required:
+            - code
+            - message
+          properties:
+            code:
+              type: string
+              example: VALIDATION_ERROR
+            message:
+              type: string
+              example: Invalid parameter
+            details:
+              type: array
+              items:
+                type: object
+        requestId:
+          type: string
+          example: req-abc123
+        revision:
+          type: integer
+          example: 5
+  responses:
+    BadRequest:
+      description: Invalid input parameters or request body
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Unauthorized:
+      description: Authentication token missing or invalid
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: Resource or media not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    PreconditionFailed:
+      description: Optimistic locking conflict (revision mismatch)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    RateLimited:
+      description: Too many requests, Retry-After header provided
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
