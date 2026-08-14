@@ -1,0 +1,53 @@
+{
+  "description": "Standard error response envelopes across HTTP status codes",
+  "badRequest": {
+    "status": 400,
+    "body": {
+      "error": {
+        "code": "VALIDATION_ERROR",
+        "message": "Request validation failed"
+      },
+      "requestId": "req_123"
+    }
+  },
+  "notFound": {
+    "status": 404,
+    "body": {
+      "error": {
+        "code": "NOT_FOUND",
+        "message": "Addon not found"
+      },
+      "requestId": "req_123"
+    }
+  },
+  "preconditionFailed": {
+    "status": 412,
+    "body": {
+      "error": {
+        "code": "PRECONDITION_FAILED",
+        "message": "Resource revision conflict: expected 4 but current is 5"
+      },
+      "revision": 5,
+      "requestId": "req_123"
+    }
+  },
+  "rateLimited": {
+    "status": 429,
+    "body": {
+      "error": {
+        "code": "RATE_LIMITED",
+        "message": "Too many requests"
+      }
+    }
+  },
+  "internalError": {
+    "status": 500,
+    "body": {
+      "error": {
+        "code": "INTERNAL_ERROR",
+        "message": "An unexpected error occurred"
+      },
+      "requestId": "req_123"
+    }
+  }
+}

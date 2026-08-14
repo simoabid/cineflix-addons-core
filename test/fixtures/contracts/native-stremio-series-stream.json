@@ -1,0 +1,12 @@
+{
+  "description": "Native Stremio series stream response format",
+  "expectedShape": {
+    "streams": [
+      {
+        "name": "AddonsCore [Torrentio]",
+        "title": "Breaking Bad S01E01 1080p",
+        "url": "http://localhost:3006/v1/proxy/grant/grant_sample_series"
+      }
+    ]
+  }
+}

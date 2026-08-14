@@ -1,0 +1,12 @@
+{
+  "description": "Native Stremio manifest.json schema and format",
+  "expectedShape": {
+    "id": "org.omss.addons-core",
+    "version": "1.0.0",
+    "name": "AddonsCore",
+    "description": "Stremio Addon Aggregator",
+    "resources": ["stream"],
+    "types": ["movie", "series"],
+    "catalogs": []
+  }
+}

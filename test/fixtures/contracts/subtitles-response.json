@@ -1,0 +1,16 @@
+{
+  "description": "Subtitle aggregation response format",
+  "expectedShape": {
+    "subtitles": [
+      {
+        "id": "opensubtitles:123",
+        "url": "http://localhost:3006/v1/proxy/grant/grant_sub_eng",
+        "lang": "eng",
+        "format": "vtt"
+      }
+    ],
+    "source": "stremio-addons",
+    "addonsQueried": 1,
+    "revision": 1
+  }
+}

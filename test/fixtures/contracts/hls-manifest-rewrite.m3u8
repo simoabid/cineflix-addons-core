@@ -1,0 +1,9 @@
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:10
+#EXT-X-MEDIA-SEQUENCE:0
+#EXTINF:10.0,
+http://localhost:3006/v1/proxy?data=eyJhIjoxMjN9
+#EXTINF:10.0,
+http://localhost:3006/v1/proxy?data=eyJhIjoxMjR9
+#EXT-X-ENDLIST

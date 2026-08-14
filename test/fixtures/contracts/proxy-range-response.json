@@ -1,0 +1,10 @@
+{
+  "description": "Proxy HTTP Range request and partial content response contract",
+  "expectedHeaders": {
+    "accept-ranges": "bytes",
+    "content-range": "bytes 0-1023/10485760",
+    "content-length": "1024",
+    "content-type": "video/mp4"
+  },
+  "expectedStatus": 206
+}

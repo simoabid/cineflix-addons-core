@@ -1,0 +1,18 @@
+{
+  "description": "Progressive single-provider scraping response format",
+  "expectedShape": {
+    "sources": [
+      {
+        "name": "Torrentio",
+        "title": "Movie Title 1080p",
+        "url": "http://localhost:3006/v1/proxy/grant/grant_sample123"
+      }
+    ],
+    "subtitles": [],
+    "diagnostics": [],
+    "providerId": "addon:torrentio",
+    "providerName": "Torrentio",
+    "durationMs": 245,
+    "revision": 1
+  }
+}

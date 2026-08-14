@@ -1,0 +1,24 @@
+{
+  "description": "Standard OMSS bulk movie source aggregation response format",
+  "expectedShape": {
+    "sources": [
+      {
+        "name": "Torrentio",
+        "title": "Big Buck Bunny 1080p BluRay",
+        "url": "http://localhost:3006/v1/proxy/grant/grant_sample123",
+        "quality": "1080p",
+        "type": "mp4"
+      }
+    ],
+    "subtitles": [
+      {
+        "id": "sub:1",
+        "url": "http://localhost:3006/v1/proxy/grant/grant_sub1",
+        "lang": "eng",
+        "format": "vtt"
+      }
+    ],
+    "diagnostics": [],
+    "revision": 1
+  }
+}
