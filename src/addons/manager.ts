@@ -358,6 +358,47 @@ export class AddonManager {
         return sortAddons(this.data.addons);
     }
 
+    /**
+     * Reload state from shared storage when another instance mutated it
+     * (Phase 7 §10.3). No-op when the stored revision is not newer than the
+     * local one, so racing cluster events are harmless. Returns true when
+     * local state was actually replaced.
+     */
+    async reloadFromStorage(reason = 'cluster-sync'): Promise<boolean> {
+        return this.withLock(async () => {
+            let fresh: AddonStoreData;
+            try {
+                fresh = await this.store.load();
+            } catch (err) {
+                console.warn(
+                    `[addons] reloadFromStorage(${reason}) failed to read store:`,
+                    err instanceof Error ? err.message : err
+                );
+                return false;
+            }
+            const freshRev = fresh.revision ?? 0;
+            if (freshRev <= (this.data.revision ?? 0)) {
+                return false;
+            }
+            const prevRev = this.data.revision ?? 0;
+            this.data = fresh;
+            if (this.data.revision == null) this.data.revision = 0;
+            for (const addon of this.data.addons) {
+                this.openAddonUrls(addon);
+                addon.capabilities =
+                    addon.capabilities ?? capabilitiesFor(addon.manifest);
+            }
+            sortAddons(this.data.addons).forEach((a, i) => (a.order = i));
+            this.applyDebrid();
+            this.reconcileRegistry();
+            console.log(
+                `[addons] Reloaded from shared storage (${reason}): rev ${prevRev} → ${freshRev}, ` +
+                    `${this.data.addons.length} addon(s), ${this.data.addons.filter((a) => a.enabled).length} enabled`
+            );
+            return true;
+        });
+    }
+
     get(providerId: string): InstalledAddon | undefined {
         return this.data.addons.find((a) => a.providerId === providerId);
     }

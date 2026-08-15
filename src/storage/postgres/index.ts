@@ -87,8 +87,23 @@ export class PostgresStorageBackend implements IStorageBackend {
 
     async init(): Promise<void> {
         const pool = await this.getPool();
-        // Run migrations
-        await runMigrations(pool);
+        // Phase 7 §10.3 — serialize migrations across replicas with a
+        // session-level advisory lock on a dedicated connection, so two
+        // instances booting simultaneously cannot interleave DDL.
+        const client = await pool.connect();
+        try {
+            // Arbitrary stable lock key (must never change).
+            await client.query('SELECT pg_advisory_lock(7620384049589538626)');
+            try {
+                await runMigrations(client);
+            } finally {
+                await client.query(
+                    'SELECT pg_advisory_unlock(7620384049589538626)'
+                );
+            }
+        } finally {
+            client.release();
+        }
 
         // Initialize store_metadata revision if missing
         await pool.query(`
