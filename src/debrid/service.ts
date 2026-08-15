@@ -24,6 +24,7 @@ import type {
 import type { AuditLogger } from '../security/audit.js';
 import { globalMetrics } from '../metrics/index.js';
 import { tracer } from '../telemetry/tracing.js';
+import { globalConcurrency } from '../concurrency/coordinator.js';
 
 interface CacheEntry {
     url: string;
@@ -210,7 +211,13 @@ class DebridService {
                 span.setAttribute('debrid.cached', false);
 
                 const t0 = Date.now();
-                const resolution = await this.resolver.resolveCached(input);
+                // Phase 7 §10.1 — debrid API calls draw from their own pool so
+                // a burst of torrent resolutions can't saturate shared egress.
+                const resolver = this.resolver;
+                const resolution = await globalConcurrency.withSlot(
+                    'debrid',
+                    () => resolver.resolveCached(input)
+                );
                 const durationMs = Date.now() - t0;
                 span.setAttribute('debrid.kind', resolution.kind);
 

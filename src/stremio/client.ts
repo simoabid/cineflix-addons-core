@@ -12,6 +12,7 @@ import { secureFetch } from '../security/secureFetch.js';
 import { type UrlPolicyOptions } from '../security/urlPolicy.js';
 import { redactUrl } from '../security/redaction.js';
 import { parseAddonUrl, buildResourceUrl } from './url.js';
+import { globalConcurrency } from '../concurrency/coordinator.js';
 import type {
     StremioManifest,
     StremioStream,
@@ -60,7 +61,9 @@ export function normalizeAddonUrl(input: string): {
             originalUrl: parsed.original
         };
     } catch (err) {
-        throw new StremioAddonError(err instanceof Error ? err.message : `Invalid addon URL: ${input}`);
+        throw new StremioAddonError(
+            err instanceof Error ? err.message : `Invalid addon URL: ${input}`
+        );
     }
 }
 
@@ -69,10 +72,14 @@ export function normalizeAddonUrl(input: string): {
 export function splitBase(baseUrl: string): { root: string; query: string } {
     try {
         const u = new URL(baseUrl);
-        return { root: `${u.origin}${u.pathname.replace(/\/+$/, '')}`, query: u.search };
+        return {
+            root: `${u.origin}${u.pathname.replace(/\/+$/, '')}`,
+            query: u.search
+        };
     } catch {
         const qIndex = baseUrl.indexOf('?');
-        if (qIndex === -1) return { root: baseUrl.replace(/\/+$/, ''), query: '' };
+        if (qIndex === -1)
+            return { root: baseUrl.replace(/\/+$/, ''), query: '' };
         return {
             root: baseUrl.slice(0, qIndex).replace(/\/+$/, ''),
             query: baseUrl.slice(qIndex)
@@ -98,16 +105,23 @@ export async function fetchManifest(
 }> {
     const { manifestUrl, baseUrl, originalUrl } = normalizeAddonUrl(addonUrl);
 
-    const result = await secureFetch(manifestUrl, {
-        headers: DEFAULT_HEADERS,
-        timeoutMs,
-        maxBytes: options.maxBytes ?? 1_048_576,
-        maxRedirects: 3,
-        acceptContentTypes: ['json', 'text/plain', 'javascript'],
-        policy: options.policy ?? { allowHttp: false },
-        viaProxy: 'auto',
-        signal: options.signal
-    });
+    // Phase 7 §10.1 — manifest imports/refreshes draw from the manifest pool
+    // (separate capacity from stream scrapes and playback).
+    const result = await globalConcurrency.withSlot(
+        'manifest',
+        () =>
+            secureFetch(manifestUrl, {
+                headers: DEFAULT_HEADERS,
+                timeoutMs,
+                maxBytes: options.maxBytes ?? 1_048_576,
+                maxRedirects: 3,
+                acceptContentTypes: ['json', 'text/plain', 'javascript'],
+                policy: options.policy ?? { allowHttp: false },
+                viaProxy: 'auto',
+                signal: options.signal
+            }),
+        { signal: options.signal }
+    );
 
     if (!result.response.ok) {
         throw new StremioAddonError(
@@ -156,7 +170,8 @@ export async function fetchStreams(
 ): Promise<StremioStream[] & { cacheMaxAge?: number }> {
     const url = buildResourceUrl(baseUrl, 'stream', type, id);
     const policy = options.policy ?? { allowHttp: true };
-    if (options.signal?.aborted) throw new StremioAddonError('Aborted', redactUrl(url));
+    if (options.signal?.aborted)
+        throw new StremioAddonError('Aborted', redactUrl(url));
     try {
         const result = await secureFetch(url, {
             headers: DEFAULT_HEADERS,
@@ -174,10 +189,15 @@ export async function fetchStreams(
                 redactUrl(url)
             );
         }
-        const json = (await result.response.json()) as StremioStreamResponse & { cacheMaxAge?: number };
+        const json = (await result.response.json()) as StremioStreamResponse & {
+            cacheMaxAge?: number;
+        };
         const streams = Array.isArray(json?.streams) ? json.streams : [];
         // Preserve response-level cacheMaxAge for source expiry (standard Stremio field)
-        const cacheMaxAge = typeof json?.cacheMaxAge === 'number' ? json.cacheMaxAge : undefined;
+        const cacheMaxAge =
+            typeof json?.cacheMaxAge === 'number'
+                ? json.cacheMaxAge
+                : undefined;
         // Attach as non-enumerable expiring hint so callers can use it without changing array shape
         if (cacheMaxAge != null) {
             Object.defineProperty(streams, 'cacheMaxAge', {

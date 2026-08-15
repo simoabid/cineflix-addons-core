@@ -26,6 +26,7 @@ import {
     type RequestInit as UndiciRequestInit
 } from 'undici';
 import { tracer, logger } from '../telemetry/index.js';
+import { globalConcurrency } from '../concurrency/coordinator.js';
 
 export type ScrapeProxyMode = 'off' | 'allowlist' | 'all';
 
@@ -275,6 +276,47 @@ export async function scrapeFetch(
         // invalid URL string, fallback to 'unknown'
     }
 
+    // Phase 7 §10.1 — per-host outbound concurrency bound. scrapeFetch is the
+    // single choke point for all outbound HTTP (secureFetch delegates here),
+    // so every class of remote work (manifests, streams, imports, proxy
+    // upstreams) is capped per hostname no matter which pool initiated it.
+    if (upstreamHost !== 'unknown') {
+        return globalConcurrency.withHostSlot(upstreamHost, () =>
+            doFetch(urlStr, rest, {
+                viaProxy,
+                timeoutMs,
+                pinnedIp,
+                optPropagateTrace,
+                upstreamHost
+            })
+        );
+    }
+    return doFetch(urlStr, rest, {
+        viaProxy,
+        timeoutMs,
+        pinnedIp,
+        optPropagateTrace,
+        upstreamHost
+    });
+}
+
+async function doFetch(
+    urlStr: string,
+    rest: Omit<
+        ScrapeFetchInit,
+        'viaProxy' | 'timeoutMs' | 'pinnedIp' | 'propagateTrace'
+    >,
+    ctx: {
+        viaProxy: boolean | 'auto';
+        timeoutMs?: number;
+        pinnedIp?: string;
+        optPropagateTrace?: boolean;
+        upstreamHost: string;
+    }
+): Promise<Response> {
+    const { viaProxy, timeoutMs, pinnedIp, optPropagateTrace, upstreamHost } =
+        ctx;
+
     return tracer.withSpan(
         'http.client.request',
         async (span) => {
@@ -421,4 +463,19 @@ export function resetScrapeProxyAgent(): void {
     if (agent) void agent.close().catch(() => undefined);
     agent = undefined;
     loggedStatus = false;
+}
+
+/**
+ * Phase 7 §10.2 — close all egress agents at shutdown so in-flight proxied
+ * sockets don't keep the event loop alive past the grace period.
+ */
+export async function closeEgress(): Promise<void> {
+    if (agent) {
+        try {
+            await agent.close();
+        } catch {
+            /* ignore */
+        }
+        agent = null;
+    }
 }
