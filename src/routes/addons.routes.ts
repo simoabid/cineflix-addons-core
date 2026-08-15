@@ -396,6 +396,73 @@ export function registerAddonRoutes(
         }
     );
 
+    // ── Phase 7 §10.4: provider quarantine management ────────────────────────
+    // Quarantine is an automatic reliability state (repeated circuit opens);
+    // release is a deliberate operator action.
+    app.get(
+        '/v1/quarantine',
+        { preHandler: operatorGuard },
+        async (_req, reply) => {
+            return reply.code(200).send({
+                quarantined: globalReliability.listQuarantined(),
+                revision: manager.getRevision()
+            });
+        }
+    );
+
+    app.post<{ Params: { providerId: string } }>(
+        '/v1/quarantine/:providerId/release',
+        { preHandler: adminGuard },
+        async (req, reply) => {
+            const paramRes = providerIdValidator(req.params.providerId);
+            if (!paramRes.ok && paramRes.errors) {
+                return reply
+                    .code(400)
+                    .send(formatValidationError(paramRes.errors, req.id));
+            }
+            const providerId = paramRes.data!;
+
+            const ip = clientIp(req, cfg);
+            if (
+                !(await enforceRateLimit(
+                    reply,
+                    limiter,
+                    rateLimitKey('mutate', req.auth?.actor?.id, ip),
+                    RATE_LIMITS.mutate.limit,
+                    RATE_LIMITS.mutate.windowMs
+                ))
+            ) {
+                return;
+            }
+
+            const record = globalReliability.getQuarantine(providerId);
+            if (!record) {
+                return reply.code(404).send({
+                    error: {
+                        code: 'NOT_FOUND',
+                        message: 'Provider is not quarantined'
+                    },
+                    requestId: req.id
+                });
+            }
+
+            globalReliability.releaseQuarantine(providerId);
+            await auditMutation(
+                req,
+                'addon.quarantine.release',
+                providerId,
+                'success',
+                { before: record }
+            );
+
+            return reply.code(200).send({
+                ok: true,
+                released: providerId,
+                revision: manager.getRevision()
+            });
+        }
+    );
+
     // ── PATCH /v1/addons/:providerId ──────────────────────────────────────────
     app.patch<{
         Params: { providerId: string };

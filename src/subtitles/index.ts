@@ -11,8 +11,12 @@ import type { StremioSubtitle } from '../stremio/protocol.js';
 import { fetchSubtitles } from '../stremio/client.js';
 import { mapSubtitles } from '../stremio/mapper.js';
 import { normalizeImdb } from '../stremio/ids.js';
-import { globalMediaIdentity, MediaIdentityError } from '../media/mediaIdentity.js';
+import {
+    globalMediaIdentity,
+    MediaIdentityError
+} from '../media/mediaIdentity.js';
 import { globalReliability } from '../reliability/circuit.js';
+import { globalConcurrency } from '../concurrency/coordinator.js';
 import type { PlaybackGrantStore } from '../security/playbackGrant.js';
 
 export interface SubtitleQuery {
@@ -39,7 +43,10 @@ export async function aggregateSubtitles(
     manager: AddonManager,
     publicUrl: string,
     query: SubtitleQuery,
-    options: SubtitleAggregateOptions & { signal?: AbortSignal; deadlineMs?: number } = {}
+    options: SubtitleAggregateOptions & {
+        signal?: AbortSignal;
+        deadlineMs?: number;
+    } = {}
 ): Promise<SubtitleAggregateResult> {
     const isSeries = query.season != null && query.episode != null;
     const type: 'movie' | 'tv' = isSeries ? 'tv' : 'movie';
@@ -56,14 +63,26 @@ export async function aggregateSubtitles(
                 String(query.tmdbId),
                 query.season,
                 query.episode,
-                { signal: options.signal, deadlineMs: options.deadlineMs, allowTmdbFallback: true }
+                {
+                    signal: options.signal,
+                    deadlineMs: options.deadlineMs,
+                    allowTmdbFallback: true
+                }
             );
-            imdb = identity.media.imdbId ? normalizeImdb(identity.media.imdbId) : '';
+            imdb = identity.media.imdbId
+                ? normalizeImdb(identity.media.imdbId)
+                : '';
             // Fallback: if IMDb still missing but at least one subtitle addon supports tmdb prefix, use tmdb id directly.
             if (!imdb) {
                 const anyTmdb = manager
                     .getSubtitleEnabled()
-                    .some((a) => a.capabilities?.subtitles.some((e) => e.idPrefixes.includes('tmdb') || e.idPrefixes.some((p) => p.startsWith('tmdb'))));
+                    .some((a) =>
+                        a.capabilities?.subtitles.some(
+                            (e) =>
+                                e.idPrefixes.includes('tmdb') ||
+                                e.idPrefixes.some((p) => p.startsWith('tmdb'))
+                        )
+                    );
                 if (anyTmdb) {
                     stremioId = `tmdb:${query.tmdbId}${isSeries ? `:${query.season}:${query.episode}` : ''}`;
                 }
@@ -73,10 +92,17 @@ export async function aggregateSubtitles(
                 // Preserve taxonomy and cancellation — don't swallow TIMEOUT/ABORTED/validation
                 if (err.code === 'TIMEOUT') throw err;
                 if (err.code === 'ABORTED') throw err;
-                if (err.code === 'INVALID_TMDB_ID' || err.code === 'INVALID_SEASON_EPISODE') throw err;
+                if (
+                    err.code === 'INVALID_TMDB_ID' ||
+                    err.code === 'INVALID_SEASON_EPISODE'
+                )
+                    throw err;
             }
             // For other TMDB_NOT_FOUND etc, fall through to generic "could not resolve" but preserve message
-            if (err instanceof MediaIdentityError && err.code === 'TMDB_NOT_FOUND') {
+            if (
+                err instanceof MediaIdentityError &&
+                err.code === 'TMDB_NOT_FOUND'
+            ) {
                 return {
                     subtitles: [],
                     addonsQueried: 0,
@@ -103,11 +129,20 @@ export async function aggregateSubtitles(
 
     // Only subtitle-capable addons (capability-aware) participate
     const capable = manager.getSubtitleEnabled();
-    const raw = await collectForId(id, stremioType, manager, publicUrl, options, capable);
+    // Phase 7 §10.1 — subtitle aggregation draws from its own pool so scrape
+    // bursts cannot starve subtitle lookups (and vice versa).
+    const raw = await globalConcurrency.withSlot(
+        'subtitles',
+        () =>
+            collectForId(id, stremioType, manager, publicUrl, options, capable),
+        { signal: options.signal }
+    );
     // Language post-filter (preserve behavior: filter only when query.language supplied)
     if (query.language) {
         const lang = query.language.toLowerCase();
-        const filtered = raw.subtitles.filter((s) => s.label.toLowerCase().includes(lang));
+        const filtered = raw.subtitles.filter((s) =>
+            s.label.toLowerCase().includes(lang)
+        );
         if (filtered.length) return { ...raw, subtitles: filtered };
     }
     return raw;
@@ -118,11 +153,15 @@ async function collectForId(
     stremioType: string,
     manager: AddonManager,
     publicUrl: string,
-    options: SubtitleAggregateOptions & { signal?: AbortSignal; deadlineMs?: number },
+    options: SubtitleAggregateOptions & {
+        signal?: AbortSignal;
+        deadlineMs?: number;
+    },
     prefiltered?: ReturnType<AddonManager['getSubtitleEnabled']>
 ): Promise<SubtitleAggregateResult> {
     const capable = prefiltered ?? manager.getSubtitleEnabled();
-    if (options.signal?.aborted) throw Object.assign(new Error('Aborted'), { name: 'AbortError' });
+    if (options.signal?.aborted)
+        throw Object.assign(new Error('Aborted'), { name: 'AbortError' });
 
     const collected: StremioSubtitle[] = [];
     const urlPolicy = manager.urlPolicy();
@@ -134,31 +173,58 @@ async function collectForId(
         await Promise.all(
             batch.map(async (addon) => {
                 if (options.signal?.aborted) return;
-                const host = (() => { try { return new URL(addon.baseUrl).hostname; } catch { return undefined; } })();
+                const host = (() => {
+                    try {
+                        return new URL(addon.baseUrl).hostname;
+                    } catch {
+                        return undefined;
+                    }
+                })();
                 let release: (() => void) | null = null;
                 try {
                     // Respect circuit: skip open
-                    if (globalReliability.getState(addon.providerId) === 'open') return;
-                    if (globalReliability.getState(addon.providerId) === 'half-open' && !globalReliability.isProbeAllowed(addon.providerId)) return;
-                    release = await globalReliability.acquire(addon.providerId, host, options.signal);
+                    if (globalReliability.getState(addon.providerId) === 'open')
+                        return;
+                    if (
+                        globalReliability.getState(addon.providerId) ===
+                            'half-open' &&
+                        !globalReliability.isProbeAllowed(addon.providerId)
+                    )
+                        return;
+                    release = await globalReliability.acquire(
+                        addon.providerId,
+                        host,
+                        options.signal
+                    );
                     const start = Date.now();
                     const subs = await globalReliability.withRetry(
-                        () => fetchSubtitles(
-                            addon.baseUrl,
-                            stremioType,
-                            id,
-                            12_000,
-                            { policy: urlPolicy, signal: options.signal }
-                        ),
+                        () =>
+                            fetchSubtitles(
+                                addon.baseUrl,
+                                stremioType,
+                                id,
+                                12_000,
+                                { policy: urlPolicy, signal: options.signal }
+                            ),
                         { maxAttempts: 2, baseMs: 120, signal: options.signal }
                     );
-                    globalReliability.recordSuccess(addon.providerId, Date.now() - start);
+                    globalReliability.recordSuccess(
+                        addon.providerId,
+                        Date.now() - start
+                    );
                     collected.push(...subs);
                 } catch (err) {
-                    if ((err as Error)?.name === 'AbortError' && options.signal?.aborted) return;
+                    if (
+                        (err as Error)?.name === 'AbortError' &&
+                        options.signal?.aborted
+                    )
+                        return;
                     const kind = globalReliability.classifyError(err);
                     // Don't count abort as provider failure
-                    if (!((err as Error)?.name === 'AbortError' && options.signal?.aborted)) {
+                    if (!(
+                        (err as Error)?.name === 'AbortError' &&
+                        options.signal?.aborted
+                    )) {
                         globalReliability.recordFailure(addon.providerId, kind);
                     }
                     /* best-effort per addon */

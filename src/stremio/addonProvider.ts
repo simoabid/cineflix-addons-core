@@ -25,6 +25,8 @@ import type { PlaybackGrantStore } from '../security/playbackGrant.js';
 import { deriveCapabilities as deriveAddonCapabilities } from '../capabilities/index.js';
 import { globalSourceNormalization } from '../sources/normalization.js';
 import { globalReliability } from '../reliability/circuit.js';
+import { globalConcurrency } from '../concurrency/coordinator.js';
+import { globalProviderBudgets } from '../capacity/budgets.js';
 
 function deriveCapabilities(
     manifest: StremioManifest
@@ -41,7 +43,8 @@ function deriveCapabilities(
         }
     } else {
         const types = manifest.types;
-        if (!Array.isArray(types) || types.length === 0) return ['movies', 'tv'];
+        if (!Array.isArray(types) || types.length === 0)
+            return ['movies', 'tv'];
         for (const t of types) {
             if (t === 'movie') out.add('movies');
             if (t === 'series' || t === 'tv') out.add('tv');
@@ -119,11 +122,17 @@ export class StremioAddonProvider extends BaseProvider {
         };
     }
 
-    async getMovieSources(media: ProviderMediaObject, signal?: AbortSignal): Promise<ProviderResult> {
+    async getMovieSources(
+        media: ProviderMediaObject,
+        signal?: AbortSignal
+    ): Promise<ProviderResult> {
         return this.resolve(media, signal);
     }
 
-    async getTVSources(media: ProviderMediaObject, signal?: AbortSignal): Promise<ProviderResult> {
+    async getTVSources(
+        media: ProviderMediaObject,
+        signal?: AbortSignal
+    ): Promise<ProviderResult> {
         return this.resolve(media, signal);
     }
 
@@ -156,8 +165,12 @@ export class StremioAddonProvider extends BaseProvider {
         }
     }
 
-    private async resolve(media: ProviderMediaObject, signal?: AbortSignal): Promise<ProviderResult> {
-        if (signal?.aborted) throw Object.assign(new Error('Aborted'), { name: 'AbortError' });
+    private async resolve(
+        media: ProviderMediaObject,
+        signal?: AbortSignal
+    ): Promise<ProviderResult> {
+        if (signal?.aborted)
+            throw Object.assign(new Error('Aborted'), { name: 'AbortError' });
         const stremioType = toStremioType(media.type);
         const candidates = buildIdCandidates(this.manifest, media);
 
@@ -186,18 +199,46 @@ export class StremioAddonProvider extends BaseProvider {
             };
         }
 
+        // Phase 7 §10.4 — quarantined providers never serve traffic (the
+        // selection service filters them too; this is the defense in depth).
+        if (this.reliability.isQuarantined(this.id)) {
+            const q = this.reliability.getQuarantine(this.id);
+            return this.emptyResult(
+                `quarantined: ${q?.reason ?? 'repeated failures'}`
+            );
+        }
+
         const diagnostics: Diagnostic[] = [];
         const dedupSeen = new Set<string>();
 
         for (const id of candidates) {
-            if (signal?.aborted) throw Object.assign(new Error('Aborted'), { name: 'AbortError' });
+            if (signal?.aborted)
+                throw Object.assign(new Error('Aborted'), {
+                    name: 'AbortError'
+                });
             // Short negative cache: if last attempt for this exact id was "no stream" very recently, skip
-            if (this.reliability.hasNegative(this.id, 'no_stream') && this.reliability.hasNegative(`${this.id}:${id}`, 'no_stream' as never)) {
+            if (
+                this.reliability.hasNegative(this.id, 'no_stream') &&
+                this.reliability.hasNegative(
+                    `${this.id}:${id}`,
+                    'no_stream' as never
+                )
+            ) {
                 continue;
+            }
+            // Phase 7 §10.4 — per-provider daily call budget guard.
+            const budget = globalProviderBudgets.consume(this.id);
+            if (!budget.allowed) {
+                return this.emptyResult(
+                    `daily call budget exhausted (${budget.limit}/day, resets ${new Date(budget.resetAt ?? 0).toISOString()})`
+                );
             }
             // Half-open single-trial gate
             const state = this.reliability.getState(this.id);
-            if (state === 'half-open' && !this.reliability.isProbeAllowed(this.id)) {
+            if (
+                state === 'half-open' &&
+                !this.reliability.isProbeAllowed(this.id)
+            ) {
                 continue;
             }
 
@@ -212,20 +253,29 @@ export class StremioAddonProvider extends BaseProvider {
             let release: (() => void) | null = null;
             const start = Date.now();
             try {
-                if (signal?.aborted) throw Object.assign(new Error('Aborted'), { name: 'AbortError' });
+                if (signal?.aborted)
+                    throw Object.assign(new Error('Aborted'), {
+                        name: 'AbortError'
+                    });
                 // Per-provider + per-host concurrency gate — cancellable
                 release = await this.reliability.acquire(this.id, host, signal);
                 const latencyStart = Date.now();
 
-                // Retry only transient failures — cancellable
+                // Retry only transient failures — cancellable; stream calls
+                // draw from the provider-stream pool (Phase 7 §10.1).
                 const streams = await this.reliability.withRetry(
                     () =>
-                        fetchStreams(
-                            this.BASE_URL,
-                            stremioType,
-                            id,
-                            this.streamTimeoutMs,
-                            { policy: this.urlPolicy, signal }
+                        globalConcurrency.withSlot(
+                            'provider-stream',
+                            () =>
+                                fetchStreams(
+                                    this.BASE_URL,
+                                    stremioType,
+                                    id,
+                                    this.streamTimeoutMs,
+                                    { policy: this.urlPolicy, signal }
+                                ),
+                            { signal }
                         ),
                     { maxAttempts: 2, baseMs: 150, signal }
                 );
@@ -233,16 +283,28 @@ export class StremioAddonProvider extends BaseProvider {
                 const latency = Date.now() - latencyStart;
 
                 if (!streams.length) {
-                    this.reliability.recordFailure(this.id, 'no_stream', latency);
+                    this.reliability.recordFailure(
+                        this.id,
+                        'no_stream',
+                        latency
+                    );
                     // Remember per-id negative cache
                     // (use a side map via negative cache key trick)
-                    (this.reliability as unknown as { negative: Map<string, unknown> }).negative.set(`${this.id}:${id}:no_stream`, { expiresAt: Date.now() + 30_000 });
+                    (
+                        this.reliability as unknown as {
+                            negative: Map<string, unknown>;
+                        }
+                    ).negative.set(`${this.id}:${id}:no_stream`, {
+                        expiresAt: Date.now() + 30_000
+                    });
                     continue;
                 }
 
                 this.reliability.recordSuccess(this.id, latency);
 
-                const responseCacheMaxAge = (streams as unknown as { cacheMaxAge?: number }).cacheMaxAge;
+                const responseCacheMaxAge = (
+                    streams as unknown as { cacheMaxAge?: number }
+                ).cacheMaxAge;
                 // Source normalization: http direct streams via centralized service
                 // Provides typing, quality, hdr, codec, dedup, stable ids, grant creation.
                 // Pass probe=true to enable bounded HEAD/range validation without full download.
@@ -299,7 +361,9 @@ export class StremioAddonProvider extends BaseProvider {
                 );
                 return { sources, subtitles, diagnostics };
             } catch (err) {
-                const isAbort = (err as Error)?.name === 'AbortError' || (err as Error)?.name === 'TimeoutError';
+                const isAbort =
+                    (err as Error)?.name === 'AbortError' ||
+                    (err as Error)?.name === 'TimeoutError';
                 const latency = Date.now() - start;
                 // Don't penalize circuit for user-initiated abort/cancellation
                 if (!(isAbort && signal?.aborted)) {
@@ -343,28 +407,45 @@ export class StremioAddonProvider extends BaseProvider {
             // Wrap subtitle fetch in same reliability policy as streams (single trial)
             if (this.reliability.getState(this.id) === 'open') {
                 // Skip if circuit open
-            } else if (this.reliability.getState(this.id) === 'half-open' && !this.reliability.isProbeAllowed(this.id)) {
+            } else if (
+                this.reliability.getState(this.id) === 'half-open' &&
+                !this.reliability.isProbeAllowed(this.id)
+            ) {
                 // Another half-open trial in flight
             } else {
                 let release: (() => void) | null = null;
                 try {
-                    const host = (() => { try { return new URL(this.BASE_URL).hostname; } catch { return undefined; } })();
-                    release = await this.reliability.acquire(this.id, host, signal);
+                    const host = (() => {
+                        try {
+                            return new URL(this.BASE_URL).hostname;
+                        } catch {
+                            return undefined;
+                        }
+                    })();
+                    release = await this.reliability.acquire(
+                        this.id,
+                        host,
+                        signal
+                    );
                     const start = Date.now();
                     const subs = await this.reliability.withRetry(
-                        () => fetchSubtitles(
-                            this.BASE_URL,
-                            stremioType,
-                            id,
-                            12_000,
-                            { policy: this.urlPolicy, signal }
-                        ),
+                        () =>
+                            fetchSubtitles(
+                                this.BASE_URL,
+                                stremioType,
+                                id,
+                                12_000,
+                                { policy: this.urlPolicy, signal }
+                            ),
                         { maxAttempts: 2, baseMs: 120, signal }
                     );
                     this.reliability.recordSuccess(this.id, Date.now() - start);
                     collected.push(...subs);
                 } catch (err) {
-                    if ((err as Error)?.name === 'AbortError' && signal?.aborted) {
+                    if (
+                        (err as Error)?.name === 'AbortError' &&
+                        signal?.aborted
+                    ) {
                         // cancellation — don't record as failure
                     } else {
                         const kind = this.reliability.classifyError(err);

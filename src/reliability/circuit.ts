@@ -21,6 +21,26 @@ export type FailureKind =
 
 export type CircuitState = 'closed' | 'open' | 'half-open';
 
+export interface QuarantineOptions {
+    /** Enable automatic quarantine on repeated circuit opens. */
+    enabled?: boolean;
+    /** Circuit opens within the window that trigger quarantine (default 5). */
+    openThreshold?: number;
+    /** Rolling window for counting circuit opens (ms, default 1h). */
+    windowMs?: number;
+    /** Auto-release after this long; 0 = manual release only (default 6h). */
+    ttlMs?: number;
+}
+
+export interface QuarantineRecord {
+    providerId: string;
+    reason: string;
+    since: number;
+    opensInWindow: number;
+    /** Epoch ms after which the quarantine auto-releases (null = manual). */
+    until: number | null;
+}
+
 interface CircuitRecord {
     state: CircuitState;
     failures: number;
@@ -49,17 +69,46 @@ interface NegativeEntry {
 
 export class ReliabilityRegistry {
     private circuits = new Map<string, CircuitRecord>();
-    private semaphores = new Map<string, { count: number; limit: number; queue: Array<{ resolve: () => void; reject: (e: Error) => void; signal?: AbortSignal }> }>();
+    private semaphores = new Map<
+        string,
+        {
+            count: number;
+            limit: number;
+            queue: Array<{
+                resolve: () => void;
+                reject: (e: Error) => void;
+                signal?: AbortSignal;
+            }>;
+        }
+    >();
     private negative = new Map<string, NegativeEntry>();
     private metrics = new Map<
         string,
-        { attempts: number; successes: number; failures: number; noResult: number; latencySum: number; lastLatency?: number }
+        {
+            attempts: number;
+            successes: number;
+            failures: number;
+            noResult: number;
+            latencySum: number;
+            lastLatency?: number;
+        }
     >();
     private opts: Required<ReliabilityOptions>;
-    private hostSemaphores = new Map<string, { count: number; limit: number }>();
+    private hostSemaphores = new Map<
+        string,
+        { count: number; limit: number }
+    >();
     private halfOpenInFlight = new Set<string>();
 
-    constructor(opts: ReliabilityOptions = {}) {
+    // ── Phase 7 §10.4: provider quarantine ───────────────────────────────────
+    private quarantineOpts: Required<QuarantineOptions>;
+    private quarantines = new Map<string, QuarantineRecord>();
+    private circuitOpens = new Map<string, number[]>();
+
+    constructor(
+        opts: ReliabilityOptions = {},
+        quarantineOpts: QuarantineOptions = {}
+    ) {
         this.opts = {
             failureThreshold: opts.failureThreshold ?? 5,
             openTtlMs: opts.openTtlMs ?? 30_000,
@@ -67,6 +116,29 @@ export class ReliabilityRegistry {
             concurrencyLimit: opts.concurrencyLimit ?? 4,
             negativeTtlMs: opts.negativeTtlMs ?? 30_000
         };
+        this.quarantineOpts = {
+            enabled: quarantineOpts.enabled ?? false,
+            openThreshold: quarantineOpts.openThreshold ?? 5,
+            windowMs: quarantineOpts.windowMs ?? 3_600_000,
+            ttlMs: quarantineOpts.ttlMs ?? 21_600_000
+        };
+    }
+
+    /** Configure quarantine policy at boot (server.ts wires AppConfig here). */
+    configureQuarantine(opts: QuarantineOptions): void {
+        this.quarantineOpts = {
+            ...this.quarantineOpts,
+            ...Object.fromEntries(
+                Object.entries(opts).filter(([, v]) => v !== undefined)
+            )
+        } as Required<QuarantineOptions>;
+    }
+
+    /** Update runtime concurrency policy (server.ts wires AppConfig here). */
+    configureConcurrency(concurrencyLimit: number): void {
+        if (Number.isFinite(concurrencyLimit) && concurrencyLimit > 0) {
+            this.opts.concurrencyLimit = Math.floor(concurrencyLimit);
+        }
     }
 
     getState(providerId: string): CircuitState {
@@ -107,7 +179,10 @@ export class ReliabilityRegistry {
         m.latencySum += latencyMs;
         m.lastLatency = latencyMs;
 
-        if (rec.state === 'half-open' && rec.successes >= this.opts.halfOpenSuccessThreshold) {
+        if (
+            rec.state === 'half-open' &&
+            rec.successes >= this.opts.halfOpenSuccessThreshold
+        ) {
             rec.state = 'closed';
             rec.failures = 0;
             rec.successes = 0;
@@ -120,7 +195,11 @@ export class ReliabilityRegistry {
         }
     }
 
-    recordFailure(providerId: string, kind: FailureKind, latencyMs?: number): void {
+    recordFailure(
+        providerId: string,
+        kind: FailureKind,
+        latencyMs?: number
+    ): void {
         const rec = this.ensureCircuit(providerId);
         rec.failures += 1;
         rec.successes = 0;
@@ -137,38 +216,134 @@ export class ReliabilityRegistry {
         if (kind === 'no_stream' || kind === 'no_compatible_id') {
             // Short negative cache rather than opening circuit for "no result"
             const key = `${providerId}:${kind}`;
-            this.negative.set(key, { expiresAt: Date.now() + this.opts.negativeTtlMs });
+            this.negative.set(key, {
+                expiresAt: Date.now() + this.opts.negativeTtlMs
+            });
             m.noResult += 1;
             // However, if we were half-open, a no-result still counts as a failed trial and must reopen
             if (wasHalfOpen) {
                 rec.state = 'open';
                 rec.openedAt = Date.now();
                 this.releaseHalfOpen(providerId);
+                this.noteCircuitOpened(providerId);
             }
             return;
         }
-        if (rec.failures >= this.opts.failureThreshold && rec.state === 'closed') {
+        if (
+            rec.failures >= this.opts.failureThreshold &&
+            rec.state === 'closed'
+        ) {
             rec.state = 'open';
             rec.openedAt = Date.now();
+            this.noteCircuitOpened(providerId);
         } else if (wasHalfOpen) {
             rec.state = 'open';
             rec.openedAt = Date.now();
             this.releaseHalfOpen(providerId);
+            this.noteCircuitOpened(providerId);
         }
+    }
+
+    /**
+     * Track circuit-open transitions and auto-quarantine providers that open
+     * repeatedly within the rolling window (Phase 7 §10.4). Quarantined
+     * providers are excluded from selection until manual release or TTL.
+     */
+    private noteCircuitOpened(providerId: string): void {
+        const q = this.quarantineOpts;
+        if (!q.enabled) return;
+        const now = Date.now();
+        const opens = (this.circuitOpens.get(providerId) ?? []).filter(
+            (t) => now - t < q.windowMs
+        );
+        opens.push(now);
+        this.circuitOpens.set(providerId, opens);
+        if (
+            opens.length >= q.openThreshold &&
+            !this.isQuarantined(providerId)
+        ) {
+            this.quarantine(
+                providerId,
+                `circuit opened ${opens.length} times in ${Math.round(q.windowMs / 60000)}m window`
+            );
+        }
+    }
+
+    // ── quarantine API ───────────────────────────────────────────────────────
+
+    quarantine(
+        providerId: string,
+        reason: string,
+        opts?: { ttlMs?: number }
+    ): void {
+        const ttl =
+            opts?.ttlMs != null ? opts.ttlMs : this.quarantineOpts.ttlMs;
+        this.quarantines.set(providerId, {
+            providerId,
+            reason,
+            since: Date.now(),
+            opensInWindow: (this.circuitOpens.get(providerId) ?? []).length,
+            until: ttl > 0 ? Date.now() + ttl : null
+        });
+    }
+
+    releaseQuarantine(providerId: string): boolean {
+        this.circuitOpens.delete(providerId);
+        return this.quarantines.delete(providerId);
+    }
+
+    isQuarantined(providerId: string): boolean {
+        const rec = this.quarantines.get(providerId);
+        if (!rec) return false;
+        if (rec.until != null && Date.now() > rec.until) {
+            this.quarantines.delete(providerId);
+            this.circuitOpens.delete(providerId);
+            return false;
+        }
+        return true;
+    }
+
+    getQuarantine(providerId: string): QuarantineRecord | null {
+        if (!this.isQuarantined(providerId)) return null;
+        return this.quarantines.get(providerId) ?? null;
+    }
+
+    listQuarantined(): QuarantineRecord[] {
+        for (const id of [...this.quarantines.keys()]) {
+            this.isQuarantined(id); // lazy TTL expiry
+        }
+        return [...this.quarantines.values()];
     }
 
     classifyError(err: unknown): FailureKind {
         if (!err || typeof err !== 'object') return 'unknown';
         const errName = (err as Error).name ?? '';
-        if (errName === 'TimeoutError' || (err as { code?: string }).code === 'TIMEOUT') return 'timeout';
+        if (
+            errName === 'TimeoutError' ||
+            (err as { code?: string }).code === 'TIMEOUT'
+        )
+            return 'timeout';
         const msg = (err as Error).message?.toLowerCase() ?? '';
-        if (msg.includes('timed out') || msg.includes('timeout')) return 'timeout';
-        if (msg.includes('dns') || msg.includes('enotfound') || msg.includes('eai_again')) return 'dns';
-        if (msg.includes('http 4') || (err as { status?: number }).status === 404 || (err as { status?: number }).status === 401) return 'http_4xx';
+        if (msg.includes('timed out') || msg.includes('timeout'))
+            return 'timeout';
+        if (
+            msg.includes('dns') ||
+            msg.includes('enotfound') ||
+            msg.includes('eai_again')
+        )
+            return 'dns';
+        if (
+            msg.includes('http 4') ||
+            (err as { status?: number }).status === 404 ||
+            (err as { status?: number }).status === 401
+        )
+            return 'http_4xx';
         if (msg.includes('http 5') || msg.includes('50')) return 'http_5xx';
-        if (msg.includes('malformed') || msg.includes('json')) return 'malformed';
+        if (msg.includes('malformed') || msg.includes('json'))
+            return 'malformed';
         if (msg.includes('debrid')) return 'debrid_unavailable';
-        if (msg.includes('no stream') || msg.includes('no compatible')) return 'no_stream';
+        if (msg.includes('no stream') || msg.includes('no compatible'))
+            return 'no_stream';
         return 'transport';
     }
 
@@ -185,14 +360,27 @@ export class ReliabilityRegistry {
 
     // ── concurrency semaphore ────────────────────────────────────────────────
 
-    async acquire(providerId: string, host?: string, signal?: AbortSignal): Promise<() => void> {
-        if (signal?.aborted) throw Object.assign(new Error('Aborted'), { name: 'AbortError' });
+    async acquire(
+        providerId: string,
+        host?: string,
+        signal?: AbortSignal
+    ): Promise<() => void> {
+        if (signal?.aborted)
+            throw Object.assign(new Error('Aborted'), { name: 'AbortError' });
         // Per-provider semaphore
-        await this.acquireSemaphore(providerId, this.opts.concurrencyLimit, signal);
+        await this.acquireSemaphore(
+            providerId,
+            this.opts.concurrencyLimit,
+            signal
+        );
         let hostRelease: (() => void) | null = null;
         if (host) {
             try {
-                await this.acquireSemaphore(`host:${host}`, this.opts.concurrencyLimit * 2, signal);
+                await this.acquireSemaphore(
+                    `host:${host}`,
+                    this.opts.concurrencyLimit * 2,
+                    signal
+                );
                 hostRelease = () => this.releaseSemaphore(`host:${host}`);
             } catch (err) {
                 this.releaseSemaphore(providerId);
@@ -208,7 +396,11 @@ export class ReliabilityRegistry {
         };
     }
 
-    private acquireSemaphore(key: string, limit: number, signal?: AbortSignal): Promise<void> {
+    private acquireSemaphore(
+        key: string,
+        limit: number,
+        signal?: AbortSignal
+    ): Promise<void> {
         let sem = this.semaphores.get(key);
         if (!sem) {
             sem = { count: 0, limit, queue: [] };
@@ -235,7 +427,11 @@ export class ReliabilityRegistry {
                     const idx = sem!.queue.indexOf(entry);
                     if (idx !== -1) sem!.queue.splice(idx, 1);
                     signal.removeEventListener('abort', onAbort);
-                    reject(Object.assign(new Error('Aborted'), { name: 'AbortError' }));
+                    reject(
+                        Object.assign(new Error('Aborted'), {
+                            name: 'AbortError'
+                        })
+                    );
                 };
                 if (signal.aborted) onAbort();
                 else signal.addEventListener('abort', onAbort, { once: true });
@@ -264,37 +460,59 @@ export class ReliabilityRegistry {
      * Only retries on retryable kinds (timeout, transport, http_5xx).
      */
     isRetryable(kind: FailureKind): boolean {
-        return kind === 'timeout' || kind === 'transport' || kind === 'http_5xx' || kind === 'dns';
+        return (
+            kind === 'timeout' ||
+            kind === 'transport' ||
+            kind === 'http_5xx' ||
+            kind === 'dns'
+        );
     }
 
     async withRetry<T>(
         fn: () => Promise<T>,
-        opts: { maxAttempts?: number; baseMs?: number; signal?: AbortSignal } = {}
+        opts: {
+            maxAttempts?: number;
+            baseMs?: number;
+            signal?: AbortSignal;
+        } = {}
     ): Promise<T> {
         const maxAttempts = opts.maxAttempts ?? 3;
         const baseMs = opts.baseMs ?? 200;
         const signal = opts.signal;
-        if (signal?.aborted) throw Object.assign(new Error('Aborted'), { name: 'AbortError' });
+        if (signal?.aborted)
+            throw Object.assign(new Error('Aborted'), { name: 'AbortError' });
         let lastErr: unknown;
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
-            if (signal?.aborted) throw Object.assign(new Error('Aborted'), { name: 'AbortError' });
+            if (signal?.aborted)
+                throw Object.assign(new Error('Aborted'), {
+                    name: 'AbortError'
+                });
             try {
                 return await fn();
             } catch (err) {
                 lastErr = err;
                 if (signal?.aborted) throw err;
                 const kind = this.classifyError(err);
-                if (attempt === maxAttempts - 1 || !this.isRetryable(kind)) throw err;
-                const backoff = baseMs * Math.pow(2, attempt) + Math.random() * 100;
+                if (attempt === maxAttempts - 1 || !this.isRetryable(kind))
+                    throw err;
+                const backoff =
+                    baseMs * Math.pow(2, attempt) + Math.random() * 100;
                 await new Promise<void>((resolve, reject) => {
                     const timer = setTimeout(resolve, backoff);
                     if (signal) {
                         const onAbort = () => {
                             clearTimeout(timer);
-                            reject(Object.assign(new Error('Aborted'), { name: 'AbortError' }));
+                            reject(
+                                Object.assign(new Error('Aborted'), {
+                                    name: 'AbortError'
+                                })
+                            );
                         };
                         if (signal.aborted) onAbort();
-                        else signal.addEventListener('abort', onAbort, { once: true });
+                        else
+                            signal.addEventListener('abort', onAbort, {
+                                once: true
+                            });
                     }
                 });
             }
@@ -304,7 +522,13 @@ export class ReliabilityRegistry {
 
     // ── metrics ─────────────────────────────────────────────────────────────
 
-    getMetrics(providerId: string): { attempts: number; successes: number; failures: number; noResult: number; avgLatency?: number } {
+    getMetrics(providerId: string): {
+        attempts: number;
+        successes: number;
+        failures: number;
+        noResult: number;
+        avgLatency?: number;
+    } {
         const m = this.metrics.get(providerId);
         if (!m) return { attempts: 0, successes: 0, failures: 0, noResult: 0 };
         return {
@@ -312,17 +536,47 @@ export class ReliabilityRegistry {
             successes: m.successes,
             failures: m.failures,
             noResult: m.noResult,
-            avgLatency: m.attempts ? Math.round(m.latencySum / m.attempts) : undefined
+            avgLatency: m.attempts
+                ? Math.round(m.latencySum / m.attempts)
+                : undefined
         };
     }
 
-    snapshot(): Record<string, { state: CircuitState; metrics: ReturnType<ReliabilityRegistry['getMetrics']> }> {
-        const out: Record<string, { state: CircuitState; metrics: ReturnType<ReliabilityRegistry['getMetrics']> }> = {};
+    snapshot(): Record<
+        string,
+        {
+            state: CircuitState;
+            metrics: ReturnType<ReliabilityRegistry['getMetrics']>;
+            quarantined?: boolean;
+            quarantine?: QuarantineRecord;
+        }
+    > {
+        const out: Record<
+            string,
+            {
+                state: CircuitState;
+                metrics: ReturnType<ReliabilityRegistry['getMetrics']>;
+                quarantined?: boolean;
+                quarantine?: QuarantineRecord;
+            }
+        > = {};
         for (const [id] of this.metrics) {
-            out[id] = { state: this.getState(id), metrics: this.getMetrics(id) };
+            const quarantine = this.getQuarantine(id);
+            out[id] = {
+                state: this.getState(id),
+                metrics: this.getMetrics(id),
+                ...(quarantine ? { quarantined: true, quarantine } : {})
+            };
         }
         for (const [id, rec] of this.circuits) {
-            if (!out[id]) out[id] = { state: rec.state, metrics: this.getMetrics(id) };
+            if (!out[id]) {
+                const quarantine = this.getQuarantine(id);
+                out[id] = {
+                    state: rec.state,
+                    metrics: this.getMetrics(id),
+                    ...(quarantine ? { quarantined: true, quarantine } : {})
+                };
+            }
         }
         return out;
     }
@@ -336,10 +590,23 @@ export class ReliabilityRegistry {
         return rec;
     }
 
-    private ensureMetrics(providerId: string): { attempts: number; successes: number; failures: number; noResult: number; latencySum: number; lastLatency?: number } {
+    private ensureMetrics(providerId: string): {
+        attempts: number;
+        successes: number;
+        failures: number;
+        noResult: number;
+        latencySum: number;
+        lastLatency?: number;
+    } {
         let m = this.metrics.get(providerId);
         if (!m) {
-            m = { attempts: 0, successes: 0, failures: 0, noResult: 0, latencySum: 0 };
+            m = {
+                attempts: 0,
+                successes: 0,
+                failures: 0,
+                noResult: 0,
+                latencySum: 0
+            };
             this.metrics.set(providerId, m);
         }
         return m;

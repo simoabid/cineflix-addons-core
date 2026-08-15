@@ -15,6 +15,7 @@ import type { InstalledAddon } from '../addons/types.js';
 import { buildIdCandidates } from '../stremio/ids.js';
 import { sortAddons } from '../priority.js';
 import type { ReliabilityRegistry } from '../reliability/circuit.js';
+import type { ProviderBudgetRegistry } from '../capacity/budgets.js';
 
 export interface SelectionOptions {
     /** Optional explicit allowlist (e.g. user-scoped). */
@@ -23,6 +24,8 @@ export interface SelectionOptions {
     includeCircuitOpen?: boolean;
     /** Whether to include unhealthy providers (default false — skip unhealthy). */
     includeUnhealthy?: boolean;
+    /** Include quarantined / budget-exhausted providers (diagnostics only). */
+    includeQuarantined?: boolean;
     /** Abort signal for candidate building (pass-through). */
     signal?: AbortSignal;
 }
@@ -36,7 +39,9 @@ export interface RankedProvider {
 export class ProviderSelectionService {
     constructor(
         private readonly manager: AddonManager,
-        private readonly reliability?: ReliabilityRegistry
+        private readonly reliability?: ReliabilityRegistry,
+        /** Phase 7 §10.4 — providers with exhausted daily budgets are skipped. */
+        private readonly budgets?: ProviderBudgetRegistry
     ) {}
 
     get revision(): number {
@@ -56,7 +61,25 @@ export class ProviderSelectionService {
 
         // Filter by explicit allowlist if provided
         if (opts.allowedIds) {
-            candidates = candidates.filter((a) => opts.allowedIds!.has(a.providerId));
+            candidates = candidates.filter((a) =>
+                opts.allowedIds!.has(a.providerId)
+            );
+        }
+
+        // Phase 7 §10.4 — quarantined providers never serve traffic until
+        // released (manual or TTL); they stay visible via /debug endpoints.
+        if (!opts.includeQuarantined && this.reliability) {
+            candidates = candidates.filter(
+                (a) => !this.reliability!.isQuarantined(a.providerId)
+            );
+        }
+
+        // Phase 7 §10.4 — providers whose daily call budget is exhausted are
+        // skipped until the UTC-day window resets.
+        if (!opts.includeQuarantined && this.budgets) {
+            candidates = candidates.filter(
+                (a) => !this.budgets!.isExhausted(a.providerId)
+            );
         }
 
         // Filter by circuit state (open = recently failed, skip unless requested)
@@ -71,13 +94,19 @@ export class ProviderSelectionService {
         // Filter by health state (unhealthy = skip unless explicitly included)
         if (!opts.includeUnhealthy) {
             candidates = candidates.filter((a) => {
-                const h = (a as unknown as { health?: { healthy: boolean; lastChecked?: string } }).health;
+                const h = (
+                    a as unknown as {
+                        health?: { healthy: boolean; lastChecked?: string };
+                    }
+                ).health;
                 if (!h) return true;
                 if (h.healthy === false) {
                     // Consider freshness: if lastChecked is stale (>30m), allow retry
                     if (h.lastChecked) {
-                        const age = Date.now() - new Date(h.lastChecked).getTime();
-                        if (Number.isFinite(age) && age > 30 * 60 * 1000) return true;
+                        const age =
+                            Date.now() - new Date(h.lastChecked).getTime();
+                        if (Number.isFinite(age) && age > 30 * 60 * 1000)
+                            return true;
                     }
                     return false;
                 }
@@ -91,7 +120,10 @@ export class ProviderSelectionService {
             if (!caps) return true; // no caps = assume ok (should not happen)
             const types = caps.stream.flatMap((e) => e.mediaTypes);
             if (media.type === 'tv') {
-                return types.includes('series' as never) || types.includes('tv' as never);
+                return (
+                    types.includes('series' as never) ||
+                    types.includes('tv' as never)
+                );
             }
             return types.includes('movie' as never);
         });
@@ -147,10 +179,18 @@ export class ProviderSelectionService {
         media: ProviderMediaObject,
         fetcher: (addon: InstalledAddon) => Promise<T>,
         opts: { concurrency?: number; signal?: AbortSignal } = {}
-    ): Promise<Array<{ addon: InstalledAddon; result: T | null; error?: string }>> {
-        const providers = this.selectStreamProviders(media, { signal: opts.signal });
+    ): Promise<
+        Array<{ addon: InstalledAddon; result: T | null; error?: string }>
+    > {
+        const providers = this.selectStreamProviders(media, {
+            signal: opts.signal
+        });
         const concurrency = opts.concurrency ?? 4;
-        const results: Array<{ addon: InstalledAddon; result: T | null; error?: string }> = [];
+        const results: Array<{
+            addon: InstalledAddon;
+            result: T | null;
+            error?: string;
+        }> = [];
 
         for (let i = 0; i < providers.length; i += concurrency) {
             if (opts.signal?.aborted) break;
@@ -164,14 +204,20 @@ export class ProviderSelectionService {
                         return {
                             addon,
                             result: null,
-                            error: err instanceof Error ? err.message : String(err)
+                            error:
+                                err instanceof Error ? err.message : String(err)
                         };
                     }
                 })
             );
             for (const s of settled) {
                 if (s.status === 'fulfilled') results.push(s.value);
-                else results.push({ addon: batch[0], result: null, error: String(s.reason) });
+                else
+                    results.push({
+                        addon: batch[0],
+                        result: null,
+                        error: String(s.reason)
+                    });
             }
         }
 
@@ -193,10 +239,13 @@ export class ProviderSelectionService {
             signal?: AbortSignal;
         } = {}
     ): Promise<Array<{ addon: InstalledAddon; result: T | null }>> {
-        const providers = this.selectStreamProviders(media, { signal: opts.signal });
+        const providers = this.selectStreamProviders(media, {
+            signal: opts.signal
+        });
         const targetCount = opts.targetCount ?? 3;
         const concurrency = opts.concurrency ?? 2;
-        const collected: Array<{ addon: InstalledAddon; result: T | null }> = [];
+        const collected: Array<{ addon: InstalledAddon; result: T | null }> =
+            [];
         let totalSources = 0;
 
         for (let i = 0; i < providers.length; i += concurrency) {
@@ -215,7 +264,8 @@ export class ProviderSelectionService {
             );
             for (const r of batchResults) {
                 collected.push(r);
-                totalSources += (r.result?.sources as unknown[] | undefined)?.length ?? 0;
+                totalSources +=
+                    (r.result?.sources as unknown[] | undefined)?.length ?? 0;
             }
             if (totalSources >= targetCount) break;
         }

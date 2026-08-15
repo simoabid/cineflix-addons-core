@@ -21,9 +21,16 @@ import {
 } from './playbackGrant.js';
 import { validateOutboundUrl, UrlPolicyError } from './urlPolicy.js';
 import { createRateLimiter, RATE_LIMITS, rateLimitKey } from './rateLimit.js';
-import { scrapeFetch } from '../egress/scrapeFetch.js';
+import { scrapeFetch, shouldProxyUrl } from '../egress/scrapeFetch.js';
 import { getRateLimitIp } from './auth.js';
 import { globalMetrics } from '../metrics/index.js';
+import { globalConcurrency } from '../concurrency/coordinator.js';
+import {
+    StreamConcurrencyError,
+    StreamConcurrencyTracker,
+    EgressBudgetMonitor
+} from '../capacity/index.js';
+import { logger } from '../telemetry/logger.js';
 
 const HOP_BY_HOP = new Set([
     'connection',
@@ -42,6 +49,12 @@ const HOP_BY_HOP = new Set([
 
 export interface SecureProxyContext {
     grants: PlaybackGrantStore;
+    /** Phase 7 §10.4 — concurrent stream caps (per IP / user / global). */
+    streams?: StreamConcurrencyTracker;
+    /** Phase 7 §10.4 — egress byte budget accounting. */
+    egress?: EgressBudgetMonitor;
+    /** Phase 7 §10.4 — max child grants a single manifest rewrite may mint. */
+    maxGrantsPerRequest?: number;
 }
 
 export function createSecureProxyContext(cfg: AppConfig): SecureProxyContext {
@@ -83,6 +96,8 @@ export function createSecureProxyContext(cfg: AppConfig): SecureProxyContext {
     const grants = createPlaybackGrantStore({
         signingSecret: secret,
         defaultTtlSec: cfg.playbackGrantTtlSec,
+        // Phase 7 §10.4 — hard cap on concurrent active grants.
+        maxActive: cfg.playbackGrantMaxActive,
         urlPolicy: {
             allowHttp: cfg.allowHttpUpstreams,
             hostAllowlist:
@@ -105,6 +120,32 @@ export function createSecureProxyContext(cfg: AppConfig): SecureProxyContext {
             : {})
     });
     return { grants };
+}
+
+/**
+ * Build the Phase 7 §10.4 capacity guards for the proxy context
+ * (stream concurrency caps + egress budget). Called from server.ts so the
+ * same instances feed /health/status and /metrics.
+ */
+export function createProxyCapacityGuards(cfg: AppConfig): {
+    streams: StreamConcurrencyTracker;
+    egress: EgressBudgetMonitor;
+    maxGrantsPerRequest: number;
+} {
+    const useRedis = cfg.cacheType === 'redis' || cfg.store === 'redis';
+    return {
+        streams: new StreamConcurrencyTracker({
+            maxPerIp: cfg.maxConcurrentStreamsPerIp,
+            maxPerUser: cfg.maxConcurrentStreamsPerUser,
+            maxGlobal: cfg.maxConcurrentStreamsGlobal,
+            redis: useRedis ? cfg.redis : undefined
+        }),
+        egress: new EgressBudgetMonitor({
+            dailyBudgetBytes: cfg.egressDailyBudgetMb * 1024 * 1024,
+            proxyBudgetBytes: cfg.egressProxyDailyBudgetMb * 1024 * 1024
+        }),
+        maxGrantsPerRequest: cfg.playbackGrantMaxPerRequest
+    };
 }
 
 function clientIp(
@@ -184,12 +225,20 @@ function isDashManifest(
     return false;
 }
 
+/** Per-request child-grant budget (Phase 7 §10.4): stops manifest rewrites
+ * from minting unbounded segment grants; remaining URLs keep their upstream
+ * form once the budget is spent. */
+interface GrantBudget {
+    remaining: number;
+}
+
 async function rewriteDashManifest(
     body: string,
     manifestUrl: string,
     grant: PlaybackGrantClaims,
     ctx: SecureProxyContext,
-    publicBase: string
+    publicBase: string,
+    budget: GrantBudget
 ): Promise<string> {
     const base = new URL(manifestUrl);
     const ttlSec = Math.max(60, grant.exp - Math.floor(Date.now() / 1000));
@@ -200,6 +249,7 @@ async function rewriteDashManifest(
     async function grantFor(raw: string): Promise<string | null> {
         const trimmed = raw.trim();
         if (!trimmed) return null;
+        if (budget.remaining <= 0) return null;
         if (/^\$[^$]+\$$/.test(trimmed)) return null;
         // Detect DASH template variables
         const isTemplate = trimmed.includes('$');
@@ -225,6 +275,7 @@ async function rewriteDashManifest(
                     ttlSec,
                     maxRedirects: grant.maxRedirects
                 });
+                budget.remaining--;
                 const proxyBase = ctx.grants.toProxyUrl(child, publicBase);
                 // Preserve the template suffix including variables
                 // Compute the suffix relative to baseDir
@@ -246,6 +297,7 @@ async function rewriteDashManifest(
                 ttlSec,
                 maxRedirects: grant.maxRedirects
             });
+            budget.remaining--;
             return ctx.grants.toProxyUrl(child, publicBase);
         } catch {
             return null;
@@ -343,11 +395,19 @@ async function rewriteManifest(
     grant: PlaybackGrantClaims,
     ctx: SecureProxyContext,
     publicBase: string,
-    contentType = ''
+    contentType = '',
+    budget: GrantBudget
 ): Promise<string> {
     // Route to DASH-aware rewriter when needed; HLS remains line-based.
     if (isDashManifest(body, contentType, manifestUrl)) {
-        return rewriteDashManifest(body, manifestUrl, grant, ctx, publicBase);
+        return rewriteDashManifest(
+            body,
+            manifestUrl,
+            grant,
+            ctx,
+            publicBase,
+            budget
+        );
     }
     const base = new URL(manifestUrl);
     const lines = body.split(/\r?\n/);
@@ -358,7 +418,14 @@ async function rewriteManifest(
         if (!trimmed || trimmed.startsWith('#')) {
             if (trimmed.startsWith('#') && /URI="/i.test(trimmed)) {
                 out.push(
-                    await replaceUriAttrs(trimmed, base, grant, ctx, publicBase)
+                    await replaceUriAttrs(
+                        trimmed,
+                        base,
+                        grant,
+                        ctx,
+                        publicBase,
+                        budget
+                    )
                 );
             } else {
                 out.push(line);
@@ -366,6 +433,10 @@ async function rewriteManifest(
             continue;
         }
         try {
+            if (budget.remaining <= 0) {
+                out.push(line);
+                continue;
+            }
             const abs = new URL(trimmed, base).toString();
             const child = await ctx.grants.issue({
                 url: abs,
@@ -375,6 +446,7 @@ async function rewriteManifest(
                 ttlSec: Math.max(60, grant.exp - Math.floor(Date.now() / 1000)),
                 maxRedirects: grant.maxRedirects
             });
+            budget.remaining--;
             out.push(ctx.grants.toProxyUrl(child, publicBase));
         } catch {
             out.push('# addons-core: segment blocked by url policy');
@@ -388,7 +460,8 @@ async function replaceUriAttrs(
     base: URL,
     grant: PlaybackGrantClaims,
     ctx: SecureProxyContext,
-    publicBase: string
+    publicBase: string,
+    budget: GrantBudget
 ): Promise<string> {
     const re = /URI="([^"]+)"/gi;
     let result = line;
@@ -396,6 +469,7 @@ async function replaceUriAttrs(
     for (const m of matches) {
         const raw = m[1];
         try {
+            if (budget.remaining <= 0) continue;
             const abs = new URL(raw, base).toString();
             const child = await ctx.grants.issue({
                 url: abs,
@@ -405,6 +479,7 @@ async function replaceUriAttrs(
                 ttlSec: Math.max(60, grant.exp - Math.floor(Date.now() / 1000)),
                 maxRedirects: grant.maxRedirects
             });
+            budget.remaining--;
             const proxied = ctx.grants.toProxyUrl(child, publicBase);
             result = result.replace(`URI="${raw}"`, `URI="${proxied}"`);
         } catch {
@@ -412,6 +487,20 @@ async function replaceUriAttrs(
         }
     }
     return result;
+}
+
+/** Record proxied bytes against the egress budget (Phase 7 §10.4). */
+function recordEgress(
+    ctx: SecureProxyContext,
+    url: string,
+    bytes: number
+): void {
+    if (!ctx.egress || bytes <= 0) return;
+    try {
+        ctx.egress.record(bytes, shouldProxyUrl(url, 'auto'));
+    } catch {
+        /* accounting must never break playback */
+    }
 }
 
 async function fetchGrantUpstream(
@@ -485,14 +574,20 @@ async function handleGrantRequest(
     reply: FastifyReply,
     ctx: SecureProxyContext,
     cfg: AppConfig,
-    publicBase: string
+    publicBase: string,
+    opts: { segment?: boolean } = {}
 ): Promise<void> {
     if (request.headers.range) {
         globalMetrics.recordProxyRangeRequest();
     }
+    // Phase 7 §10.1 — full media streams and HLS/DASH segments draw from
+    // separate pools so segment bursts can't crowd out new playbacks.
+    const pool = opts.segment ? 'hls-segment' : 'proxy-stream';
     let upstream: Response & { finalUrl?: string };
     try {
-        upstream = await fetchGrantUpstream(grant, request, cfg);
+        upstream = await globalConcurrency.withSlot(pool, () =>
+            fetchGrantUpstream(grant, request, cfg)
+        );
     } catch (err) {
         if (err instanceof UrlPolicyError) {
             globalMetrics.recordProxyDeniedSsrf();
@@ -500,6 +595,20 @@ async function handleGrantRequest(
                 error: {
                     code: 'URL_POLICY_VIOLATION',
                     message: 'Upstream URL is not permitted'
+                }
+            });
+            return;
+        }
+        const poolCode = (err as { code?: string }).code;
+        if (poolCode === 'SEMAPHORE_FULL' || poolCode === 'QUEUE_TIMEOUT') {
+            reply.header('Retry-After', '2');
+            await reply.code(503).send({
+                error: {
+                    code: 'OVERLOADED',
+                    message:
+                        err instanceof Error
+                            ? err.message
+                            : 'Concurrency pool saturated'
                 }
             });
             return;
@@ -561,13 +670,18 @@ async function handleGrantRequest(
             });
             return;
         }
+        recordEgress(ctx, finalUrl, buf.byteLength);
+        const budget: GrantBudget = {
+            remaining: ctx.maxGrantsPerRequest ?? 500
+        };
         const rewritten = await rewriteManifest(
             buf.toString('utf8'),
             finalUrl,
             grant,
             ctx,
             publicBase,
-            contentType
+            contentType,
+            budget
         );
         const out = Buffer.from(rewritten, 'utf8');
         globalMetrics.recordProxyBytes(out.byteLength);
@@ -620,6 +734,47 @@ async function handleGrantRequest(
                 return;
             }
         }
+
+        // Phase 7 §10.4 — concurrent stream caps (per IP / user / global).
+        // Held for the lifetime of the streamed response.
+        let releaseStreamSlot: (() => Promise<void>) | null = null;
+        if (ctx.streams) {
+            try {
+                releaseStreamSlot = await ctx.streams.acquire({
+                    ip: clientIp(request, cfg) ?? 'unknown',
+                    userId: (
+                        request as unknown as {
+                            authUser?: { id?: string };
+                        }
+                    ).authUser?.id,
+                    grantId: grant.id
+                });
+            } catch (err) {
+                if (err instanceof StreamConcurrencyError) {
+                    globalMetrics.recordStreamRejection(err.reason);
+                    logger.warn('Proxied stream rejected by concurrency cap', {
+                        component: 'proxy',
+                        reason: err.reason,
+                        limit: err.limit
+                    });
+                    try {
+                        await upstream.body.cancel();
+                    } catch {
+                        /* ignore */
+                    }
+                    reply.header('Retry-After', '5');
+                    await reply.code(429).send({
+                        error: {
+                            code: err.code,
+                            message: err.message
+                        }
+                    });
+                    return;
+                }
+                throw err;
+            }
+        }
+
         globalMetrics.incrementActiveProxyStreams();
         const maxStream = cfg.proxyMaxStreamBytes;
         const webStream = upstream.body as import('stream/web').ReadableStream;
@@ -630,6 +785,11 @@ async function handleGrantRequest(
             if (!streamClosed) {
                 streamClosed = true;
                 globalMetrics.decrementActiveProxyStreams();
+                recordEgress(ctx, finalUrl, bytesSeen);
+                if (releaseStreamSlot) {
+                    void releaseStreamSlot().catch(() => undefined);
+                    releaseStreamSlot = null;
+                }
             }
         };
         const limited = nodeStream.pipe(
@@ -699,6 +859,7 @@ async function handleGrantRequest(
         });
         return;
     }
+    recordEgress(ctx, finalUrl, buf2.byteLength);
     headersOut['Content-Length'] = String(buf2.byteLength);
     await reply
         .code(upstream.status)
@@ -754,11 +915,10 @@ export function registerSecureProxyRoutes(
     ): Promise<boolean> => {
         const ip = clientIp(request, cfg);
         const key = rateLimitKey('proxy', undefined, ip);
-        const result = limiter.take(
-            key,
-            RATE_LIMITS.proxy.limit,
-            RATE_LIMITS.proxy.windowMs
-        );
+        // Phase 7 §10.4 — configurable redemption quota (grants are the
+        // anonymous public surface; per-IP is the enforceable scope).
+        const limit = cfg.proxyRateLimitPerMin || RATE_LIMITS.proxy.limit;
+        const result = limiter.take(key, limit, RATE_LIMITS.proxy.windowMs);
         reply.header('X-RateLimit-Limit', String(result.limit));
         reply.header('X-RateLimit-Remaining', String(result.remaining));
         if (!result.allowed) {
@@ -858,7 +1018,9 @@ export function registerSecureProxyRoutes(
                 reply,
                 ctx,
                 cfg,
-                publicBase
+                publicBase,
+                // DASH segment fetches draw from the segment pool (§10.1).
+                { segment: true }
             );
         }
     );

@@ -79,6 +79,7 @@ export {
 export {
     createPlaybackGrantStore,
     grantPublicView,
+    GrantCapacityError,
     type PlaybackGrantClaims,
     type PlaybackGrantStore,
     type IssueGrantInput
@@ -86,6 +87,7 @@ export {
 
 export {
     createSecureProxyContext,
+    createProxyCapacityGuards,
     registerSecureProxyRoutes,
     type SecureProxyContext
 } from './proxyRoute.js';

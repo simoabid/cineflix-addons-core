@@ -30,6 +30,18 @@ import {
     UrlPolicyError
 } from './urlPolicy.js';
 import { redactUrl, redactHeaders } from './redaction.js';
+import { globalMetrics } from '../metrics/index.js';
+
+/** Raised when the active-grant hard cap is reached (Phase 7 §10.4). */
+export class GrantCapacityError extends Error {
+    readonly code = 'GRANT_CAPACITY_EXCEEDED';
+    constructor(maxActive: number) {
+        super(
+            `Playback grant capacity reached (${maxActive} active) — refusing to mint more until existing grants expire`
+        );
+        this.name = 'GrantCapacityError';
+    }
+}
 
 export interface PlaybackGrantClaims {
     /** Opaque grant id. */
@@ -108,6 +120,12 @@ export function createPlaybackGrantStore(
         defaultTtlSec?: number;
         /** Max grants retained. */
         maxEntries?: number;
+        /**
+         * Phase 7 §10.4 — hard cap on active grants; issue() rejects with
+         * GrantCapacityError once reached (after purging expired entries).
+         * Defaults to maxEntries (per-instance cap).
+         */
+        maxActive?: number;
         /** URL policy applied at issue time. */
         urlPolicy?: UrlPolicyOptions;
     } & {
@@ -117,6 +135,7 @@ export function createPlaybackGrantStore(
 ): PlaybackGrantStore {
     const defaultTtlSec = opts.defaultTtlSec ?? 2 * 60 * 60;
     const maxEntries = opts.maxEntries ?? 50_000;
+    const maxActive = opts.maxActive ?? maxEntries;
     const secret = opts.signingSecret;
     const urlPolicy: UrlPolicyOptions = {
         allowHttp: false,
@@ -210,6 +229,15 @@ export function createPlaybackGrantStore(
         const now = Math.floor(Date.now() / 1000);
         const ttl = input.ttlSec ?? defaultTtlSec;
         const id = randomBytes(16).toString('base64url');
+
+        // Phase 7 §10.4 — capacity guard: purge expired/used first, then
+        // reject if the active set is still at the hard cap.
+        purge();
+        if (map.size >= maxActive) {
+            globalMetrics.recordGrantRejected('capacity');
+            throw new GrantCapacityError(maxActive);
+        }
+        globalMetrics.recordGrantIssued();
 
         // Only allow a safe subset of headers onto the grant.
         const headers: Record<string, string> = {};
