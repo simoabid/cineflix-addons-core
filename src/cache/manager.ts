@@ -186,7 +186,8 @@ export class CacheManager {
         const t0 = Date.now();
         this.sets++;
         try {
-            const raw = typeof value === 'string' ? value : JSON.stringify(value);
+            const raw =
+                typeof value === 'string' ? value : JSON.stringify(value);
             if (this.backendType === 'redis') {
                 const redis = await this.getRedis();
                 if (redis) {
@@ -321,6 +322,27 @@ export class CacheManager {
         }
         await this.memory.clear();
         this.flight.reset();
+    }
+
+    /**
+     * Phase 7 §10.2 — close the Redis connection cleanly at shutdown so the
+     * event loop can exit within the grace period. Safe to call when only the
+     * in-memory backend is active.
+     */
+    async close(): Promise<void> {
+        if (this.redisClient) {
+            try {
+                await this.redisClient.quit();
+            } catch {
+                /* best-effort: destroy if quit hangs/fails */
+                try {
+                    void this.redisClient.destroy?.();
+                } catch {
+                    /* ignore */
+                }
+            }
+            this.redisClient = null;
+        }
     }
 
     /** Check if request specifies privileged cache bypass. */

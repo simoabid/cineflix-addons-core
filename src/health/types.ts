@@ -99,4 +99,14 @@ export interface ServiceStatusReport {
     activeIncidents: ActiveIncident[];
     incidents?: ActiveIncident[];
     dependencies: DependencyStatus[];
+    /** Phase 7 §10.2 — present once shutdown has begun. */
+    shuttingDown?: boolean;
+    /** Phase 7 §10.3/§10.4 — capacity and cluster telemetry. */
+    capacity?: {
+        quarantinedProviders: number;
+        providerBudgetsExhausted: string[];
+        egress: { level: string; usedPct: number; proxyUsedPct: number };
+        activeStreams: number;
+    };
+    cluster?: { mode: string; instanceId: string };
 }

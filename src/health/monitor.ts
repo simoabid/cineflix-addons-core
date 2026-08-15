@@ -12,6 +12,11 @@ import type { CacheManager } from '../cache/manager.js';
 import { debridService } from '../debrid/service.js';
 import { globalReliability } from '../reliability/circuit.js';
 import { logger } from '../telemetry/logger.js';
+import {
+    globalReadinessGate,
+    type ReadinessGate
+} from '../lifecycle/shutdown.js';
+import { globalConcurrency } from '../concurrency/coordinator.js';
 import type {
     FailureClassification,
     CheckType,
@@ -22,7 +27,6 @@ import type {
     ActiveIncident
 } from './types.js';
 
-const CONCURRENCY = 4;
 let eventLoopMonitor: ReturnType<typeof monitorEventLoopDelay> | null = null;
 
 function getEventLoopMonitor(): ReturnType<typeof monitorEventLoopDelay> {
@@ -58,6 +62,29 @@ export class HealthMonitor {
             staleThresholdMinutes?: number;
             degradedMinProvidersRatio?: number;
             version?: string;
+            /** Phase 7 §10.2 — readiness flips false once shutdown begins. */
+            readinessGate?: ReadinessGate;
+            /** Phase 7 §10.4 — optional capacity telemetry in status. */
+            capacity?: {
+                providerBudgets: {
+                    snapshot(): Record<
+                        string,
+                        { used: number; limit: number; exhausted: boolean }
+                    >;
+                };
+                egress: {
+                    state(): {
+                        level: string;
+                        usedPct: number;
+                        proxyUsedPct: number;
+                    };
+                };
+                streams: { gauge(): { activeStreams: number } };
+            };
+            cluster?: {
+                readonly mode: string;
+                stats(): { instanceId: string };
+            };
         }
     ) {}
 
@@ -103,6 +130,25 @@ export class HealthMonitor {
             { ok: boolean; message?: string; latencyMs?: number }
         > = {};
         let allOk = true;
+
+        // Phase 7 §10.2 — an instance that began shutting down is never ready,
+        // so the LB drains it while in-flight requests finish.
+        const gate = this.opts.readinessGate ?? globalReadinessGate;
+        if (gate.isShuttingDown) {
+            return {
+                status: 'down',
+                ready: false,
+                uptimeSec: Math.floor((Date.now() - this.bootTime) / 1000),
+                timestamp: new Date().toISOString(),
+                revision: this.manager.getRevision(),
+                checks: {
+                    shutdown: {
+                        ok: false,
+                        message: `Shutting down (${gate.reason}, ${gate.elapsedMs}ms ago)`
+                    }
+                }
+            };
+        }
 
         // 1. Manager state
         try {
@@ -311,6 +357,39 @@ export class HealthMonitor {
             });
         }
 
+        // Phase 7 §10.4 — quarantined providers signal a degraded pool.
+        const quarantined = globalReliability.listQuarantined();
+        if (quarantined.length > 0) {
+            degradedReasons.push(
+                `${quarantined.length} provider(s) quarantined after repeated failures`
+            );
+            activeIncidents.push({
+                code: 'PROVIDERS_QUARANTINED',
+                severity: 'warning',
+                message: `Quarantined: ${quarantined
+                    .map((q) => `${q.providerId} (${q.reason})`)
+                    .join(', ')}`,
+                detectedAt: new Date().toISOString(),
+                runbook: '/docs/runbooks/emergency-quarantine-addon.md'
+            });
+        }
+
+        // Phase 7 §10.4 — egress budget thresholds become incidents.
+        const cap = this.opts.capacity;
+        if (cap) {
+            const egressState = cap.egress.state();
+            if (egressState.level === 'exceeded') {
+                degradedReasons.push('Daily egress budget exceeded');
+                activeIncidents.push({
+                    code: 'EGRESS_BUDGET_EXCEEDED',
+                    severity: 'warning',
+                    message: `Egress at ${egressState.usedPct}% of daily budget (proxy: ${egressState.proxyUsedPct}%)`,
+                    detectedAt: new Date().toISOString(),
+                    runbook: '/docs/runbooks/high-proxy-egress.md'
+                });
+            }
+        }
+
         // Dependencies assessment
         const depReport = await this.getDependencies(services);
         const hasDownDep = depReport.dependencies.some(
@@ -338,6 +417,20 @@ export class HealthMonitor {
               ? 'degraded'
               : 'ok';
 
+        const gate = this.opts.readinessGate ?? globalReadinessGate;
+        const capacity = cap
+            ? {
+                  quarantinedProviders: quarantined.length,
+                  providerBudgetsExhausted: Object.entries(
+                      cap.providerBudgets.snapshot()
+                  )
+                      .filter(([, b]) => b.exhausted)
+                      .map(([id]) => id),
+                  egress: cap.egress.state(),
+                  activeStreams: cap.streams.gauge().activeStreams
+              }
+            : undefined;
+
         return {
             status: overallStatus,
             timestamp: new Date().toISOString(),
@@ -362,7 +455,17 @@ export class HealthMonitor {
             degradedReasons,
             activeIncidents,
             incidents: activeIncidents,
-            dependencies: depReport.dependencies
+            dependencies: depReport.dependencies,
+            ...(gate.isShuttingDown ? { shuttingDown: true } : {}),
+            ...(capacity ? { capacity } : {}),
+            ...(this.opts.cluster
+                ? {
+                      cluster: {
+                          mode: this.opts.cluster.mode,
+                          instanceId: this.opts.cluster.stats().instanceId
+                      }
+                  }
+                : {})
         };
     }
 
@@ -589,14 +692,29 @@ export class HealthMonitor {
         const staleThresholdMs =
             (this.opts.staleThresholdMinutes ?? 60) * 60 * 1000;
 
-        for (let i = 0; i < addons.length; i += CONCURRENCY) {
-            const batch = addons.slice(i, i + CONCURRENCY);
+        // Phase 7 §10.1 — bounded health-check pool (separate capacity from
+        // scrape traffic so a bulk burst can never starve health probes).
+        // Each probe draws from the `health` pool via withSlot so the cap is
+        // actually enforced, not just advisory.
+        const batchSize = Math.max(1, globalConcurrency.pool('health').limit);
+        for (let i = 0; i < addons.length; i += batchSize) {
+            const batch = addons.slice(i, i + batchSize);
             const results = await Promise.all(
                 batch.map((a) => {
-                    const checkType: CheckType = a.capabilities?.subtitles?.length && !a.capabilities?.stream?.length
-                        ? 'subtitle_probe'
-                        : 'stream_probe';
-                    return this.checkOne(a.providerId, a.manifestUrl, checkType);
+                    const checkType: CheckType =
+                        a.capabilities?.subtitles?.length &&
+                        !a.capabilities?.stream?.length
+                            ? 'subtitle_probe'
+                            : 'stream_probe';
+                    return globalConcurrency
+                        .withSlot('health', () =>
+                            this.checkOne(
+                                a.providerId,
+                                a.manifestUrl,
+                                checkType
+                            )
+                        )
+                        .catch(() => false);
                 })
             );
             healthy += results.filter(Boolean).length;
@@ -670,12 +788,14 @@ export class HealthMonitor {
     async triggerSweep(): Promise<{ queued: boolean; jobId?: string }> {
         if (this.opts.jobEngine) {
             try {
-                const job = await this.opts.jobEngine.enqueue(
+                // Phase 7 §10.3 — distributed lock + dedup so replicas firing
+                // on the same schedule do not double-sweep.
+                const job = await this.opts.jobEngine.enqueueScheduled(
                     'health-sweep',
                     {},
-                    { dedupKey: 'health-sweep-scheduled' }
+                    'health-sweep-scheduled'
                 );
-                return { queued: true, jobId: job.id };
+                return { queued: true, jobId: job?.id };
             } catch {
                 /* fall back to direct check */
             }

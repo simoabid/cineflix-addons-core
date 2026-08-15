@@ -41,6 +41,7 @@ export class JobEngine {
     private readonly pollIntervalMs: number;
     private readonly lockDurationMs: number;
     private running = false;
+    private draining = false;
     private pollTimer: NodeJS.Timeout | null = null;
     private outboxTimer: NodeJS.Timeout | null = null;
     private maintenanceTimer: NodeJS.Timeout | null = null;
@@ -146,6 +147,31 @@ export class JobEngine {
         return this.storage.cancelJob(id);
     }
 
+    /**
+     * Enqueue a scheduled/sweep job under a distributed lock so multiple
+     * replicas firing on the same schedule cannot race past the dedup check
+     * (Phase 7 §10.3). Returns the existing active job when one is already
+     * scheduled.
+     */
+    async enqueueScheduled(
+        type: string,
+        payload: Record<string, unknown>,
+        dedupKey: string
+    ): Promise<JobRecord | null> {
+        return this.locks.withLock(
+            `jobs:scheduled:${type}`,
+            10_000,
+            async () => {
+                const existing = await this.storage.getJobByDedupKey(
+                    dedupKey,
+                    true
+                );
+                if (existing) return existing;
+                return this.enqueue(type, payload, { dedupKey });
+            }
+        );
+    }
+
     async retry(id: string): Promise<JobRecord | null> {
         const job = await this.storage.getJob(id);
         if (!job) return null;
@@ -174,6 +200,15 @@ export class JobEngine {
 
     stop(): void {
         this.running = false;
+        this.clearTimers();
+        // Abort all running jobs
+        for (const [id, ctrl] of this.activeJobs.entries()) {
+            ctrl.abort();
+            this.activeJobs.delete(id);
+        }
+    }
+
+    private clearTimers(): void {
         if (this.pollTimer) {
             clearTimeout(this.pollTimer);
             this.pollTimer = null;
@@ -186,11 +221,79 @@ export class JobEngine {
             clearTimeout(this.maintenanceTimer);
             this.maintenanceTimer = null;
         }
-        // Abort all running jobs
-        for (const [id, ctrl] of this.activeJobs.entries()) {
-            ctrl.abort();
-            this.activeJobs.delete(id);
+    }
+
+    /**
+     * Graceful shutdown drain (Phase 7 §10.2): stop accepting new work,
+     * let in-flight jobs finish within `drainMs`, then abort stragglers.
+     * Unlike stop(), aborted jobs are released back to the queue with a
+     * retryable failure so another instance (or this one after restart)
+     * picks them up — checkpoints are already persisted via progress and
+     * heartbeat records, and leases expire via lockedUntil.
+     */
+    async beginShutdown(drainMs: number): Promise<void> {
+        this.running = false;
+        this.draining = true;
+        this.clearTimers();
+
+        const deadline = Date.now() + Math.max(0, drainMs);
+        while (this.activeJobs.size > 0 && Date.now() < deadline) {
+            await new Promise((r) =>
+                setTimeout(r, Math.min(100, Math.max(1, deadline - Date.now())))
+            );
         }
+
+        const stragglers = [...this.activeJobs.keys()];
+        if (stragglers.length > 0) {
+            logger.warn(
+                `Drain deadline hit with ${stragglers.length} job(s) still running — releasing for retry`,
+                { component: 'jobs', jobIds: stragglers }
+            );
+            for (const id of stragglers) {
+                // Ask a cooperating handler to stop…
+                const ctrl = this.activeJobs.get(id);
+                ctrl?.abort(
+                    Object.assign(
+                        new Error('Worker shutdown: job released for retry'),
+                        { name: 'AbortError', code: 'WORKER_SHUTDOWN' }
+                    )
+                );
+            }
+            // …and give the abort handlers a moment to persist the release.
+            const settleDeadline = Date.now() + 2000;
+            while (this.activeJobs.size > 0 && Date.now() < settleDeadline) {
+                await new Promise((r) => setTimeout(r, 50));
+            }
+            // Handlers that ignore their AbortSignal cannot be interrupted —
+            // persist the retryable release on their behalf. If such a zombie
+            // later writes a completion, the worst case is a redundant
+            // terminal record; the process exits immediately after this.
+            for (const id of [...this.activeJobs.keys()]) {
+                await this.storage
+                    .failJob(
+                        id,
+                        'Job interrupted by worker shutdown; released for retry',
+                        this.workerId,
+                        true
+                    )
+                    .catch(() => undefined);
+                this.activeJobs.delete(id);
+                this.activeWorkerCount = Math.max(
+                    0,
+                    this.activeWorkerCount - 1
+                );
+            }
+        }
+        this.draining = false;
+    }
+
+    get isDraining(): boolean {
+        return this.draining;
+    }
+
+    /** Awaited by readiness checks during shutdown. */
+    get activeJobCount(): number {
+        return this.activeJobs.size;
     }
 
     private scheduleMaintenanceCleanup(delayMs: number): void {
@@ -198,13 +301,17 @@ export class JobEngine {
         this.maintenanceTimer = setTimeout(async () => {
             if (!this.running) return;
             try {
-                await this.enqueue(
+                // Distributed lock (Phase 7 §10.3): with multiple replicas the
+                // storage-level dedupKey already prevents duplicate jobs, but
+                // the lock also removes the check-then-enqueue race between
+                // instances firing at the same moment.
+                await this.enqueueScheduled(
                     'maintenance-cleanup',
                     {},
-                    { dedupKey: 'scheduled-maintenance-cleanup' }
+                    'scheduled-maintenance-cleanup'
                 );
             } catch {
-                /* ignore */
+                /* another instance holds the sweep lock — fine */
             }
             this.scheduleMaintenanceCleanup(30 * 60 * 1000); // repeat every 30 minutes
         }, delayMs);
@@ -364,17 +471,52 @@ export class JobEngine {
                 } catch (err) {
                     const duration = Date.now() - t0;
                     if (abortController.signal.aborted) {
+                        // Graceful drain: release the job for retry on another
+                        // worker instead of cancelling it (Phase 7 §10.2).
+                        if (this.draining) {
+                            await this.storage
+                                .failJob(
+                                    job.id,
+                                    'Job interrupted by worker shutdown; released for retry',
+                                    this.workerId,
+                                    true
+                                )
+                                .catch(() => undefined);
+                            logger.info(
+                                `Job ${job.id} (${job.type}) released for retry (worker shutdown)`,
+                                {
+                                    component: 'jobs',
+                                    jobId: job.id,
+                                    jobType: job.type,
+                                    traceId: span.traceId
+                                }
+                            );
+                        }
                         return;
                     }
 
                     const isAbort =
                         (err as { name?: string })?.name === 'AbortError' ||
                         (err as { code?: string })?.code === 'CANCELLED' ||
+                        (err as { code?: string })?.code ===
+                            'WORKER_SHUTDOWN' ||
                         /cancelled/i.test(
                             err instanceof Error ? err.message : String(err)
                         );
 
                     if (isAbort) {
+                        if (
+                            (err as { code?: string })?.code ===
+                            'WORKER_SHUTDOWN'
+                        ) {
+                            await this.storage.failJob(
+                                job.id,
+                                'Job interrupted by worker shutdown; released for retry',
+                                this.workerId,
+                                true
+                            );
+                            return;
+                        }
                         await this.storage.cancelJob(job.id);
                         return;
                     }
@@ -464,12 +606,14 @@ export class JobEngine {
 
     getStats(): {
         running: boolean;
+        draining: boolean;
         workers: number;
         activeJobs: number;
         registeredTypes: string[];
     } {
         return {
             running: this.running,
+            draining: this.draining,
             workers: this.concurrency,
             activeJobs: this.activeJobs.size,
             registeredTypes: this.getRegisteredTypes()
