@@ -36,6 +36,28 @@ function envList(name: string): string[] {
         .filter(Boolean);
 }
 
+function envJsonRecord(name: string): Record<string, number> {
+    const v = process.env[name];
+    if (!v) return {};
+    try {
+        const parsed = JSON.parse(v) as unknown;
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            return {};
+        }
+        const out: Record<string, number> = {};
+        for (const [k, val] of Object.entries(
+            parsed as Record<string, unknown>
+        )) {
+            if (typeof val === 'number' && Number.isFinite(val) && val >= 0) {
+                out[k] = Math.floor(val);
+            }
+        }
+        return out;
+    } catch {
+        return {};
+    }
+}
+
 export type AuthMode =
     'disabled' | 'static-token' | 'oidc' | 'reverse-proxy' | 'service-jwt';
 
@@ -146,6 +168,49 @@ export interface AppConfig {
     tracingPropagateToUpstream: boolean;
     healthStaleThresholdMinutes: number;
     healthDegradedMinProvidersRatio: number;
+
+    /** Phase 7 (10.1): bounded concurrency pools for all remote work. */
+    concurrency: {
+        bulkScrape: number;
+        progressiveScrape: number;
+        providerStream: number;
+        outboundHost: number;
+        subtitles: number;
+        manifest: number;
+        health: number;
+        debrid: number;
+        proxyStream: number;
+        hlsSegment: number;
+        queueMax: number;
+        queueTimeoutMs: number;
+    };
+
+    /** Phase 7 (10.2): graceful shutdown / rolling deploys. */
+    terminationGracePeriodMs: number;
+    shutdownDrainJobs: boolean;
+
+    /** Phase 7 (10.3): multi-instance coordination. */
+    clusterBusEnabled: boolean;
+
+    /** Phase 7 (10.4): capacity and cost controls. */
+    maxConcurrentStreamsPerIp: number;
+    maxConcurrentStreamsPerUser: number;
+    maxConcurrentStreamsGlobal: number;
+    bulkMaxProvidersPerRequest: number;
+    sourceLookupDeadlineMs: number;
+    playbackGrantMaxActive: number;
+    playbackGrantMaxPerRequest: number;
+    providerDailyCallBudget: number;
+    providerBudgetOverrides: Record<string, number>;
+    egressDailyBudgetMb: number;
+    egressProxyDailyBudgetMb: number;
+    scrapeRateLimitPerMin: number;
+    anonScrapeRateLimitPerMin: number;
+    proxyRateLimitPerMin: number;
+    quarantineEnabled: boolean;
+    quarantineOpenThreshold: number;
+    quarantineWindowMs: number;
+    quarantineTtlMs: number;
 }
 
 function parseAuthMode(
@@ -323,7 +388,64 @@ export function loadConfig(): AppConfig {
         healthDegradedMinProvidersRatio: Math.max(
             0.1,
             Math.min(1.0, envNum('HEALTH_DEGRADED_MIN_RATIO', 0.5))
-        )
+        ),
+
+        // ── Phase 7 (10.1): concurrency pools ────────────────────────────────
+        // Independent limits per class of remote work so a large bulk scrape can
+        // never consume capacity reserved for health checks, admin, or playback.
+        concurrency: {
+            bulkScrape: envNum('CONCURRENCY_BULK_SCRAPE', 8),
+            progressiveScrape: envNum('CONCURRENCY_PROGRESSIVE_SCRAPE', 16),
+            providerStream: envNum('CONCURRENCY_PROVIDER_STREAM', 4),
+            outboundHost: envNum('CONCURRENCY_OUTBOUND_HOST', 8),
+            subtitles: envNum('CONCURRENCY_SUBTITLES', 8),
+            manifest: envNum('CONCURRENCY_MANIFEST', 6),
+            health: envNum('CONCURRENCY_HEALTH', 4),
+            debrid: envNum('CONCURRENCY_DEBRID', 6),
+            proxyStream: envNum('CONCURRENCY_PROXY_STREAM', 32),
+            hlsSegment: envNum('CONCURRENCY_HLS_SEGMENT', 64),
+            queueMax: envNum('CONCURRENCY_QUEUE_MAX', 200),
+            queueTimeoutMs: envNum('CONCURRENCY_QUEUE_TIMEOUT_MS', 5000)
+        },
+
+        // ── Phase 7 (10.2): graceful shutdown ────────────────────────────────
+        terminationGracePeriodMs: envNum('TERMINATION_GRACE_PERIOD_MS', 15_000),
+        shutdownDrainJobs: envBool('SHUTDOWN_DRAIN_JOBS', true),
+
+        // ── Phase 7 (10.3): multi-instance coordination ──────────────────────
+        clusterBusEnabled: envBool('CLUSTER_BUS_ENABLED', true),
+
+        // ── Phase 7 (10.4): capacity and cost controls ───────────────────────
+        maxConcurrentStreamsPerIp: envNum('MAX_CONCURRENT_STREAMS_PER_IP', 3),
+        maxConcurrentStreamsPerUser: envNum(
+            'MAX_CONCURRENT_STREAMS_PER_USER',
+            4
+        ),
+        maxConcurrentStreamsGlobal: envNum(
+            'MAX_CONCURRENT_STREAMS_GLOBAL',
+            200
+        ),
+        bulkMaxProvidersPerRequest: envNum(
+            'BULK_MAX_PROVIDERS_PER_REQUEST',
+            16
+        ),
+        sourceLookupDeadlineMs: envNum('SOURCE_LOOKUP_DEADLINE_MS', 20_000),
+        playbackGrantMaxActive: envNum('PLAYBACK_GRANT_MAX_ACTIVE', 50_000),
+        playbackGrantMaxPerRequest: envNum(
+            'PLAYBACK_GRANT_MAX_PER_REQUEST',
+            500
+        ),
+        providerDailyCallBudget: envNum('PROVIDER_DAILY_CALL_BUDGET', 0),
+        providerBudgetOverrides: envJsonRecord('PROVIDER_BUDGET_OVERRIDES'),
+        egressDailyBudgetMb: envNum('EGRESS_DAILY_BUDGET_MB', 0),
+        egressProxyDailyBudgetMb: envNum('EGRESS_PROXY_DAILY_BUDGET_MB', 0),
+        scrapeRateLimitPerMin: envNum('SCRAPE_RATE_LIMIT_PER_MIN', 30),
+        anonScrapeRateLimitPerMin: envNum('ANON_SCRAPE_RATE_LIMIT_PER_MIN', 30),
+        proxyRateLimitPerMin: envNum('PROXY_RATE_LIMIT_PER_MIN', 120),
+        quarantineEnabled: envBool('QUARANTINE_ENABLED', true),
+        quarantineOpenThreshold: envNum('QUARANTINE_OPEN_THRESHOLD', 5),
+        quarantineWindowMs: envNum('QUARANTINE_WINDOW_MS', 3_600_000),
+        quarantineTtlMs: envNum('QUARANTINE_TTL_MS', 21_600_000)
     };
 }
 
