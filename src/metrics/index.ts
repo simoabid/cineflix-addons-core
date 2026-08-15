@@ -336,6 +336,41 @@ export class MetricsCollector {
 
     // ── Storage Metrics ──────────────────────────────────────────────────────
 
+    // Phase 7 capacity counters
+    private readonly providerBudgetExhausted = new Map<string, number>();
+    private readonly streamRejections = new Map<string, number>();
+    private grantsIssued = 0;
+    private readonly grantRejections = new Map<string, number>();
+
+    recordProviderBudgetExhausted(providerId: string): void {
+        this.providerBudgetExhausted.set(
+            providerId,
+            (this.providerBudgetExhausted.get(providerId) ?? 0) + 1
+        );
+    }
+
+    recordStreamRejection(reason: string): void {
+        this.streamRejections.set(
+            reason,
+            (this.streamRejections.get(reason) ?? 0) + 1
+        );
+    }
+
+    recordGrantIssued(): void {
+        this.grantsIssued++;
+    }
+
+    recordGrantRejected(reason: string): void {
+        this.grantRejections.set(
+            reason,
+            (this.grantRejections.get(reason) ?? 0) + 1
+        );
+    }
+
+    get grantsIssuedTotal(): number {
+        return this.grantsIssued;
+    }
+
     recordStorageOperation(
         op: string,
         status: 'ok' | 'error',
@@ -365,9 +400,7 @@ export class MetricsCollector {
         );
     }
 
-    private async getJobStats(
-        storage?: IStorageBackend
-    ): Promise<{
+    private async getJobStats(storage?: IStorageBackend): Promise<{
         queued: number;
         running: number;
         failed: number;
@@ -451,7 +484,10 @@ export class MetricsCollector {
                     );
                     if (hasStream) {
                         totalStreamProviders++;
-                        if (a.health?.lastChecked && a.health?.healthy === true) {
+                        if (
+                            a.health?.lastChecked &&
+                            a.health?.healthy === true
+                        ) {
                             healthyStreamProviders++;
                         }
                     }
@@ -516,6 +552,31 @@ export class MetricsCollector {
         cache?: CacheManager;
         jobs?: JobEngine;
         storage?: IStorageBackend;
+        /** Phase 7 live gauges. */
+        concurrency?: {
+            snapshot(): Record<
+                string,
+                {
+                    name: string;
+                    inFlight: number;
+                    queued: number;
+                    totalRejectedFull: number;
+                    totalQueueTimeouts: number;
+                }
+            >;
+        };
+        streams?: { gauge(): { activeStreams: number } };
+        egressBudget?: {
+            state(): {
+                level: string;
+                usedPct: number;
+                proxyUsedPct: number;
+                dailyBytes: number;
+                proxyBytes: number;
+            };
+        };
+        grants?: { size(): number };
+        readiness?: { isShuttingDown: boolean };
     }): Promise<string> {
         const lines: string[] = [];
         const uptimeSec = Math.floor((Date.now() - this.startTime) / 1000);
@@ -771,7 +832,9 @@ export class MetricsCollector {
                 '# HELP addons_core_stale_health_total Total number of stale provider health records.'
             );
             lines.push('# TYPE addons_core_stale_health_total gauge');
-            lines.push(`addons_core_stale_health_total ${slo.staleHealthCount}`);
+            lines.push(
+                `addons_core_stale_health_total ${slo.staleHealthCount}`
+            );
             lines.push('');
         }
 
@@ -1005,6 +1068,146 @@ export class MetricsCollector {
             lines.push('');
         }
 
+        // ── Phase 7: resilience & capacity metrics ──────────────────────────
+
+        // Concurrency pools
+        if (services?.concurrency) {
+            const pools = services.concurrency.snapshot();
+            lines.push(
+                '# HELP addons_concurrency_in_flight Current in-flight units per concurrency pool (Phase 7).'
+            );
+            lines.push('# TYPE addons_concurrency_in_flight gauge');
+            for (const stats of Object.values(pools)) {
+                lines.push(
+                    `addons_concurrency_in_flight{pool="${stats.name}"} ${stats.inFlight}`
+                );
+            }
+            lines.push('');
+            lines.push(
+                '# HELP addons_concurrency_queued Current queued acquisitions per pool.'
+            );
+            lines.push('# TYPE addons_concurrency_queued gauge');
+            for (const stats of Object.values(pools)) {
+                lines.push(
+                    `addons_concurrency_queued{pool="${stats.name}"} ${stats.queued}`
+                );
+            }
+            lines.push('');
+            lines.push(
+                '# HELP addons_concurrency_rejected_total Acquisitions rejected (queue full) per pool.'
+            );
+            lines.push('# TYPE addons_concurrency_rejected_total counter');
+            for (const stats of Object.values(pools)) {
+                lines.push(
+                    `addons_concurrency_rejected_total{pool="${stats.name}"} ${stats.totalRejectedFull}`
+                );
+            }
+            lines.push('');
+            lines.push(
+                '# HELP addons_concurrency_queue_timeouts_total Queue-time acquisitions that timed out per pool.'
+            );
+            lines.push(
+                '# TYPE addons_concurrency_queue_timeouts_total counter'
+            );
+            for (const stats of Object.values(pools)) {
+                lines.push(
+                    `addons_concurrency_queue_timeouts_total{pool="${stats.name}"} ${stats.totalQueueTimeouts}`
+                );
+            }
+            lines.push('');
+        }
+
+        // Quarantine (from the circuit registry)
+        if (services?.circuit) {
+            const quarantined = services.circuit.listQuarantined();
+            lines.push(
+                '# HELP addons_quarantined_providers Providers currently quarantined after repeated failures.'
+            );
+            lines.push('# TYPE addons_quarantined_providers gauge');
+            lines.push(`addons_quarantined_providers ${quarantined.length}`);
+            lines.push('');
+        }
+
+        // Provider daily budgets
+        if (this.providerBudgetExhausted.size > 0) {
+            lines.push(
+                '# HELP addons_provider_budget_exhausted_total Budget-exhaustion events per provider.'
+            );
+            lines.push('# TYPE addons_provider_budget_exhausted_total counter');
+            for (const [pid, count] of this.providerBudgetExhausted.entries()) {
+                lines.push(
+                    `addons_provider_budget_exhausted_total{provider="${pid}"} ${count}`
+                );
+            }
+            lines.push('');
+        }
+
+        // Stream concurrency controls
+        if (this.streamRejections.size > 0) {
+            lines.push(
+                '# HELP addons_stream_rejections_total Proxied streams rejected by concurrency caps.'
+            );
+            lines.push('# TYPE addons_stream_rejections_total counter');
+            for (const [reason, count] of this.streamRejections.entries()) {
+                lines.push(
+                    `addons_stream_rejections_total{reason="${reason}"} ${count}`
+                );
+            }
+            lines.push('');
+        }
+
+        // Playback grant issuance controls
+        lines.push('# HELP addons_grants_issued_total Playback grants issued.');
+        lines.push('# TYPE addons_grants_issued_total counter');
+        lines.push(`addons_grants_issued_total ${this.grantsIssued}`);
+        lines.push('');
+        if (services?.grants) {
+            lines.push(
+                '# HELP addons_grants_active Playback grants currently retained.'
+            );
+            lines.push('# TYPE addons_grants_active gauge');
+            lines.push(`addons_grants_active ${services.grants.size()}`);
+            lines.push('');
+        }
+        if (this.grantRejections.size > 0) {
+            lines.push(
+                '# HELP addons_grants_rejected_total Grant issuance rejections by reason.'
+            );
+            lines.push('# TYPE addons_grants_rejected_total counter');
+            for (const [reason, count] of this.grantRejections.entries()) {
+                lines.push(
+                    `addons_grants_rejected_total{reason="${reason}"} ${count}`
+                );
+            }
+            lines.push('');
+        }
+
+        // Egress budget
+        if (services?.egressBudget) {
+            const e = services.egressBudget.state();
+            lines.push(
+                '# HELP addons_egress_budget_used_percent Daily egress budget used (percent).'
+            );
+            lines.push('# TYPE addons_egress_budget_used_percent gauge');
+            lines.push(`addons_egress_budget_used_percent ${e.usedPct}`);
+            lines.push(
+                `addons_egress_proxy_budget_used_percent ${e.proxyUsedPct}`
+            );
+            lines.push('');
+        }
+
+        // Readiness / shutdown state
+        if (services?.readiness) {
+            lines.push(
+                '# HELP addons_shutting_down 1 once the instance began graceful shutdown.'
+            );
+            lines.push('# TYPE addons_shutting_down gauge');
+            lines.push(
+                `addons_shutting_down ${services.readiness.isShuttingDown ? 1 : 0}`
+            );
+            lines.push('');
+        }
+
         return lines.join('\n');
     }
 
@@ -1014,6 +1217,11 @@ export class MetricsCollector {
         cache?: CacheManager;
         jobs?: JobEngine;
         storage?: IStorageBackend;
+        concurrency?: { snapshot(): Record<string, unknown> };
+        streams?: { gauge(): { activeStreams: number } };
+        egressBudget?: { state(): unknown };
+        grants?: { size(): number };
+        readiness?: { isShuttingDown: boolean };
     }) {
         const uptimeSec = Math.floor((Date.now() - this.startTime) / 1000);
         const routes: Array<{
@@ -1070,7 +1278,20 @@ export class MetricsCollector {
             },
             debrid: { enabled: debridService.isEnabled() },
             jobs: jobData,
-            slo
+            slo,
+            ...(services.concurrency
+                ? { concurrency: services.concurrency.snapshot() }
+                : {}),
+            ...(services.streams ? { streams: services.streams.gauge() } : {}),
+            ...(services.egressBudget
+                ? { egressBudget: services.egressBudget.state() }
+                : {}),
+            ...(services.grants
+                ? { grantsActive: services.grants.size() }
+                : {}),
+            ...(services.readiness
+                ? { shuttingDown: services.readiness.isShuttingDown }
+                : {})
         };
     }
 }

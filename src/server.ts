@@ -2,6 +2,7 @@ import { OMSSServer } from '@omss/framework';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
+import { nanoid } from 'nanoid';
 import {
     loadConfig,
     resolvePublicUrl,
@@ -32,7 +33,7 @@ import { CacheManager } from './cache/index.js';
 import { buildAggregateResultKey } from './cache/namespaces.js';
 import { JobEngine } from './jobs/index.js';
 import { debridService } from './debrid/service.js';
-import { logScrapeProxyStatus } from './egress/scrapeFetch.js';
+import { logScrapeProxyStatus, closeEgress } from './egress/scrapeFetch.js';
 import { installStreamEgress } from './egress/globalDispatcher.js';
 import {
     assertCorsSafe,
@@ -40,6 +41,7 @@ import {
     applySecurityHeaders,
     createAuditLogger,
     createSecureProxyContext,
+    createProxyCapacityGuards,
     registerSecureProxyRoutes,
     toSafeError
 } from './security/index.js';
@@ -65,6 +67,13 @@ import {
     seasonEpisodeValidator
 } from './validation/schemas.js';
 import { formatValidationError } from './validation/validator.js';
+import { globalConcurrency } from './concurrency/coordinator.js';
+import {
+    globalReadinessGate,
+    ShutdownCoordinator
+} from './lifecycle/shutdown.js';
+import { ClusterBus } from './cluster/bus.js';
+import { globalProviderBudgets } from './capacity/budgets.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -120,6 +129,21 @@ async function main(): Promise<void> {
     }
 
     installStreamEgress();
+
+    // ── Phase 7: configure global resilience/capacity singletons ──────────
+    const instanceId = `inst_${process.pid}_${nanoid(6)}`;
+    globalConcurrency.configure(cfg);
+    globalReliability.configureQuarantine({
+        enabled: cfg.quarantineEnabled,
+        openThreshold: cfg.quarantineOpenThreshold,
+        windowMs: cfg.quarantineWindowMs,
+        ttlMs: cfg.quarantineTtlMs
+    });
+    globalReliability.configureConcurrency(cfg.concurrency.providerStream);
+    globalProviderBudgets.configure({
+        defaultDailyLimit: cfg.providerDailyCallBudget,
+        overrides: cfg.providerBudgetOverrides
+    });
 
     const publicUrl = resolvePublicUrl(cfg);
     const audit = createAuditLogger({
@@ -216,6 +240,15 @@ async function main(): Promise<void> {
         aggregateSwrSec: cfg.cacheSwrSec
     });
 
+    // ── Phase 7 §10.3: cluster event bus (Redis pub/sub; no-op single-node) ─
+    const useSharedRedis = cfg.cacheType === 'redis' || cfg.store === 'redis';
+    const clusterBus = new ClusterBus({
+        enabled: cfg.clusterBusEnabled,
+        instanceId,
+        redis: useSharedRedis ? cfg.redis : undefined
+    });
+    await clusterBus.start();
+
     const registry = server.getRegistry();
     const manager = AddonManager.create(registry, cfg, storage);
     // Revision hook: clear bulk/OMSS cache when provider set changes so
@@ -238,6 +271,55 @@ async function main(): Promise<void> {
         } catch {
             /* ignore */
         }
+        // Tell other replicas to reload from shared storage (§10.3).
+        await clusterBus.publish({
+            type: 'revision',
+            revision: rev,
+            origin: instanceId
+        });
+        // Best-effort cache-invalidate for memory-only fallback nodes where
+        // Redis invalidation may have missed or raced; remote handler will
+        // drop its in-memory prefix copies. Harmless duplicate when Redis
+        // already cleared.
+        await clusterBus
+            .publish({
+                type: 'cache-invalidate',
+                prefixes: ['aggregate-result:v1:', 'provider-result:v1:'],
+                origin: instanceId
+            })
+            .catch(() => undefined);
+    });
+    // Cross-instance sync: a replica that mutated the provider set bumps the
+    // shared revision; reload local state and drop caches when we're behind.
+    clusterBus.on(async (event) => {
+        if (event.type === 'revision') {
+            if (event.revision > manager.getRevision()) {
+                logger.info(
+                    `Cluster revision ${event.revision} > local ${manager.getRevision()} — reloading`,
+                    { component: 'cluster', origin: event.origin }
+                );
+                const reloaded = await manager.reloadFromStorage(
+                    `cluster-revision-${event.revision}`
+                );
+                if (reloaded) {
+                    try {
+                        await cacheManager.invalidateOnRevisionChange(
+                            event.revision
+                        );
+                        await omssCache.clear();
+                        globalMediaIdentity.clearCache();
+                    } catch {
+                        /* ignore */
+                    }
+                }
+            }
+        } else if (event.type === 'cache-invalidate') {
+            for (const prefix of event.prefixes) {
+                await cacheManager
+                    .invalidatePrefix(prefix)
+                    .catch(() => undefined);
+            }
+        }
     });
     await manager.init();
 
@@ -247,6 +329,14 @@ async function main(): Promise<void> {
     });
 
     const proxyCtx = createSecureProxyContext(cfg);
+    // Phase 7 §10.4 — capacity guards shared by proxy routes, health, metrics.
+    const capacityGuards = createProxyCapacityGuards(cfg);
+    const proxyCtxWithCapacity = {
+        ...proxyCtx,
+        streams: capacityGuards.streams,
+        egress: capacityGuards.egress,
+        maxGrantsPerRequest: capacityGuards.maxGrantsPerRequest
+    };
     // Wire grants into providers so sources use /v1/proxy/grant/:id.
     if (cfg.secureProxy) {
         manager.setPlaybackGrants(proxyCtx.grants, publicUrl);
@@ -258,7 +348,12 @@ async function main(): Promise<void> {
     patchTMDBService(server);
 
     // Authoritative provider selection — single source of truth for ordering.
-    const selection = new ProviderSelectionService(manager, globalReliability);
+    // Budgets (Phase 7 §10.4) filter providers with exhausted daily call limits.
+    const selection = new ProviderSelectionService(
+        manager,
+        globalReliability,
+        globalProviderBudgets
+    );
 
     // Make source cache keys revision-aware so stale entries are never hit after a mutation,
     // even if the async clear hasn't finished. Also injects creation revision into cached responses.
@@ -267,7 +362,7 @@ async function main(): Promise<void> {
     // Patch OMSS SourceService to use selection ordering and bounded concurrency.
     // This makes bulk and progressive agree on priority and ensures
     // reordering changes both paths predictably (Phase 2.2 acceptance).
-    patchSourceService(server, selection);
+    patchSourceService(server, selection, cfg);
 
     const monitor = new HealthMonitor(manager, {
         intervalMinutes: cfg.healthIntervalMinutes,
@@ -275,7 +370,14 @@ async function main(): Promise<void> {
         jobEngine,
         staleThresholdMinutes: cfg.healthStaleThresholdMinutes,
         degradedMinProvidersRatio: cfg.healthDegradedMinProvidersRatio,
-        version: cfg.version
+        version: cfg.version,
+        readinessGate: globalReadinessGate,
+        capacity: {
+            providerBudgets: globalProviderBudgets,
+            egress: capacityGuards.egress,
+            streams: capacityGuards.streams
+        },
+        cluster: clusterBus
     });
 
     const app = server.getInstance();
@@ -346,8 +448,33 @@ async function main(): Promise<void> {
     // Global HTTP security (headers, cookies, safe errors, query length).
     registerHttpSecurity(app, cfg);
 
+    // Phase 7 §10.2 — once shutdown begins, refuse new work with 503 so the
+    // load balancer drains us; probes and metrics stay served.
+    app.addHook('onRequest', async (request, reply) => {
+        if (!globalReadinessGate.isShuttingDown) return;
+        const path = (request.url ?? '').split('?')[0];
+        if (
+            path.startsWith('/health') ||
+            path === '/metrics' ||
+            path === '/health/ready' ||
+            path === '/health/live'
+        ) {
+            reply.header('Connection', 'close');
+            return;
+        }
+        reply.header('Connection', 'close');
+        reply.header('Retry-After', '5');
+        await reply.code(503).send({
+            error: {
+                code: 'SHUTTING_DOWN',
+                message: 'Instance is shutting down — retry another replica'
+            },
+            requestId: request.id
+        });
+    });
+
     // Secure playback grant routes + legacy open-proxy block.
-    registerSecureProxyRoutes(app, cfg, proxyCtx, publicUrl);
+    registerSecureProxyRoutes(app, cfg, proxyCtxWithCapacity, publicUrl);
 
     // ── Auth session endpoints ────────────────────────────────────────────────
     registerAuthRoutes(app, cfg, audit);
@@ -392,12 +519,18 @@ async function main(): Promise<void> {
             return reply.code(200).send({
                 revision: manager.getRevision(),
                 reliability: globalReliability.snapshot(),
+                quarantined: globalReliability.listQuarantined(),
+                providerBudgets: globalProviderBudgets.snapshot(),
                 providers: manager.list().map((a) => ({
                     id: a.providerId,
                     name: a.name,
                     enabled: a.enabled,
                     capabilities: a.capabilities,
                     state: globalReliability.getState(a.providerId),
+                    quarantined: globalReliability.isQuarantined(a.providerId),
+                    budgetExhausted: globalProviderBudgets.isExhausted(
+                        a.providerId
+                    ),
                     metrics: globalReliability.getMetrics(a.providerId)
                 }))
             });
@@ -420,8 +553,15 @@ async function main(): Promise<void> {
             undefined,
             ip
         );
-        // Use a dedicated bucket for progressive scraping: 30/min per IP, concurrency via limiter
-        const res = scrapeLimiter.lim.take(key, 30, 60_000);
+        // Phase 7 §10.4 — dedicated bucket per IP with a tighter quota for
+        // anonymous callers when one is configured (authenticated actors get
+        // the standard scrape quota).
+        const authUser = (request as unknown as { authUser?: { id?: string } })
+            .authUser;
+        const perMin = authUser?.id
+            ? cfg.scrapeRateLimitPerMin
+            : cfg.anonScrapeRateLimitPerMin || cfg.scrapeRateLimitPerMin;
+        const res = scrapeLimiter.lim.take(key, perMin, 60_000);
         reply.header('X-RateLimit-Limit', String(res.limit));
         reply.header('X-RateLimit-Remaining', String(res.remaining));
         if (!res.allowed) {
@@ -676,30 +816,60 @@ async function main(): Promise<void> {
 
         const creationRev = manager.getRevision();
         const deadline = Date.now() + 15_000;
-        const result = await aggregateSubtitles(
-            manager,
-            publicUrl,
-            {
-                imdbId: q.imdbId,
-                tmdbId: q.tmdbId,
-                season: q.season,
-                episode: q.episode,
-                language: q.language
-            },
-            {
-                grants: cfg.secureProxy ? proxyCtx.grants : undefined,
-                secureProxy: cfg.secureProxy,
-                signal: (request as unknown as { signal?: AbortSignal }).signal,
-                deadlineMs: deadline
+        try {
+            const result = await aggregateSubtitles(
+                manager,
+                publicUrl,
+                {
+                    imdbId: q.imdbId,
+                    tmdbId: q.tmdbId,
+                    season: q.season,
+                    episode: q.episode,
+                    language: q.language
+                },
+                {
+                    grants: cfg.secureProxy ? proxyCtx.grants : undefined,
+                    secureProxy: cfg.secureProxy,
+                    signal: (request as unknown as { signal?: AbortSignal })
+                        .signal,
+                    deadlineMs: deadline
+                }
+            );
+            return reply.code(200).send({
+                subtitles: result.subtitles,
+                source: 'stremio-addons',
+                addonsQueried: result.addonsQueried,
+                revision: creationRev,
+                ...(result.error ? { error: result.error } : {})
+            });
+        } catch (err) {
+            const code = (err as { code?: string }).code;
+            if (code === 'SEMAPHORE_FULL' || code === 'QUEUE_TIMEOUT') {
+                reply.header('Retry-After', '2');
+                return reply.code(503).send({
+                    subtitles: [],
+                    source: 'stremio-addons',
+                    addonsQueried: 0,
+                    revision: creationRev,
+                    diagnostics: [
+                        {
+                            code: 'OVERLOADED',
+                            message:
+                                err instanceof Error
+                                    ? err.message
+                                    : 'Concurrency pool saturated',
+                            field: '',
+                            severity: 'warning'
+                        }
+                    ],
+                    error:
+                        err instanceof Error
+                            ? err.message
+                            : 'Concurrency pool saturated'
+                });
             }
-        );
-        return reply.code(200).send({
-            subtitles: result.subtitles,
-            source: 'stremio-addons',
-            addonsQueried: result.addonsQueried,
-            revision: creationRev,
-            ...(result.error ? { error: result.error } : {})
-        });
+            throw err;
+        }
     });
 
     // ── Health Probes & Metrics (Phase 6.4) ───────────────────────────────────
@@ -761,13 +931,23 @@ async function main(): Promise<void> {
             const wantsJson =
                 format === 'json' || accept.includes('application/json');
 
+            // Phase 7 live gauges (concurrency pools, capacity, readiness).
+            const phase7Services = {
+                concurrency: globalConcurrency,
+                streams: capacityGuards.streams,
+                egressBudget: capacityGuards.egress,
+                grants: proxyCtx.grants,
+                readiness: globalReadinessGate
+            };
+
             if (wantsJson) {
                 const snap = await globalMetrics.snapshot({
                     manager,
                     circuit: globalReliability,
                     cache: cacheManager,
                     jobs: jobEngine,
-                    storage
+                    storage,
+                    ...phase7Services
                 });
                 return reply
                     .header('Content-Type', 'application/json; charset=utf-8')
@@ -780,7 +960,8 @@ async function main(): Promise<void> {
                 circuit: globalReliability,
                 cache: cacheManager,
                 jobs: jobEngine,
-                storage
+                storage,
+                ...phase7Services
             });
             return reply
                 .header(
@@ -829,7 +1010,9 @@ async function main(): Promise<void> {
                 health: addon.health,
                 reliability: {
                     state,
-                    metrics
+                    metrics,
+                    quarantined: globalReliability.isQuarantined(providerId),
+                    quarantine: globalReliability.getQuarantine(providerId)
                 },
                 revision: manager.getRevision(),
                 addedAt: addon.addedAt,
@@ -897,16 +1080,61 @@ async function main(): Promise<void> {
     monitor.start();
     jobEngine.start();
 
-    process.on('SIGTERM', () => {
-        jobEngine.stop();
-        monitor.stop();
-        void storage.close();
+    // ── Phase 7 §10.2: graceful shutdown / rolling deploys ──────────────────
+    // Ordered phases: readiness already flipped by the coordinator before any
+    // phase runs. Each phase is bounded; the whole sequence is bounded by the
+    // configurable termination grace period. A second signal force-exits.
+    const shutdown = new ShutdownCoordinator(globalReadinessGate, {
+        gracePeriodMs: cfg.terminationGracePeriodMs,
+        installSignals: true
     });
-    process.on('SIGINT', () => {
-        jobEngine.stop();
-        monitor.stop();
-        void storage.close();
-    });
+    shutdown
+        .addPhase('stop-background-schedulers', async () => {
+            monitor.stop();
+        })
+        .addPhase(
+            'drain-jobs',
+            async () => {
+                if (cfg.shutdownDrainJobs) {
+                    // Give in-flight jobs most of their share of the grace
+                    // period, then release stragglers for retry elsewhere.
+                    const drainMs = Math.max(
+                        1000,
+                        Math.floor(cfg.terminationGracePeriodMs * 0.6)
+                    );
+                    await jobEngine.beginShutdown(drainMs);
+                } else {
+                    jobEngine.stop();
+                }
+            },
+            // Drain enforces its own deadline; this cap is the backstop.
+            Math.max(2000, Math.floor(cfg.terminationGracePeriodMs * 0.7))
+        )
+        .addPhase('abort-queued-concurrency-waiters', async () => {
+            const aborted = globalConcurrency.abortAllQueued();
+            if (aborted > 0) {
+                logger.info(`Aborted ${aborted} queued pool waiters`, {
+                    component: 'lifecycle'
+                });
+            }
+        })
+        .addPhase('close-http-listener', async () => {
+            // server.stop() closes the Fastify listener and waits for
+            // in-flight requests to complete.
+            await server.stop();
+        })
+        .addPhase('close-cluster-bus', async () => {
+            await clusterBus.close();
+        })
+        .addPhase('close-cache', async () => {
+            await cacheManager.close();
+        })
+        .addPhase('close-storage', async () => {
+            await storage.close();
+        })
+        .addPhase('close-egress-agents', async () => {
+            await closeEgress();
+        });
 
     const authSummary =
         cfg.authMode === 'disabled'
@@ -1028,7 +1256,8 @@ function patchCacheRevision(
 
 function patchSourceService(
     server: OMSSServer,
-    selection: ProviderSelectionService
+    selection: ProviderSelectionService,
+    cfg: AppConfig
 ): void {
     // Original preserved for debugging if needed
     void (
@@ -1061,114 +1290,23 @@ function patchSourceService(
         }
     ).fetchFromProviders = async (type: string, media: unknown) => {
         const m = media as import('@omss/framework').ProviderMediaObject;
-        const providers = selection.selectStreamProviders(m);
+        let providers = selection.selectStreamProviders(m);
+
+        // Phase 7 §10.4 — cap per-request source-lookup cost: providers are
+        // priority-ordered, so truncating keeps the best-first subset.
+        if (cfg.bulkMaxProvidersPerRequest > 0) {
+            providers = providers.slice(0, cfg.bulkMaxProvidersPerRequest);
+        }
         if (providers.length === 0) return [];
 
-        // Absolute deadline for the whole bulk aggregation — prevents multiple IDs/retries
-        // from exceeding the request budget. 20 s is enough for a 4-concurrency aggregate
-        // even with retries, but still aborts runaway addons.
-        const bulkCtrl = new AbortController();
-        const bulkTimeout = setTimeout(() => {
-            try {
-                bulkCtrl.abort(
-                    Object.assign(new Error('bulk deadline exceeded'), {
-                        name: 'TimeoutError'
-                    })
-                );
-            } catch {
-                /* ignore */
-            }
-        }, 20_000);
-        const bulkSignal = bulkCtrl.signal;
-
-        // Bounded concurrency aggregate — cancellable
-        const concurrency = 4;
-        const results: unknown[] = [];
-        try {
-            for (let i = 0; i < providers.length; i += concurrency) {
-                if (bulkSignal.aborted) break;
-                const batch = providers.slice(i, i + concurrency);
-                const settled = await Promise.allSettled(
-                    batch.map(async (addon) => {
-                        if (bulkSignal.aborted)
-                            return {
-                                sources: [],
-                                subtitles: [],
-                                diagnostics: []
-                            };
-                        const provider = (
-                            server as unknown as {
-                                getRegistry: () => {
-                                    getProvider(id: string): {
-                                        getMovieSources(
-                                            m: unknown,
-                                            s?: AbortSignal
-                                        ): Promise<unknown>;
-                                        getTVSources(
-                                            m: unknown,
-                                            s?: AbortSignal
-                                        ): Promise<unknown>;
-                                    };
-                                };
-                            }
-                        )
-                            .getRegistry()
-                            .getProvider(addon.providerId);
-                        if (!provider)
-                            return {
-                                sources: [],
-                                subtitles: [],
-                                diagnostics: []
-                            };
-                        try {
-                            const res =
-                                type === 'movie'
-                                    ? await provider.getMovieSources(
-                                          m as never,
-                                          bulkSignal
-                                      )
-                                    : await provider.getTVSources(
-                                          m as never,
-                                          bulkSignal
-                                      );
-                            return res;
-                        } catch (err) {
-                            if (
-                                (err as Error)?.name === 'AbortError' ||
-                                (err as Error)?.name === 'TimeoutError'
-                            ) {
-                                return {
-                                    sources: [],
-                                    subtitles: [],
-                                    diagnostics: []
-                                };
-                            }
-                            return {
-                                sources: [],
-                                subtitles: [],
-                                diagnostics: [
-                                    {
-                                        code: 'PROVIDER_ERROR',
-                                        message: `${addon.name}: ${err instanceof Error ? err.message : String(err)}`,
-                                        field: '',
-                                        severity: 'error'
-                                    }
-                                ]
-                            };
-                        }
-                    })
-                );
-                for (const s of settled) {
-                    if (s.status === 'fulfilled') results.push(s.value);
-                }
-            }
-        } finally {
-            clearTimeout(bulkTimeout);
-        }
-
-        // Keep results in selection priority order (already) but ensure mapping is 1:1
-        // Providers already ordered, results array is in same order as batch slicing.
-        return results;
+        // Phase 7 §10.1 — bulk lookups draw from the bulk pool, weighted by
+        // fan-out so a 16-provider aggregate reserves proportionally more
+        // capacity than a 2-provider one and cannot starve other classes.
+        const bulkPool = globalConcurrency.pool('bulk-scrape');
+        return bulkPool.withSlot(
+            () => fetchFromProvidersBounded(server, type, m, providers, cfg),
+            { weight: Math.max(1, Math.ceil(providers.length / 4)) }
+        );
     };
 
     // Also ensure buildResponse respects upstream dedup when grants are opaque.
@@ -1262,10 +1400,141 @@ function patchSourceService(
     );
 }
 
+/**
+ * Aggregate fetch over a pre-selected provider list with an absolute
+ * deadline (Phase 7: cfg.sourceLookupDeadlineMs) and batched bounded
+ * concurrency. The bulk-scrape pool slot is held by the caller.
+ */
+async function fetchFromProvidersBounded(
+    server: OMSSServer,
+    type: string,
+    m: import('@omss/framework').ProviderMediaObject,
+    providers: Array<{ providerId: string; name: string }>,
+    cfg: AppConfig
+): Promise<unknown[]> {
+    // Absolute deadline for the whole bulk aggregation — prevents multiple IDs/retries
+    // from exceeding the request budget.
+    const bulkCtrl = new AbortController();
+    const bulkTimeout = setTimeout(() => {
+        try {
+            bulkCtrl.abort(
+                Object.assign(new Error('bulk deadline exceeded'), {
+                    name: 'TimeoutError'
+                })
+            );
+        } catch {
+            /* ignore */
+        }
+    }, cfg.sourceLookupDeadlineMs);
+    const bulkSignal = bulkCtrl.signal;
+
+    // Bounded concurrency aggregate — cancellable
+    const concurrency = 4;
+    const results: unknown[] = [];
+    try {
+        for (let i = 0; i < providers.length; i += concurrency) {
+            if (bulkSignal.aborted) break;
+            const batch = providers.slice(i, i + concurrency);
+            const settled = await Promise.allSettled(
+                batch.map(async (addon) => {
+                    if (bulkSignal.aborted)
+                        return { sources: [], subtitles: [], diagnostics: [] };
+                    const provider = (
+                        server as unknown as {
+                            getRegistry: () => {
+                                getProvider(id: string): {
+                                    getMovieSources(
+                                        m: unknown,
+                                        s?: AbortSignal
+                                    ): Promise<unknown>;
+                                    getTVSources(
+                                        m: unknown,
+                                        s?: AbortSignal
+                                    ): Promise<unknown>;
+                                };
+                            };
+                        }
+                    )
+                        .getRegistry()
+                        .getProvider(addon.providerId);
+                    if (!provider)
+                        return { sources: [], subtitles: [], diagnostics: [] };
+                    try {
+                        const res =
+                            type === 'movie'
+                                ? await provider.getMovieSources(
+                                      m as never,
+                                      bulkSignal
+                                  )
+                                : await provider.getTVSources(
+                                      m as never,
+                                      bulkSignal
+                                  );
+                        return res;
+                    } catch (err) {
+                        if (
+                            (err as Error)?.name === 'AbortError' ||
+                            (err as Error)?.name === 'TimeoutError'
+                        ) {
+                            return {
+                                sources: [],
+                                subtitles: [],
+                                diagnostics: []
+                            };
+                        }
+                        return {
+                            sources: [],
+                            subtitles: [],
+                            diagnostics: [
+                                {
+                                    code: 'PROVIDER_ERROR',
+                                    message: `${addon.name}: ${err instanceof Error ? err.message : String(err)}`,
+                                    field: '',
+                                    severity: 'error'
+                                }
+                            ]
+                        };
+                    }
+                })
+            );
+            for (const s of settled) {
+                if (s.status === 'fulfilled') results.push(s.value);
+            }
+        }
+    } finally {
+        clearTimeout(bulkTimeout);
+    }
+
+    // Keep results in selection priority order (already) but ensure mapping is 1:1
+    // Providers already ordered, results array is in same order as batch slicing.
+    return results;
+}
+
 function sendProviderError(
     reply: import('fastify').FastifyReply,
     err: unknown
 ) {
+    // Phase 7 §10.1 — pool saturation surfaces as 503 OVERLOADED with a
+    // retry hint instead of a generic 5xx.
+    const code = (err as { code?: string }).code;
+    if (code === 'SEMAPHORE_FULL' || code === 'QUEUE_TIMEOUT') {
+        reply.header('Retry-After', '2');
+        const message =
+            err instanceof Error ? err.message : 'Concurrency pool saturated';
+        return reply.code(503).send({
+            sources: [],
+            subtitles: [],
+            diagnostics: [
+                {
+                    code: 'OVERLOADED',
+                    message,
+                    field: '',
+                    severity: 'warning'
+                }
+            ],
+            error: message
+        });
+    }
     const status = (err as Error & { statusCode?: number }).statusCode ?? 500;
     const safe = toSafeError(err, status);
     const message = safe.body.error.message;

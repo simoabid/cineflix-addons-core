@@ -20,6 +20,7 @@ This directory contains production-ready operational runbooks for diagnosing, mi
 | 10 | [SSRF & Security Incident Response](file:///home/seemoo/Documents/CINEFLIX%20Project/addons-core/docs/runbooks/ssrf-security-incident.md) | Critical | `addons_core_proxy_denied_ssrf_total` rising / Private IP probes | Isolate addon / revoke grants / update URL policy allowlist |
 | 11 | [Emergency Addon Quarantine](file:///home/seemoo/Documents/CINEFLIX%20Project/addons-core/docs/runbooks/emergency-quarantine-addon.md) | High | Malicious addon manifest / spam streams / memory leaking | Force-disable addon / trip circuit / trigger instant sweep |
 | 12 | [Zero-Downtime Deployment Rollback](file:///home/seemoo/Documents/CINEFLIX%20Project/addons-core/docs/runbooks/deployment-rollback.md) | Critical | Failed migration / post-deployment crash loops / API 500 spikes | Rollback container image / revert schema migration / restore state |
+| 13 | [Graceful Shutdown & Rolling Deploy Verification](file:///home/seemoo/Documents/CINEFLIX%20Project/addons-core/docs/runbooks/graceful-shutdown-rolling-deploy.md) | Standard Ops | Deploys / SIGTERM / `SHUTTING_DOWN` 503s / `WORKER_SHUTDOWN` job errors | Verify grace periods / watch readiness drain / confirm job retry |
 
 ---
 

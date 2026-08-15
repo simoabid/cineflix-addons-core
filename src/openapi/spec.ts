@@ -587,6 +587,35 @@ export function buildOpenApiSpec(
                     }
                 }
             },
+            '/v1/quarantine': {
+                get: {
+                    tags: ['Addon Management'],
+                    summary:
+                        'List quarantined providers (Phase 7 auto-quarantine after repeated failures)',
+                    responses: {
+                        '200': { description: 'Quarantined provider records' }
+                    }
+                }
+            },
+            '/v1/quarantine/{providerId}/release': {
+                post: {
+                    tags: ['Addon Management'],
+                    summary:
+                        'Manually release a provider from quarantine (admin)',
+                    parameters: [
+                        {
+                            name: 'providerId',
+                            in: 'path',
+                            required: true,
+                            schema: { type: 'string' }
+                        }
+                    ],
+                    responses: {
+                        '200': { description: 'Provider released' },
+                        '404': { $ref: '#/components/responses/NotFound' }
+                    }
+                }
+            },
             '/v1/addons/reorder': {
                 post: {
                     tags: ['Addon Management'],
