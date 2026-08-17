@@ -799,6 +799,63 @@ export const reorderAddonsBodyValidator: ValidatorFn<ReorderAddonsBody> = (
     return { ok: true, data: { order: b.order as string[] } };
 };
 
+export interface ManualQuarantineBody {
+    reason?: string;
+    ttlMs?: number;
+}
+
+export const manualQuarantineBodyValidator: ValidatorFn<
+    ManualQuarantineBody
+> = (input) => {
+    if (
+        input === undefined ||
+        input === null ||
+        typeof input !== 'object' ||
+        Array.isArray(input)
+    ) {
+        return { ok: true, data: {} };
+    }
+    const b = input as Record<string, unknown>;
+    const errors: ValidationIssue[] = [];
+    const out: ManualQuarantineBody = {};
+
+    errors.push(...checkUnknownProperties(b, ['reason', 'ttlMs'], 'body'));
+
+    if (b.reason !== undefined) {
+        if (
+            typeof b.reason !== 'string' ||
+            b.reason.trim().length === 0 ||
+            b.reason.length > 500
+        ) {
+            errors.push({
+                field: 'body.reason',
+                message:
+                    'Reason must be a non-empty string up to 500 characters',
+                received: b.reason
+            });
+        } else {
+            out.reason = b.reason.trim();
+        }
+    }
+
+    if (b.ttlMs !== undefined) {
+        const t = Number(b.ttlMs);
+        if (!Number.isInteger(t) || t < 0 || t > 86_400_000 * 30) {
+            errors.push({
+                field: 'body.ttlMs',
+                message:
+                    'ttlMs must be a non-negative integer up to 30 days in milliseconds',
+                received: b.ttlMs
+            });
+        } else {
+            out.ttlMs = t;
+        }
+    }
+
+    if (errors.length > 0) return { ok: false, errors };
+    return { ok: true, data: out };
+};
+
 export interface ImportUrlBody {
     url?: string;
     urls?: string[];
