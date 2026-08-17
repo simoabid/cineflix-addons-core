@@ -40,6 +40,7 @@ import {
     providerIdValidator,
     patchAddonBodyValidator,
     reorderAddonsBodyValidator,
+    manualQuarantineBodyValidator,
     patchDebridBodyValidator,
     debridTransferBodyValidator
 } from '../validation/schemas.js';
@@ -326,7 +327,11 @@ export function registerAddonRoutes(
     );
 
     // ── DELETE /v1/addons/:providerId ─────────────────────────────────────────
-    app.delete<{ Params: { providerId: string } }>(
+    app.delete<{
+        Params: { providerId: string };
+        Body?: { reason?: string };
+        Querystring?: { reason?: string };
+    }>(
         '/v1/addons/:providerId',
         { preHandler: adminGuard },
         async (req, reply) => {
@@ -362,6 +367,19 @@ export function registerAddonRoutes(
                 return;
             }
 
+            const rawReason =
+                typeof req.body === 'object' &&
+                req.body !== null &&
+                typeof (req.body as Record<string, unknown>).reason === 'string'
+                    ? (req.body as Record<string, string>).reason.trim()
+                    : typeof req.query === 'object' &&
+                        req.query !== null &&
+                        typeof (req.query as Record<string, unknown>).reason ===
+                            'string'
+                      ? (req.query as Record<string, string>).reason.trim()
+                      : undefined;
+            const reason = rawReason || 'Operator removal';
+
             const before = manager.get(providerId);
             const removed = await manager.remove(providerId);
             if (!removed) {
@@ -381,7 +399,8 @@ export function registerAddonRoutes(
             }
 
             await auditMutation(req, 'addon.remove', providerId, 'success', {
-                before: before ? toPublicAddon(before) : undefined
+                before: before ? toPublicAddon(before) : undefined,
+                reason
             });
 
             const rev = manager.getRevision();
@@ -391,6 +410,7 @@ export function registerAddonRoutes(
             return reply.code(200).send({
                 ok: true,
                 removed: providerId,
+                reason,
                 revision: rev
             });
         }
@@ -458,6 +478,91 @@ export function registerAddonRoutes(
             return reply.code(200).send({
                 ok: true,
                 released: providerId,
+                revision: manager.getRevision()
+            });
+        }
+    );
+
+    app.post<{
+        Params: { providerId: string };
+        Body: Record<string, unknown>;
+    }>(
+        '/v1/quarantine/:providerId',
+        { preHandler: operatorGuard },
+        async (req, reply) => {
+            const paramRes = providerIdValidator(req.params.providerId);
+            if (!paramRes.ok && paramRes.errors) {
+                return reply
+                    .code(400)
+                    .send(formatValidationError(paramRes.errors, req.id));
+            }
+            const providerId = paramRes.data!;
+
+            const bodyRes = manualQuarantineBodyValidator(req.body);
+            if (!bodyRes.ok && bodyRes.errors) {
+                return reply
+                    .code(400)
+                    .send(formatValidationError(bodyRes.errors, req.id));
+            }
+            const body = bodyRes.data ?? {};
+
+            // Rate limit: uses 'mutate' bucket because quarantining modifies provider availability & reliability state.
+            const ip = clientIp(req, cfg);
+            if (
+                !(await enforceRateLimit(
+                    reply,
+                    limiter,
+                    rateLimitKey('mutate', req.auth?.actor?.id, ip),
+                    RATE_LIMITS.mutate.limit,
+                    RATE_LIMITS.mutate.windowMs
+                ))
+            ) {
+                return;
+            }
+
+            // Optimistic concurrency check
+            if (
+                !(await checkOptimisticConcurrency(
+                    req,
+                    reply,
+                    manager.getRevision()
+                ))
+            ) {
+                return;
+            }
+
+            const addon = manager.get(providerId);
+            if (!addon) {
+                return reply.code(404).send({
+                    error: {
+                        code: 'NOT_FOUND',
+                        message: 'Addon not found'
+                    },
+                    requestId: req.id
+                });
+            }
+
+            const reason = body.reason || 'Manual operator quarantine';
+            globalReliability.quarantine(providerId, reason, {
+                ttlMs: body.ttlMs
+            });
+
+            await auditMutation(
+                req,
+                'addon.quarantine.manual',
+                providerId,
+                'success',
+                {
+                    reason,
+                    meta: { ttlMs: body.ttlMs }
+                }
+            );
+
+            return reply.code(200).send({
+                ok: true,
+                quarantined: providerId,
+                reason,
+                record: globalReliability.getQuarantine(providerId),
                 revision: manager.getRevision()
             });
         }
@@ -641,6 +746,100 @@ export function registerAddonRoutes(
             return reply.code(status).send({
                 ...result,
                 addon: result.addon ? toPublicAddon(result.addon) : undefined,
+                revision: rev
+            });
+        }
+    );
+
+    // ── POST /v1/addons/:providerId/probe ─────────────────────────────────────
+    app.post<{ Params: { providerId: string } }>(
+        '/v1/addons/:providerId/probe',
+        { preHandler: operatorGuard },
+        async (req, reply) => {
+            const paramRes = providerIdValidator(req.params.providerId);
+            if (!paramRes.ok && paramRes.errors) {
+                return reply
+                    .code(400)
+                    .send(formatValidationError(paramRes.errors, req.id));
+            }
+            const providerId = paramRes.data!;
+
+            // Rate limit: uses 'refresh' bucket because probing touches upstream network dependencies.
+            const ip = clientIp(req, cfg);
+            if (
+                !(await enforceRateLimit(
+                    reply,
+                    limiter,
+                    rateLimitKey('refresh', req.auth?.actor?.id, ip),
+                    RATE_LIMITS.refresh?.limit ?? RATE_LIMITS.mutate.limit,
+                    RATE_LIMITS.refresh?.windowMs ?? RATE_LIMITS.mutate.windowMs
+                ))
+            ) {
+                return;
+            }
+
+            // Optimistic concurrency check
+            if (
+                !(await checkOptimisticConcurrency(
+                    req,
+                    reply,
+                    manager.getRevision()
+                ))
+            ) {
+                return;
+            }
+
+            const addon = manager.get(providerId);
+            if (!addon) {
+                return reply.code(404).send({
+                    error: { code: 'NOT_FOUND', message: 'Addon not found' },
+                    requestId: req.id
+                });
+            }
+
+            const t0 = Date.now();
+            const result = await manager.refresh(providerId);
+            const latencyMs = Date.now() - t0;
+
+            const circuitState = globalReliability.getState(providerId);
+            const isQuarantined = globalReliability.isQuarantined(providerId);
+            const healthRecord = {
+                healthy: result.ok,
+                latencyMs,
+                lastChecked: new Date().toISOString(),
+                circuitState,
+                error: result.ok ? undefined : result.error
+            };
+
+            manager.setHealth(providerId, result.ok, healthRecord);
+
+            await auditMutation(
+                req,
+                'addon.probe',
+                providerId,
+                result.ok ? 'success' : 'failure',
+                {
+                    reason: result.error,
+                    meta: { latencyMs, circuitState, isQuarantined }
+                }
+            );
+
+            const rev = manager.getRevision();
+            reply.header('x-provider-revision', String(rev));
+            reply.header('ETag', `"rev-${rev}"`);
+
+            return reply.code(200).send({
+                ok: result.ok,
+                providerId,
+                healthy: result.ok,
+                latencyMs,
+                circuitState,
+                isQuarantined,
+                health: healthRecord,
+                error: result.error,
+                addon: result.addon
+                    ? toPublicAddon(result.addon)
+                    : toPublicAddon(addon),
                 revision: rev
             });
         }
