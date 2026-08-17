@@ -1,186 +1,1545 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
     <head>
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <title>addons-core · admin</title>
+        <title>addons-core · Operator Console</title>
         <link rel="stylesheet" href="/admin/styles.css" />
     </head>
     <body>
-        <header class="topbar">
-            <div class="brand">
-                <span class="logo">▶</span>
-                <div>
-                    <h1>addons-core</h1>
-                    <p class="tagline">Stremio addon aggregator · OMSS backend</p>
+        <!-- Accessibility Skip Link -->
+        <a href="#main-content" class="skip-link">Skip to main content</a>
+
+        <!-- Top Navigation Bar -->
+        <header class="topbar" role="banner">
+            <div class="brand-group">
+                <div class="brand-logo" aria-hidden="true">
+                    <svg
+                        width="22"
+                        height="22"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2.2"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                    >
+                        <polygon points="5 3 19 12 5 21 5 3"></polygon>
+                    </svg>
+                </div>
+                <div class="brand-info">
+                    <div class="brand-title-row">
+                        <h1 class="brand-title">addons-core</h1>
+                        <span
+                            class="badge badge-rev"
+                            id="global-rev"
+                            title="Configuration Revision"
+                            >rev 0</span
+                        >
+                    </div>
+                    <p class="brand-tagline">
+                        OMSS Source Provider &amp; Addon Gateway
+                    </p>
                 </div>
             </div>
-            <div class="status" id="health">
-                <span class="dot" id="health-dot"></span>
-                <span id="health-text">checking…</span>
+
+            <div class="topbar-meta">
+                <!-- System Health Beacon -->
+                <div
+                    class="health-beacon"
+                    id="global-health"
+                    title="Service Health Status"
+                >
+                    <span
+                        class="beacon-dot"
+                        id="health-dot"
+                        aria-hidden="true"
+                    ></span>
+                    <span class="beacon-label" id="health-text">Checking…</span>
+                </div>
+
+                <div
+                    class="topbar-timecode"
+                    id="topbar-timecode"
+                    aria-label="Console timecode"
+                    title="Local timecode"
+                >
+                    --:--:--
+                </div>
+
+                <!-- Session / Actor Pill -->
+                <div class="session-capsule" id="session-capsule">
+                    <div class="actor-info" id="actor-info">
+                        <span class="actor-role badge" id="actor-role"
+                            >Viewer</span
+                        >
+                        <span class="actor-id" id="actor-id">anonymous</span>
+                    </div>
+                    <button
+                        class="btn btn-sm btn-ghost"
+                        id="auth-btn"
+                        aria-label="Sign in or out"
+                    >
+                        Sign in
+                    </button>
+                </div>
             </div>
         </header>
 
-        <main>
-            <section class="panel" id="token-panel" hidden>
-                <h2>Sign in</h2>
-                <p class="muted">
-                    This server requires authentication for management calls.
-                    Your token is exchanged for a short-lived HttpOnly session
-                    cookie and is <strong>not</strong> stored in the browser.
-                </p>
-                <div class="row">
-                    <input
-                        type="password"
-                        id="token-input"
-                        placeholder="admin token"
-                        autocomplete="current-password"
-                    />
-                    <button id="token-save">Sign in</button>
-                </div>
-            </section>
+        <!-- Primary Navigation Tabs -->
+        <nav class="subnav" aria-label="Main Navigation">
+            <div class="subnav-container">
+                <button
+                    class="nav-tab active"
+                    data-view="providers"
+                    id="tab-providers"
+                    role="tab"
+                    aria-selected="true"
+                    aria-controls="view-providers"
+                >
+                    <svg
+                        class="tab-icon"
+                        width="16"
+                        height="16"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                    >
+                        <rect x="2" y="2" width="20" height="8" rx="2" />
+                        <rect x="2" y="14" width="20" height="8" rx="2" />
+                        <line x1="6" y1="6" x2="6.01" y2="6" />
+                        <line x1="6" y1="18" x2="6.01" y2="18" />
+                    </svg>
+                    <span>Providers</span>
+                    <span class="tab-badge" id="tab-provider-count">0</span>
+                </button>
+                <button
+                    class="nav-tab"
+                    data-view="reliability"
+                    id="tab-reliability"
+                    role="tab"
+                    aria-selected="false"
+                    aria-controls="view-reliability"
+                >
+                    <svg
+                        class="tab-icon"
+                        width="16"
+                        height="16"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                    >
+                        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+                    </svg>
+                    <span>Reliability &amp; Circuits</span>
+                    <span
+                        class="tab-badge warning-badge"
+                        id="tab-quarantine-count"
+                        hidden
+                        >0</span
+                    >
+                </button>
+                <button
+                    class="nav-tab"
+                    data-view="jobs"
+                    id="tab-jobs"
+                    role="tab"
+                    aria-selected="false"
+                    aria-controls="view-jobs"
+                >
+                    <svg
+                        class="tab-icon"
+                        width="16"
+                        height="16"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                    >
+                        <circle cx="12" cy="12" r="10" />
+                        <polyline points="12 6 12 12 16 14" />
+                    </svg>
+                    <span>Jobs &amp; Tasks</span>
+                    <span class="tab-badge" id="tab-job-count">0</span>
+                </button>
+                <button
+                    class="nav-tab"
+                    data-view="metrics"
+                    id="tab-metrics"
+                    data-require-role="admin"
+                    role="tab"
+                    aria-selected="false"
+                    aria-controls="view-metrics"
+                >
+                    <svg
+                        class="tab-icon"
+                        width="16"
+                        height="16"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                    >
+                        <path d="M3 3v18h18" />
+                        <path d="m19 9-5 5-4-4-3 3" />
+                    </svg>
+                    <span>Observability &amp; SLO</span>
+                </button>
+                <button
+                    class="nav-tab"
+                    data-view="audit"
+                    id="tab-audit"
+                    data-require-role="admin"
+                    role="tab"
+                    aria-selected="false"
+                    aria-controls="view-audit"
+                >
+                    <svg
+                        class="tab-icon"
+                        width="16"
+                        height="16"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                    >
+                        <path
+                            d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"
+                        />
+                        <polyline points="14 2 14 8 20 8" />
+                        <line x1="16" y1="13" x2="8" y2="13" />
+                        <line x1="16" y1="17" x2="8" y2="17" />
+                        <polyline points="10 9 9 9 8 9" />
+                    </svg>
+                    <span>Audit Trail</span>
+                </button>
+                <button
+                    class="nav-tab"
+                    data-view="settings"
+                    id="tab-settings"
+                    role="tab"
+                    aria-selected="false"
+                    aria-controls="view-settings"
+                >
+                    <svg
+                        class="tab-icon"
+                        width="16"
+                        height="16"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                    >
+                        <circle cx="12" cy="12" r="3" />
+                        <path
+                            d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"
+                        />
+                    </svg>
+                    <span>Settings &amp; Debrid</span>
+                </button>
+                <button
+                    class="nav-tab"
+                    data-view="import"
+                    id="tab-import"
+                    role="tab"
+                    aria-selected="false"
+                    aria-controls="view-import"
+                >
+                    <svg
+                        class="tab-icon"
+                        width="16"
+                        height="16"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                    >
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                        <polyline points="7 10 12 15 17 10" />
+                        <line x1="12" y1="15" x2="12" y2="3" />
+                    </svg>
+                    <span>Import Addons</span>
+                </button>
+            </div>
+        </nav>
 
-            <section class="grid">
-                <div class="panel">
-                    <h2>Import from URL</h2>
-                    <p class="muted">
-                        Paste any addon <code>manifest.json</code> (or transport)
-                        URL. One per line for several.
-                    </p>
-                    <textarea
-                        id="url-input"
-                        rows="3"
-                        placeholder="https://torrentio.strem.fun/manifest.json"
-                    ></textarea>
-                    <button id="url-btn">Install</button>
+        <!-- Main Content Area -->
+        <main class="main-container" id="main-content">
+            <!-- Offline Warning Banner -->
+            <div class="offline-banner" id="offline-banner" hidden>
+                <svg
+                    width="18"
+                    height="18"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                >
+                    <line x1="1" y1="1" x2="23" y2="23" />
+                    <path d="M16.72 11.06A10.94 10.94 0 0 1 19 12.55" />
+                    <path d="M5 12.55a10.94 10.94 0 0 1 5.17-2.39" />
+                    <path d="M10.71 5.05A16 16 0 0 1 22.58 9" />
+                    <path d="M1.42 9a15.91 15.91 0 0 1 4.7-2.88" />
+                    <path d="M8.53 16.11a6 6 0 0 1 6.95 0" />
+                    <line x1="12" y1="20" x2="12.01" y2="20" />
+                </svg>
+                <span>Connection lost. Attempting to reconnect…</span>
+                <button class="btn btn-xs btn-ghost" id="retry-conn-btn">
+                    Retry now
+                </button>
+            </div>
+
+            <!-- VIEW 1: PROVIDERS & ADDONS -->
+            <section
+                class="view-panel active"
+                id="view-providers"
+                role="tabpanel"
+                aria-labelledby="tab-providers"
+            >
+                <div class="panel-header">
+                    <div>
+                        <h2 class="section-title">
+                            Installed Addons &amp; Source Providers
+                        </h2>
+                        <p class="section-desc" id="store-summary">
+                            Managing stream &amp; subtitle sources with
+                            revision-aware waterfall ordering.
+                        </p>
+                    </div>
+                    <div class="panel-actions">
+                        <button
+                            class="btn btn-secondary"
+                            id="sweep-health-btn"
+                            title="Run background health sweep across stream providers"
+                            data-require-role="operator"
+                        >
+                            <svg
+                                width="14"
+                                height="14"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="currentColor"
+                                stroke-width="2"
+                            >
+                                <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
+                            </svg>
+                            <span>Sweep Health</span>
+                        </button>
+                        <button
+                            class="btn btn-ghost"
+                            id="refresh-addons-btn"
+                            title="Reload providers list"
+                        >
+                            <svg
+                                width="14"
+                                height="14"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="currentColor"
+                                stroke-width="2"
+                            >
+                                <polyline points="23 4 23 10 17 10" />
+                                <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+                            </svg>
+                            <span>Reload</span>
+                        </button>
+                    </div>
                 </div>
 
-                <div class="panel">
-                    <h2>Import from Stremio account</h2>
-                    <p class="muted">
-                        Imports your whole Stremio addon collection. Credentials
-                        are sent once to <code>api.strem.io</code> and not stored.
-                    </p>
-                    <input type="email" id="stremio-email" placeholder="email" />
-                    <input
-                        type="password"
-                        id="stremio-password"
-                        placeholder="password"
-                    />
-                    <div class="or">— or —</div>
-                    <input
-                        type="text"
-                        id="stremio-authkey"
-                        placeholder="authKey (optional, instead of email/password)"
-                    />
-                    <button id="stremio-btn">Import collection</button>
-                </div>
-
-                <div class="panel">
-                    <h2>Import from repository</h2>
-                    <p class="muted">
-                        A URL returning a list of addon URLs (JSON array/object or
-                        one-per-line text).
-                    </p>
-                    <input
-                        type="text"
-                        id="repo-input"
-                        placeholder="https://example.com/addons.json"
-                    />
-                    <button id="repo-btn">Import all</button>
-                </div>
-            </section>
-
-            <section class="panel" id="debrid-panel">
-                <div class="panel-head">
-                    <h2>Debrid</h2>
-                    <span class="debrid-badge" id="debrid-badge">off</span>
-                </div>
-                <p class="muted">
-                    Resolve torrent streams (Torrentio, MediaFusion, Comet, …)
-                    into playable HTTP links via your debrid account. Only
-                    already-cached torrents are used, to keep playback fast.
-                </p>
-                <div class="row">
-                    <select id="debrid-provider">
-                        <option value="none">Disabled</option>
-                        <option value="realdebrid">Real-Debrid</option>
-                        <option value="alldebrid">AllDebrid</option>
-                        <option value="premiumize">Premiumize</option>
-                    </select>
-                    <input
-                        type="password"
-                        id="debrid-key"
-                        placeholder="API key"
-                        autocomplete="off"
-                    />
-                </div>
-                <div class="row">
-                    <button id="debrid-save">Save</button>
-                    <button class="ghost" id="debrid-test">Test key</button>
-                </div>
-                <p class="muted lock" id="debrid-lock" hidden>
-                    Debrid is pinned by environment variables (DEBRID_*) and
-                    can't be changed here.
-                </p>
-            </section>
-
-            <section class="panel">
-                <div class="panel-head">
-                    <h2>
-                        Installed addons
-                        <span class="count" id="addon-count">0</span>
-                    </h2>
-                    <div class="head-actions">
+                <!-- Provider Filters & Search -->
+                <div class="filter-toolbar">
+                    <div class="search-input-wrapper">
+                        <svg
+                            class="search-icon"
+                            width="15"
+                            height="15"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="2"
+                        >
+                            <circle cx="11" cy="11" r="8" />
+                            <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                        </svg>
                         <input
                             type="search"
-                            id="addon-search"
-                            placeholder="Filter…"
+                            id="provider-search"
+                            placeholder="Filter by name, provider ID, resource…"
+                            aria-label="Search providers"
                         />
-                        <button class="ghost" id="health-btn">
-                            Check health
+                    </div>
+
+                    <div class="filter-controls">
+                        <select
+                            id="filter-capability"
+                            aria-label="Filter by capability"
+                        >
+                            <option value="all">All Capabilities</option>
+                            <option value="stream">Stream Provider</option>
+                            <option value="subtitles">Subtitles</option>
+                            <option value="catalog">Catalog</option>
+                            <option value="meta">Metadata</option>
+                        </select>
+
+                        <select
+                            id="filter-health"
+                            aria-label="Filter by health state"
+                        >
+                            <option value="all">All Health States</option>
+                            <option value="healthy">Healthy Only</option>
+                            <option value="unhealthy">Unhealthy / Stale</option>
+                            <option value="unknown">Unknown</option>
+                        </select>
+
+                        <select
+                            id="filter-state"
+                            aria-label="Filter by admission state"
+                        >
+                            <option value="all">All States</option>
+                            <option value="enabled">Enabled Only</option>
+                            <option value="disabled">Disabled Only</option>
+                            <option value="pending">Pending Validation</option>
+                            <option value="quarantined">Quarantined</option>
+                        </select>
+
+                        <select id="sort-by" aria-label="Sort providers">
+                            <option value="order-asc">
+                                Priority Order (Asc)
+                            </option>
+                            <option value="order-desc">
+                                Priority Order (Desc)
+                            </option>
+                            <option value="name-asc">Name (A-Z)</option>
+                            <option value="name-desc">Name (Z-A)</option>
+                            <option value="health-desc">
+                                Health (Healthy First)
+                            </option>
+                            <option value="updatedAt-desc">
+                                Recently Updated
+                            </option>
+                        </select>
+                    </div>
+                </div>
+
+                <!-- Provider List Container -->
+                <div class="provider-list-card">
+                    <div class="provider-list-header">
+                        <span class="col-rank">Priority</span>
+                        <span class="col-provider">Provider Info</span>
+                        <span class="col-caps">Capabilities</span>
+                        <span class="col-health">Health / Freshness</span>
+                        <span class="col-policy">Timeout (ms)</span>
+                        <span class="col-actions">Actions</span>
+                    </div>
+
+                    <ul
+                        class="provider-list"
+                        id="provider-list"
+                        aria-label="Providers list"
+                        aria-dropeffect="move"
+                    ></ul>
+
+                    <div class="empty-state" id="empty-providers-msg" hidden>
+                        <svg
+                            width="40"
+                            height="40"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="1.5"
+                        >
+                            <rect x="2" y="2" width="20" height="8" rx="2" />
+                            <rect x="2" y="14" width="20" height="8" rx="2" />
+                            <line x1="6" y1="6" x2="6.01" y2="6" />
+                            <line x1="6" y1="18" x2="6.01" y2="18" />
+                        </svg>
+                        <h3>No providers found</h3>
+                        <p class="muted">
+                            No addons match your active filters or none are
+                            installed yet.
+                        </p>
+                        <button
+                            class="btn btn-primary btn-sm"
+                            id="empty-import-btn"
+                        >
+                            Import Addons
                         </button>
-                        <button class="ghost" id="refresh-btn">Reload</button>
                     </div>
                 </div>
-                <p class="muted store" id="store-desc"></p>
-                <ul class="addon-list" id="addon-list"></ul>
-                <p class="empty" id="empty-msg" hidden>
-                    No addons installed yet — import some above.
+
+                <!-- Pagination Bar -->
+                <div class="pagination-bar" id="provider-pagination">
+                    <span class="pagination-info" id="pagination-info"
+                        >Showing 0 of 0 providers</span
+                    >
+                    <div class="pagination-buttons">
+                        <button
+                            class="btn btn-sm btn-ghost"
+                            id="prev-page-btn"
+                            disabled
+                        >
+                            Previous
+                        </button>
+                        <span class="page-indicator" id="page-indicator"
+                            >Page 1 of 1</span
+                        >
+                        <button
+                            class="btn btn-sm btn-ghost"
+                            id="next-page-btn"
+                            disabled
+                        >
+                            Next
+                        </button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- VIEW 2: RELIABILITY & CIRCUITS -->
+            <section
+                class="view-panel"
+                id="view-reliability"
+                role="tabpanel"
+                aria-labelledby="tab-reliability"
+                hidden
+            >
+                <div class="panel-header">
+                    <div>
+                        <h2 class="section-title">
+                            Reliability Registry &amp; Circuit Breakers
+                        </h2>
+                        <p class="section-desc">
+                            Real-time circuit states, failure classifications,
+                            and quarantine enforcement.
+                        </p>
+                    </div>
+                    <div class="panel-actions">
+                        <button
+                            class="btn btn-ghost"
+                            id="refresh-reliability-btn"
+                        >
+                            <svg
+                                width="14"
+                                height="14"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="currentColor"
+                                stroke-width="2"
+                            >
+                                <polyline points="23 4 23 10 17 10" />
+                                <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+                            </svg>
+                            <span>Refresh</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Quarantine Management Card -->
+                <div class="card reliability-section">
+                    <div class="card-header-row">
+                        <div>
+                            <h3 class="card-title">Quarantined Providers</h3>
+                            <p class="card-desc">
+                                Providers automatically isolated after repeated
+                                circuit openings or manually quarantined by
+                                operator.
+                            </p>
+                        </div>
+                        <button
+                            class="btn btn-sm btn-secondary"
+                            id="open-manual-quarantine-btn"
+                            data-require-role="operator"
+                        >
+                            Manual Quarantine
+                        </button>
+                    </div>
+
+                    <div id="quarantine-list" class="quarantine-grid"></div>
+                    <p class="empty-inline" id="empty-quarantine-msg">
+                        No providers are currently in quarantine.
+                    </p>
+                </div>
+
+                <!-- Circuit States Table -->
+                <div class="card reliability-section">
+                    <h3 class="card-title">Provider Circuit Breakers</h3>
+                    <p class="card-desc">
+                        Live state of outbound provider request circuits.
+                    </p>
+
+                    <div class="table-wrapper">
+                        <table class="data-table" id="circuits-table">
+                            <thead>
+                                <tr>
+                                    <th>Provider</th>
+                                    <th>Circuit State</th>
+                                    <th>Consecutive Failures</th>
+                                    <th>Last Failure Reason</th>
+                                    <th>Probe Telemetry</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="circuits-tbody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+
+            <!-- VIEW 3: BACKGROUND JOBS & TASKS -->
+            <section
+                class="view-panel"
+                id="view-jobs"
+                role="tabpanel"
+                aria-labelledby="tab-jobs"
+                hidden
+            >
+                <div class="panel-header">
+                    <div>
+                        <h2 class="section-title">
+                            Background Tasks &amp; Durable Jobs
+                        </h2>
+                        <p class="section-desc">
+                            Asynchronous workers executing imports, health
+                            sweeps, maintenance, and transfers.
+                        </p>
+                    </div>
+                    <div class="panel-actions">
+                        <button
+                            class="btn btn-secondary btn-sm"
+                            id="trigger-maintenance-btn"
+                            data-require-role="operator"
+                        >
+                            Run Maintenance
+                        </button>
+                        <button
+                            class="btn btn-ghost btn-sm"
+                            id="refresh-jobs-btn"
+                        >
+                            <svg
+                                width="14"
+                                height="14"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="currentColor"
+                                stroke-width="2"
+                            >
+                                <polyline points="23 4 23 10 17 10" />
+                                <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+                            </svg>
+                            <span>Refresh</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Queue Depth Summary Strip -->
+                <div class="queue-depth-bar" id="queue-depth-bar">
+                    <div class="queue-stat">
+                        <span>Active Workers:</span>
+                        <strong id="queue-active-count">0</strong>
+                    </div>
+                    <div class="queue-stat">
+                        <span>Queued Tasks:</span>
+                        <strong id="queue-pending-count">0</strong>
+                    </div>
+                    <div class="queue-stat">
+                        <span>Completed:</span>
+                        <strong id="queue-completed-count">0</strong>
+                    </div>
+                    <div class="queue-stat">
+                        <span>Failed / Retried:</span>
+                        <strong id="queue-failed-count">0</strong>
+                    </div>
+                </div>
+
+                <!-- Jobs Filter Toolbar -->
+                <div class="filter-toolbar">
+                    <select id="filter-job-type" aria-label="Filter job type">
+                        <option value="all">All Job Types</option>
+                        <option value="import-url">URL Import</option>
+                        <option value="import-stremio">Stremio Sync</option>
+                        <option value="import-repository">
+                            Repository Crawl
+                        </option>
+                        <option value="health-sweep">Health Sweep</option>
+                        <option value="maintenance">Maintenance</option>
+                        <option value="uncached-transfer">
+                            Debrid Transfer
+                        </option>
+                    </select>
+
+                    <select
+                        id="filter-job-status"
+                        aria-label="Filter job status"
+                    >
+                        <option value="all">All Statuses</option>
+                        <option value="queued">Queued</option>
+                        <option value="running">Running</option>
+                        <option value="completed">Completed</option>
+                        <option value="failed">Failed / Dead-Letter</option>
+                        <option value="cancelled">Cancelled</option>
+                    </select>
+                </div>
+
+                <div class="job-stream" id="job-stream"></div>
+                <div class="empty-state" id="empty-jobs-card" hidden>
+                    <p class="muted">No recent background jobs found.</p>
+                </div>
+            </section>
+
+            <!-- VIEW 4: OBSERVABILITY & SYSTEM METRICS (Admin only) -->
+            <section
+                class="view-panel"
+                id="view-metrics"
+                role="tabpanel"
+                aria-labelledby="tab-metrics"
+                hidden
+            >
+                <div class="panel-header">
+                    <div>
+                        <h2 class="section-title">
+                            System Metrics &amp; SLO Observability
+                        </h2>
+                        <p class="section-desc">
+                            Real-time service-level objectives, error budgets,
+                            telemetry gauges, and dependency health.
+                        </p>
+                    </div>
+                    <div class="panel-actions">
+                        <button
+                            class="btn btn-ghost btn-sm"
+                            id="refresh-metrics-btn"
+                        >
+                            <svg
+                                width="14"
+                                height="14"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="currentColor"
+                                stroke-width="2"
+                            >
+                                <polyline points="23 4 23 10 17 10" />
+                                <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+                            </svg>
+                            <span>Refresh</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- System Incidents / Alert Banner -->
+                <div class="alert-banner" id="system-alerts-banner" hidden>
+                    <svg
+                        width="18"
+                        height="18"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                    >
+                        <circle cx="12" cy="12" r="10" />
+                        <line x1="12" y1="8" x2="12" y2="12" />
+                        <line x1="12" y1="16" x2="12.01" y2="16" />
+                    </svg>
+                    <span id="system-alerts-text"
+                        >System operating normally.</span
+                    >
+                </div>
+
+                <!-- SLO Compliance Metrics Grid -->
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-label">Availability SLO</div>
+                        <div class="stat-value" id="slo-availability">
+                            100.0%
+                        </div>
+                        <div class="stat-subtext" id="slo-avail-target">
+                            Target: 99.9%
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Error Budget Remaining</div>
+                        <div class="stat-value" id="slo-error-budget">
+                            100.0%
+                        </div>
+                        <div class="stat-subtext" id="slo-error-rate">
+                            Error Rate: 0.0%
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">P95 Latency</div>
+                        <div class="stat-value" id="slo-p95">0 ms</div>
+                        <div class="stat-subtext">Target: &lt; 250 ms</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Provider Success Rate</div>
+                        <div class="stat-value" id="slo-provider-success">
+                            100.0%
+                        </div>
+                        <div class="stat-subtext" id="slo-stale-count">
+                            0 Stale Records
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Cache & Capacity Analytics Grid -->
+                <div class="grid-2col">
+                    <!-- Cache Analytics -->
+                    <div class="card">
+                        <h3 class="card-title">Cache Performance</h3>
+                        <p class="card-desc">
+                            Hit ratios, single-flight coalesce, and SWR
+                            revalidations.
+                        </p>
+                        <div class="meter-group">
+                            <div class="meter-label-row">
+                                <span>Cache Hit Ratio</span>
+                                <strong id="cache-hit-ratio">0.0%</strong>
+                            </div>
+                            <div class="meter-track">
+                                <div
+                                    class="meter-fill"
+                                    id="cache-hit-bar"
+                                    style="width: 0%"
+                                ></div>
+                            </div>
+                        </div>
+                        <div class="key-value-list" id="cache-stats-list">
+                            <div class="kv-item">
+                                <span>Total Hits:</span
+                                ><strong id="cache-hits">0</strong>
+                            </div>
+                            <div class="kv-item">
+                                <span>Total Misses:</span
+                                ><strong id="cache-misses">0</strong>
+                            </div>
+                            <div class="kv-item">
+                                <span>SWR Hits:</span
+                                ><strong id="cache-swr">0</strong>
+                            </div>
+                            <div class="kv-item">
+                                <span>Evictions:</span
+                                ><strong id="cache-evictions">0</strong>
+                            </div>
+                            <div class="kv-item">
+                                <span>Bypasses:</span
+                                ><strong id="cache-bypasses">0</strong>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Egress & Proxy Capacity -->
+                    <div class="card">
+                        <h3 class="card-title">Proxy &amp; Stream Capacity</h3>
+                        <p class="card-desc">
+                            Active streaming sessions, SSRF policy enforcement,
+                            and bandwidth.
+                        </p>
+                        <div class="meter-group">
+                            <div class="meter-label-row">
+                                <span>Daily Egress Budget</span>
+                                <strong id="egress-budget-pct">0.0%</strong>
+                            </div>
+                            <div class="meter-track">
+                                <div
+                                    class="meter-fill"
+                                    id="egress-budget-bar"
+                                    style="width: 0%"
+                                ></div>
+                            </div>
+                        </div>
+                        <div class="key-value-list">
+                            <div class="kv-item">
+                                <span>Active HTTP Requests:</span
+                                ><strong id="metric-active-http">0</strong>
+                            </div>
+                            <div class="kv-item">
+                                <span>Active Proxy Streams:</span
+                                ><strong id="metric-active-streams">0</strong>
+                            </div>
+                            <div class="kv-item">
+                                <span>Total Proxy Data:</span
+                                ><strong id="metric-proxy-bytes">0 MB</strong>
+                            </div>
+                            <div class="kv-item">
+                                <span>SSRF Denials:</span
+                                ><strong id="metric-ssrf-denied">0</strong>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Provider Success & Latency Ranking Table -->
+                <div class="card">
+                    <h3 class="card-title">
+                        Provider Performance &amp; Success Ranking
+                    </h3>
+                    <p class="card-desc">
+                        Relative ranking of active providers by observed stream
+                        success rate and probe latency.
+                    </p>
+                    <div class="table-wrapper">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Rank</th>
+                                    <th>Provider</th>
+                                    <th>Status</th>
+                                    <th>Success Rate</th>
+                                    <th>Probe Latency</th>
+                                    <th>Circuit State</th>
+                                </tr>
+                            </thead>
+                            <tbody id="provider-ranking-tbody"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Subsystem Dependencies Status -->
+                <div class="card">
+                    <h3 class="card-title">
+                        Core Subsystems &amp; Dependencies
+                    </h3>
+                    <div class="dependencies-grid" id="dependencies-grid"></div>
+                </div>
+            </section>
+
+            <!-- VIEW 5: AUDIT LOGS (Admin only) -->
+            <section
+                class="view-panel"
+                id="view-audit"
+                role="tabpanel"
+                aria-labelledby="tab-audit"
+                hidden
+            >
+                <div class="panel-header">
+                    <div>
+                        <h2 class="section-title">
+                            Security &amp; Mutation Audit Trail
+                        </h2>
+                        <p class="section-desc">
+                            Immutable log of operator actions, authentication
+                            events, and configuration mutations.
+                        </p>
+                    </div>
+                    <div class="panel-actions">
+                        <button
+                            class="btn btn-ghost btn-sm"
+                            id="refresh-audit-btn"
+                        >
+                            <svg
+                                width="14"
+                                height="14"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="currentColor"
+                                stroke-width="2"
+                            >
+                                <polyline points="23 4 23 10 17 10" />
+                                <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+                            </svg>
+                            <span>Refresh</span>
+                        </button>
+                    </div>
+                </div>
+
+                <div class="table-wrapper">
+                    <table class="data-table" id="audit-table">
+                        <thead>
+                            <tr>
+                                <th>Timestamp</th>
+                                <th>Action</th>
+                                <th>Actor</th>
+                                <th>Client IP</th>
+                                <th>Outcome</th>
+                                <th>Target</th>
+                                <th>Details</th>
+                            </tr>
+                        </thead>
+                        <tbody id="audit-tbody"></tbody>
+                    </table>
+                </div>
+                <p class="empty-inline" id="empty-audit-msg" hidden>
+                    No audit records recorded yet.
                 </p>
             </section>
 
-            <section class="panel" id="jobs-panel">
-                <div class="panel-head">
-                    <h2>
-                        Background Jobs & Tasks
-                        <span class="count" id="job-count">0</span>
-                    </h2>
-                    <div class="head-actions">
-                        <button class="ghost" id="jobs-refresh-btn">Refresh</button>
+            <!-- VIEW 6: SETTINGS & DEBRID -->
+            <section
+                class="view-panel"
+                id="view-settings"
+                role="tabpanel"
+                aria-labelledby="tab-settings"
+                hidden
+            >
+                <div class="panel-header">
+                    <div>
+                        <h2 class="section-title">
+                            Gateway Configuration &amp; Debrid
+                        </h2>
+                        <p class="section-desc">
+                            Manage Debrid provider API keys, encryption secrets,
+                            and configuration backups.
+                        </p>
                     </div>
                 </div>
-                <p class="muted">
-                    Durable asynchronous queue for imports, health sweeps, and background maintenance.
-                </p>
-                <div id="job-list" class="job-list"></div>
-                <p class="empty" id="empty-jobs-msg">No recent background jobs.</p>
+
+                <div class="grid-2col">
+                    <!-- Debrid Gateway Card -->
+                    <div class="card">
+                        <div class="card-header-row">
+                            <h3 class="card-title">Debrid Provider Resolver</h3>
+                            <span class="debrid-badge" id="debrid-status-badge"
+                                >Disabled</span
+                            >
+                        </div>
+                        <p class="card-desc">
+                            Resolves torrent streams (Torrentio, Comet,
+                            MediaFusion) into fast, high-bandwidth HTTP playback
+                            streams.
+                        </p>
+
+                        <form id="debrid-form" class="form-vertical">
+                            <div class="form-group">
+                                <label for="debrid-provider">Provider</label>
+                                <select id="debrid-provider">
+                                    <option value="none">Disabled</option>
+                                    <option value="realdebrid">
+                                        Real-Debrid
+                                    </option>
+                                    <option value="alldebrid">AllDebrid</option>
+                                    <option value="premiumize">
+                                        Premiumize
+                                    </option>
+                                </select>
+                            </div>
+
+                            <div class="form-group">
+                                <label for="debrid-key">API Key</label>
+                                <input
+                                    type="password"
+                                    id="debrid-key"
+                                    placeholder="Paste API token (sealed with master key)"
+                                    autocomplete="off"
+                                />
+                            </div>
+
+                            <div class="form-actions">
+                                <button
+                                    type="button"
+                                    class="btn btn-primary"
+                                    id="save-debrid-btn"
+                                    data-require-role="admin"
+                                >
+                                    Save Debrid Settings
+                                </button>
+                                <button
+                                    type="button"
+                                    class="btn btn-secondary"
+                                    id="test-debrid-btn"
+                                >
+                                    Test Credentials
+                                </button>
+                            </div>
+
+                            <div
+                                class="notice-box warning"
+                                id="debrid-env-lock"
+                                hidden
+                            >
+                                <svg
+                                    width="16"
+                                    height="16"
+                                    viewBox="0 0 24 24"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    stroke-width="2"
+                                >
+                                    <rect
+                                        x="3"
+                                        y="11"
+                                        width="18"
+                                        height="11"
+                                        rx="2"
+                                        ry="2"
+                                    />
+                                    <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+                                </svg>
+                                <span
+                                    >Debrid settings are pinned by environment
+                                    variables (<code>DEBRID_*</code>) and cannot
+                                    be mutated at runtime.</span
+                                >
+                            </div>
+                        </form>
+                    </div>
+
+                    <!-- Configuration Backup & Migration Card -->
+                    <div class="card">
+                        <h3 class="card-title">
+                            Configuration Backup &amp; Migration
+                        </h3>
+                        <p class="card-desc">
+                            Export or import sanitized provider lists and
+                            policies. All credentials, API keys, and private
+                            tokens are automatically stripped.
+                        </p>
+
+                        <div class="backup-actions">
+                            <button
+                                class="btn btn-secondary"
+                                id="export-config-btn"
+                            >
+                                <svg
+                                    width="14"
+                                    height="14"
+                                    viewBox="0 0 24 24"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    stroke-width="2"
+                                >
+                                    <path
+                                        d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"
+                                    />
+                                    <polyline points="7 10 12 15 17 10" />
+                                    <line x1="12" y1="15" x2="12" y2="3" />
+                                </svg>
+                                <span>Export Sanitized JSON</span>
+                            </button>
+                        </div>
+
+                        <hr class="divider" />
+
+                        <div class="form-group">
+                            <label for="import-config-file"
+                                >Import Sanitized Configuration File</label
+                            >
+                            <input
+                                type="file"
+                                id="import-config-file"
+                                accept=".json"
+                                data-require-role="admin"
+                            />
+                            <button
+                                class="btn btn-ghost btn-sm"
+                                id="upload-config-btn"
+                                data-require-role="admin"
+                            >
+                                Upload &amp; Restore
+                            </button>
+                        </div>
+                    </div>
+                </div>
             </section>
 
-            <section class="panel" id="migration-panel">
-                <div class="panel-head">
-                    <h2>Configuration & Migration</h2>
+            <!-- VIEW 7: IMPORT ADDONS -->
+            <section
+                class="view-panel"
+                id="view-import"
+                role="tabpanel"
+                aria-labelledby="tab-import"
+                hidden
+            >
+                <div class="panel-header">
+                    <div>
+                        <h2 class="section-title">
+                            Import &amp; Discover Addons
+                        </h2>
+                        <p class="section-desc">
+                            Install Stremio addons via HTTPS manifest URL,
+                            Stremio account sync, or catalog repositories.
+                        </p>
+                    </div>
                 </div>
-                <p class="muted">
-                    Export or import sanitized addon configurations (all tokens and credentials stripped).
-                </p>
-                <div class="row">
-                    <button class="ghost" id="export-btn">Export Sanitized JSON</button>
+
+                <div class="grid-3col">
+                    <!-- URL Import Card -->
+                    <div class="card">
+                        <h3 class="card-title">Direct Manifest URL</h3>
+                        <p class="card-desc">
+                            Paste one or multiple <code>manifest.json</code> (or
+                            transport) URLs, one per line.
+                        </p>
+                        <form id="url-import-form">
+                            <textarea
+                                id="url-import-input"
+                                rows="4"
+                                placeholder="https://torrentio.strem.fun/manifest.json&#10;https://opensubtitles.strem.fun/manifest.json"
+                                data-require-role="operator"
+                            ></textarea>
+                            <button
+                                type="submit"
+                                class="btn btn-primary btn-block"
+                                id="btn-import-url"
+                                data-require-role="operator"
+                            >
+                                Install Addons
+                            </button>
+                        </form>
+                    </div>
+
+                    <!-- Stremio Account Sync Card -->
+                    <div class="card">
+                        <h3 class="card-title">Stremio Account Sync</h3>
+                        <p class="card-desc">
+                            Sync your entire personal Stremio addon collection.
+                            Credentials are used once and never stored.
+                        </p>
+                        <form id="stremio-import-form">
+                            <input
+                                type="email"
+                                id="stremio-email"
+                                placeholder="Stremio email"
+                                autocomplete="username"
+                                data-require-role="operator"
+                            />
+                            <input
+                                type="password"
+                                id="stremio-password"
+                                placeholder="Stremio password"
+                                autocomplete="current-password"
+                                data-require-role="operator"
+                            />
+                            <div class="or-separator">
+                                <span>or use authKey</span>
+                            </div>
+                            <input
+                                type="text"
+                                id="stremio-authkey"
+                                placeholder="Stremio authKey (optional)"
+                                data-require-role="operator"
+                            />
+                            <button
+                                type="submit"
+                                class="btn btn-primary btn-block"
+                                id="btn-import-stremio"
+                                data-require-role="operator"
+                            >
+                                Import Collection
+                            </button>
+                        </form>
+                    </div>
+
+                    <!-- Repository Discovery Card -->
+                    <div class="card">
+                        <h3 class="card-title">Repository Catalog</h3>
+                        <p class="card-desc">
+                            Import from a curated repository endpoint returning
+                            an array or dictionary of addon URLs.
+                        </p>
+                        <form id="repo-import-form">
+                            <input
+                                type="url"
+                                id="repo-url-input"
+                                placeholder="https://stremio-addons.net/addons.json"
+                                data-require-role="operator"
+                            />
+                            <button
+                                type="submit"
+                                class="btn btn-primary btn-block"
+                                id="btn-import-repo"
+                                data-require-role="operator"
+                            >
+                                Import Repository
+                            </button>
+                        </form>
+                    </div>
                 </div>
             </section>
         </main>
 
-        <div class="toast" id="toast" hidden></div>
+        <!-- DIALOG MODAL 1: AUTHENTICATION -->
+        <dialog
+            id="auth-dialog"
+            class="modal-dialog"
+            aria-labelledby="auth-modal-title"
+        >
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2 class="modal-title" id="auth-modal-title">
+                        Operator Sign In
+                    </h2>
+                    <button
+                        class="modal-close-btn"
+                        data-close-modal
+                        aria-label="Close dialog"
+                    >
+                        &times;
+                    </button>
+                </div>
+                <div class="modal-body">
+                    <p class="modal-desc">
+                        Enter your operator or admin token. Your token will be
+                        securely exchanged for a short-lived, HttpOnly session
+                        cookie.
+                    </p>
+                    <div
+                        class="form-error-summary"
+                        id="auth-error-summary"
+                        role="alert"
+                        hidden
+                    ></div>
+                    <form id="auth-form">
+                        <div class="form-group">
+                            <label for="admin-token-input"
+                                >Admin / Operator Token</label
+                            >
+                            <input
+                                type="password"
+                                id="admin-token-input"
+                                placeholder="Enter secret token"
+                                autocomplete="current-password"
+                                required
+                            />
+                        </div>
+                        <div class="modal-footer">
+                            <button
+                                type="button"
+                                class="btn btn-ghost"
+                                data-close-modal
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                type="submit"
+                                class="btn btn-primary"
+                                id="auth-submit-btn"
+                            >
+                                Sign In
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </dialog>
+
+        <!-- DIALOG MODAL 2: MANIFEST & DIAGNOSTICS INSPECTOR -->
+        <dialog
+            id="manifest-dialog"
+            class="modal-dialog modal-large"
+            aria-labelledby="manifest-modal-title"
+        >
+            <div class="modal-content">
+                <div class="modal-header">
+                    <div class="modal-title-group">
+                        <h2 class="modal-title" id="manifest-modal-title">
+                            Addon Manifest &amp; Diagnostics
+                        </h2>
+                        <span class="badge" id="manifest-provider-id"
+                            >addon:id</span
+                        >
+                    </div>
+                    <button
+                        class="modal-close-btn"
+                        data-close-modal
+                        aria-label="Close dialog"
+                    >
+                        &times;
+                    </button>
+                </div>
+                <div class="modal-body">
+                    <div
+                        class="manifest-meta-grid"
+                        id="manifest-meta-grid"
+                    ></div>
+                    <h3 class="subsection-title">Raw Manifest (Redacted)</h3>
+                    <pre
+                        class="code-block"
+                    ><code id="manifest-raw-json">{}</code></pre>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-ghost" data-close-modal>
+                        Close
+                    </button>
+                </div>
+            </div>
+        </dialog>
+
+        <!-- DIALOG MODAL 3: MANUAL QUARANTINE -->
+        <dialog
+            id="quarantine-dialog"
+            class="modal-dialog"
+            aria-labelledby="quarantine-modal-title"
+        >
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2 class="modal-title" id="quarantine-modal-title">
+                        Quarantine Provider
+                    </h2>
+                    <button
+                        class="modal-close-btn"
+                        data-close-modal
+                        aria-label="Close dialog"
+                    >
+                        &times;
+                    </button>
+                </div>
+                <div class="modal-body">
+                    <p class="modal-desc">
+                        Quarantining a provider excludes it from stream
+                        selection and scraper waterfalls until released.
+                    </p>
+                    <div
+                        class="form-error-summary"
+                        id="quarantine-error-summary"
+                        role="alert"
+                        hidden
+                    ></div>
+                    <form id="quarantine-form">
+                        <input type="hidden" id="quarantine-provider-id" />
+                        <div class="form-group">
+                            <label for="quarantine-reason"
+                                >Reason for quarantine</label
+                            >
+                            <input
+                                type="text"
+                                id="quarantine-reason"
+                                placeholder="e.g. Broken upstream API / frequent timeouts"
+                                required
+                            />
+                        </div>
+                        <div class="form-group">
+                            <label for="quarantine-ttl"
+                                >Duration (minutes, 0 = indefinite)</label
+                            >
+                            <input
+                                type="number"
+                                id="quarantine-ttl"
+                                min="0"
+                                max="43200"
+                                value="60"
+                            />
+                        </div>
+                        <div class="modal-footer">
+                            <button
+                                type="button"
+                                class="btn btn-ghost"
+                                data-close-modal
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                type="submit"
+                                class="btn btn-danger"
+                                id="quarantine-submit-btn"
+                            >
+                                Quarantine Provider
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </dialog>
+
+        <!-- DIALOG MODAL 4: DELETE CONFIRMATION -->
+        <dialog
+            id="remove-dialog"
+            class="modal-dialog"
+            aria-labelledby="remove-modal-title"
+        >
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2 class="modal-title text-danger" id="remove-modal-title">
+                        Remove Addon
+                    </h2>
+                    <button
+                        class="modal-close-btn"
+                        data-close-modal
+                        aria-label="Close dialog"
+                    >
+                        &times;
+                    </button>
+                </div>
+                <div class="modal-body">
+                    <p class="modal-desc">
+                        Are you sure you want to permanently remove
+                        <strong id="remove-addon-name"></strong>? This action
+                        cannot be undone and will be recorded in the audit
+                        trail.
+                    </p>
+                    <div
+                        class="form-error-summary"
+                        id="remove-error-summary"
+                        role="alert"
+                        hidden
+                    ></div>
+                    <form id="remove-form">
+                        <input type="hidden" id="remove-provider-id" />
+                        <div class="form-group">
+                            <label for="remove-reason"
+                                >Audit Explanation (Reason for removal)</label
+                            >
+                            <textarea
+                                id="remove-reason"
+                                rows="2"
+                                placeholder="e.g. Broken stream provider / replaced with newer version"
+                                required
+                            ></textarea>
+                        </div>
+                        <div class="modal-footer">
+                            <button
+                                type="button"
+                                class="btn btn-ghost"
+                                data-close-modal
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                type="submit"
+                                class="btn btn-danger"
+                                id="remove-submit-btn"
+                            >
+                                Permanently Remove
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </dialog>
+
+        <!-- DIALOG MODAL 5: AUDIT DETAIL INSPECTOR -->
+        <dialog
+            id="audit-dialog"
+            class="modal-dialog modal-large"
+            aria-labelledby="audit-modal-title"
+        >
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2 class="modal-title" id="audit-modal-title">
+                        Audit Event Details
+                    </h2>
+                    <button
+                        class="modal-close-btn"
+                        data-close-modal
+                        aria-label="Close dialog"
+                    >
+                        &times;
+                    </button>
+                </div>
+                <div class="modal-body">
+                    <div
+                        class="audit-meta-summary"
+                        id="audit-meta-summary"
+                    ></div>
+                    <h3 class="subsection-title">Event Payload</h3>
+                    <pre
+                        class="code-block"
+                    ><code id="audit-raw-json">{}</code></pre>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-ghost" data-close-modal>
+                        Close
+                    </button>
+                </div>
+            </div>
+        </dialog>
+
+        <!-- Dynamic Toast Notification Container -->
+        <div
+            id="toast-container"
+            class="toast-container"
+            aria-live="polite"
+            aria-atomic="true"
+        ></div>
 
         <script src="/admin/app.js"></script>
     </body>
