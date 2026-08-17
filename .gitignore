@@ -4,6 +4,13 @@ node_modules
 # Build output
 dist
 
+# IDE & tooling
+.agents
+.claude
+.vscode
+.playwright-cli
+skills-lock.json
+
 # Env
 .env
 .env.local
@@ -24,5 +31,5 @@ Thumbs.db
 PRODUCTION_READINESS_PLAN.md
 Prompts.txt
 Phase-5-plan.md
-phase6_implementation_plan.md
-Phase-7-plan.md
+phase8_implementation_plan.md
+Phase-8-plan.md
