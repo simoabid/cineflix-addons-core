@@ -2,7 +2,7 @@
  * Secure playback proxy routes.
  *
  *   GET /v1/proxy/grant/:grantId   — redeem an opaque server-side grant
- *   GET /v1/proxy/token/:token     — redeem a compact HMAC-signed token
+ *   GET /v1/proxy/token/*          — redeem a compact HMAC-signed token
  *
  * Legacy `/v1/proxy?data=` (framework) is blocked by a preHandler when
  * secure proxy mode is mandatory, and always blocked in production.
@@ -1025,13 +1025,18 @@ export function registerSecureProxyRoutes(
         }
     );
 
-    app.get<{ Params: { token: string } }>(
-        '/v1/proxy/token/:token',
+    // NOTE: a wildcard is required here — Fastify's default maxParamLength
+    // (100) rejects realistic compact tokens (~300+ chars) with
+    // FST_ERR_MAX_PARAM_LENGTH before the handler can run. Wildcard segments
+    // are not subject to that limit, so the token is bounded and validated
+    // here instead (single segment, <= 4096 chars).
+    app.get<{ Params: { '*': string } }>(
+        '/v1/proxy/token/*',
         async (request, reply) => {
             if (!(await guardRate(request, reply))) return;
 
-            const token = request.params.token;
-            if (!token || token.length > 4096) {
+            const token = decodeURIComponent(request.params['*'] ?? '');
+            if (!token || token.length > 4096 || token.includes('/')) {
                 return reply.code(400).send({
                     error: {
                         code: 'INVALID_TOKEN',
