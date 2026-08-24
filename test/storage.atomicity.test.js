@@ -28,7 +28,13 @@ function fakeAddon(id, order = 0) {
         order,
         timeoutMs: 20000,
         source: 'url',
-        manifest: { id: 'org.test', version: '1.0.0', name: id, resources: ['stream'], types: ['movie'] },
+        manifest: {
+            id: 'org.test',
+            version: '1.0.0',
+            name: id,
+            resources: ['stream'],
+            types: ['movie']
+        },
         addedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
     };
@@ -54,8 +60,14 @@ test('writes are atomic: after mutations the file is valid JSON and no temp resi
 
         const dir = path.dirname(STORE);
         const files = await fs.readdir(dir);
-        const residue = files.filter((f) => f.startsWith(path.basename(STORE)) && f.endsWith('.tmp'));
-        assert.deepEqual(residue, [], 'temp files must be renamed away, never left behind');
+        const residue = files.filter(
+            (f) => f.startsWith(path.basename(STORE)) && f.endsWith('.tmp')
+        );
+        assert.deepEqual(
+            residue,
+            [],
+            'temp files must be renamed away, never left behind'
+        );
     } finally {
         await removeScratch(STORE);
     }
@@ -68,7 +80,11 @@ test('a corrupted (truncated JSON) store recovers to a usable empty store', asyn
 
     // Truncate the file mid-JSON, simulating a crash during a non-atomic write
     const raw = await fs.readFile(STORE, 'utf-8');
-    await fs.writeFile(STORE, raw.slice(0, Math.floor(raw.length / 2)), 'utf-8');
+    await fs.writeFile(
+        STORE,
+        raw.slice(0, Math.floor(raw.length / 2)),
+        'utf-8'
+    );
 
     const recovered = new FileStorageBackend(STORE);
     await recovered.init(); // must not throw
@@ -101,7 +117,11 @@ test('saveAddon enforces optimistic concurrency via expectedVersion', async () =
 
         // A second writer holding a stale version must be rejected
         await assert.rejects(
-            () => backend.saveAddon({ ...fakeAddon('addon:occ'), name: 'stale-write' }, 999),
+            () =>
+                backend.saveAddon(
+                    { ...fakeAddon('addon:occ'), name: 'stale-write' },
+                    999
+                ),
             (err) => {
                 assert.ok(err instanceof OptimisticLockError);
                 assert.equal(err.entity, 'addon');
@@ -111,7 +131,10 @@ test('saveAddon enforces optimistic concurrency via expectedVersion', async () =
         );
 
         // A writer holding the current version succeeds
-        const v2 = await backend.saveAddon({ ...fakeAddon('addon:occ'), name: 'fresh-write' }, v1.version);
+        const v2 = await backend.saveAddon(
+            { ...fakeAddon('addon:occ'), name: 'fresh-write' },
+            v1.version
+        );
         assert.equal(v2.version, v1.version + 1);
         assert.equal((await backend.getAddon('addon:occ')).name, 'fresh-write');
     } finally {
@@ -160,9 +183,21 @@ test('grant lifecycle: expired and consumed grants are not consumable twice', as
 
         const consumed = await backend.consumeGrant('g_active');
         assert.ok(consumed, 'active grant is consumable');
-        assert.equal(await backend.consumeGrant('g_active'), null, 'single-use grant cannot be consumed twice');
-        assert.equal(await backend.consumeGrant('g_expired'), null, 'expired grant is not consumable');
-        assert.equal(await backend.consumeGrant('g_used'), null, 'already-used grant is not consumable');
+        assert.equal(
+            await backend.consumeGrant('g_active'),
+            null,
+            'single-use grant cannot be consumed twice'
+        );
+        assert.equal(
+            await backend.consumeGrant('g_expired'),
+            null,
+            'expired grant is not consumable'
+        );
+        assert.equal(
+            await backend.consumeGrant('g_used'),
+            null,
+            'already-used grant is not consumable'
+        );
 
         const cleaned = await backend.cleanupExpiredGrants();
         assert.ok(cleaned >= 1, 'expired grants are purged by cleanup');
@@ -202,7 +237,11 @@ test('exportSanitized never carries transport URLs or credentials', async () => 
         assert.equal('manifestUrl' in exported, false);
         assert.equal('baseUrl' in exported, false);
         assert.equal('originalImportUrl' in exported, false);
-        assert.equal(JSON.stringify(data).includes('sekrit'), false, 'no credential leakage in sanitized export');
+        assert.equal(
+            JSON.stringify(data).includes('sekrit'),
+            false,
+            'no credential leakage in sanitized export'
+        );
     } finally {
         await removeScratch(STORE);
     }

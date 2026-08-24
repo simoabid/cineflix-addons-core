@@ -75,13 +75,19 @@ test('catalog-only addons are listed but never registered as stream providers', 
         assert.equal(res.ok, true);
         assert.equal(res.addon.capabilities.catalog, true);
         assert.equal(res.addon.capabilities.stream.length, 0);
-        assert.equal(registry.listProviders().length, 0, 'catalog-only addon must not enter the stream waterfall');
+        assert.equal(
+            registry.listProviders().length,
+            0,
+            'catalog-only addon must not enter the stream waterfall'
+        );
         assert.equal(manager.getStreamEnabled().length, 0);
         assert.equal(manager.list().length, 1, 'still visible for management');
         // The persistent findings flag the limited status
         assert.ok(
             res.addon.capabilities.status === 'limited' ||
-                res.addon.validationFindings.some((f) => f.severity === 'warning')
+                res.addon.validationFindings.some(
+                    (f) => f.severity === 'warning'
+                )
         );
     } finally {
         await upstream.close();
@@ -117,8 +123,12 @@ test('re-installing the same URL dedupes into an in-place update without a secon
 
 test('reorder rewrites order fields, keeps registry insertion order in sync', async () => {
     await removeScratch(STORE);
-    const a = await startFakeAddonServer({ manifest: fakeManifest({ id: 'org.test.a' }) });
-    const b = await startFakeAddonServer({ manifest: fakeManifest({ id: 'org.test.b' }) });
+    const a = await startFakeAddonServer({
+        manifest: fakeManifest({ id: 'org.test.a' })
+    });
+    const b = await startFakeAddonServer({
+        manifest: fakeManifest({ id: 'org.test.b' })
+    });
     try {
         const { manager, registry } = await freshManager();
         const ra = await manager.install(a.manifestUrl, 'url');
@@ -129,7 +139,11 @@ test('reorder rewrites order fields, keeps registry insertion order in sync', as
 
         await manager.reorder([idB, idA]);
         assert.deepEqual(manager.orderedEnabledProviderIds(), [idB, idA]);
-        assert.deepEqual(registry.listProviders(), [idB, idA], 'registry order must mirror priority order');
+        assert.deepEqual(
+            registry.listProviders(),
+            [idB, idA],
+            'registry order must mirror priority order'
+        );
         assert.equal(manager.get(idA).order, 1);
         assert.equal(manager.get(idB).order, 0);
     } finally {
@@ -141,7 +155,9 @@ test('reorder rewrites order fields, keeps registry insertion order in sync', as
 
 test('disable unregisters the provider; re-enable restores it; both bump the revision', async () => {
     await removeScratch(STORE);
-    const upstream = await startFakeAddonServer({ manifest: fakeManifest({ id: 'org.test.toggle' }) });
+    const upstream = await startFakeAddonServer({
+        manifest: fakeManifest({ id: 'org.test.toggle' })
+    });
     try {
         const { manager, registry } = await freshManager();
         const { addon } = await manager.install(upstream.manifestUrl, 'url');
@@ -167,7 +183,9 @@ test('disable unregisters the provider; re-enable restores it; both bump the rev
 
 test('setTimeout clamps to the supported range and re-registers the provider', async () => {
     await removeScratch(STORE);
-    const upstream = await startFakeAddonServer({ manifest: fakeManifest({ id: 'org.test.timeout' }) });
+    const upstream = await startFakeAddonServer({
+        manifest: fakeManifest({ id: 'org.test.timeout' })
+    });
     try {
         const { manager, registry } = await freshManager();
         const { addon } = await manager.install(upstream.manifestUrl, 'url');
@@ -178,7 +196,10 @@ test('setTimeout clamps to the supported range and re-registers the provider', a
         assert.equal(manager.get(addon.providerId).timeoutMs, 1000);
         await manager.setTimeout(addon.providerId, 999_999);
         assert.equal(manager.get(addon.providerId).timeoutMs, 120_000);
-        assert.ok(registry.hasProvider(addon.providerId), 'timeout change must not drop the provider');
+        assert.ok(
+            registry.hasProvider(addon.providerId),
+            'timeout change must not drop the provider'
+        );
     } finally {
         await upstream.close();
         await removeScratch(STORE);
@@ -211,7 +232,9 @@ test('refresh re-installs from the original import URL and updates the cached ma
 
 test('remove deletes the addon, unregisters the provider and bumps the revision', async () => {
     await removeScratch(STORE);
-    const upstream = await startFakeAddonServer({ manifest: fakeManifest({ id: 'org.test.remove' }) });
+    const upstream = await startFakeAddonServer({
+        manifest: fakeManifest({ id: 'org.test.remove' })
+    });
     try {
         const { manager, registry } = await freshManager();
         const { addon } = await manager.install(upstream.manifestUrl, 'url');
@@ -231,16 +254,27 @@ test('concurrent installs serialize under the manager lock: no lost addons, no l
     await removeScratch(STORE);
     const servers = await Promise.all(
         ['c1', 'c2', 'c3', 'c4'].map((id) =>
-            startFakeAddonServer({ manifest: fakeManifest({ id: `org.test.${id}` }) })
+            startFakeAddonServer({
+                manifest: fakeManifest({ id: `org.test.${id}` })
+            })
         )
     );
     try {
         const { manager } = await freshManager();
         const rev0 = manager.getRevision();
-        await Promise.all(servers.map((s) => manager.install(s.manifestUrl, 'url')));
+        await Promise.all(
+            servers.map((s) => manager.install(s.manifestUrl, 'url'))
+        );
         assert.equal(manager.list().length, servers.length);
-        assert.equal(manager.getRevision(), rev0 + servers.length, 'every install must bump the revision exactly once');
-        assert.equal(new Set(manager.orderedEnabledProviderIds()).size, servers.length);
+        assert.equal(
+            manager.getRevision(),
+            rev0 + servers.length,
+            'every install must bump the revision exactly once'
+        );
+        assert.equal(
+            new Set(manager.orderedEnabledProviderIds()).size,
+            servers.length
+        );
     } finally {
         await Promise.all(servers.map((s) => s.close()));
         await removeScratch(STORE);
@@ -249,12 +283,19 @@ test('concurrent installs serialize under the manager lock: no lost addons, no l
 
 test('provider ids de-collide with a numeric suffix when slugs clash', async () => {
     await removeScratch(STORE);
-    const a = await startFakeAddonServer({ manifest: fakeManifest({ id: 'org.test.same' }) });
-    const b = await startFakeAddonServer({ manifest: fakeManifest({ id: 'org.test.same' }) });
+    const a = await startFakeAddonServer({
+        manifest: fakeManifest({ id: 'org.test.same' })
+    });
+    const b = await startFakeAddonServer({
+        manifest: fakeManifest({ id: 'org.test.same' })
+    });
     try {
         const { manager } = await freshManager();
         const r1 = await manager.install(a.manifestUrl, 'url');
-        const r2 = await manager.install(`${b.baseUrl}/different-config/manifest.json`, 'url');
+        const r2 = await manager.install(
+            `${b.baseUrl}/different-config/manifest.json`,
+            'url'
+        );
         assert.equal(r1.ok && r2.ok, true);
         assert.notEqual(r1.addon.providerId, r2.addon.providerId);
         assert.ok(r2.addon.providerId.startsWith('addon:org-test-same-'));
@@ -280,7 +321,9 @@ test('policy-violating URLs are rejected before any network call', async () => {
 
 test('secret-bearing transport URLs are sealed at rest but stay usable in memory', async () => {
     await removeScratch(STORE);
-    const upstream = await startFakeAddonServer({ manifest: fakeManifest({ id: 'org.test.secret' }) });
+    const upstream = await startFakeAddonServer({
+        manifest: fakeManifest({ id: 'org.test.secret' })
+    });
     try {
         const { manager } = await freshManager();
         const configuredUrl = `${upstream.baseUrl}/manifest.json?token=supersecret123456`;
@@ -288,21 +331,36 @@ test('secret-bearing transport URLs are sealed at rest but stay usable in memory
         assert.equal(res.ok, true, res.error);
 
         // In memory: the plain URL with the operator's configuration
-        assert.equal(manager.get(res.addon.providerId).manifestUrl, configuredUrl);
+        assert.equal(
+            manager.get(res.addon.providerId).manifestUrl,
+            configuredUrl
+        );
 
         // At rest: the query-bearing URL is AES-GCM sealed
         const raw = JSON.parse(await fs.readFile(STORE, 'utf-8'));
-        const stored = raw.addons.find((a) => a.providerId === res.addon.providerId);
-        assert.ok(stored.manifestUrl.startsWith('enc:v1:'), 'secret-bearing URL must be sealed at rest');
+        const stored = raw.addons.find(
+            (a) => a.providerId === res.addon.providerId
+        );
+        assert.ok(
+            stored.manifestUrl.startsWith('enc:v1:'),
+            'secret-bearing URL must be sealed at rest'
+        );
         assert.ok(stored.baseUrl.startsWith('enc:v1:'));
 
         // And a fresh manager can load it back and unseal it
         const cfg = devConfig();
         const storage2 = new FileStorageBackend(STORE);
         await storage2.init();
-        const manager2 = AddonManager.create(createFakeRegistry(), cfg, storage2);
+        const manager2 = AddonManager.create(
+            createFakeRegistry(),
+            cfg,
+            storage2
+        );
         await manager2.init();
-        assert.equal(manager2.get(res.addon.providerId).manifestUrl, configuredUrl);
+        assert.equal(
+            manager2.get(res.addon.providerId).manifestUrl,
+            configuredUrl
+        );
     } finally {
         await upstream.close();
         await removeScratch(STORE);

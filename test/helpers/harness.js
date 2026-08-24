@@ -90,8 +90,7 @@ export function startHttpServer(handler) {
                 server,
                 port,
                 baseUrl: `http://127.0.0.1:${port}`,
-                close: () =>
-                    new Promise((res) => server.close(() => res()))
+                close: () => new Promise((res) => server.close(() => res()))
             });
         });
     });
@@ -152,10 +151,16 @@ export function startFakeAddonServer(options = {}) {
             }
         };
 
-        if (u.pathname === '/manifest.json' || u.pathname.endsWith('/manifest.json')) {
+        if (
+            u.pathname === '/manifest.json' ||
+            u.pathname.endsWith('/manifest.json')
+        ) {
             seen.manifests++;
             if (options.manifestBody !== undefined) {
-                return send(options.manifestStatus ?? 200, options.manifestBody);
+                return send(
+                    options.manifestStatus ?? 200,
+                    options.manifestBody
+                );
             }
             return send(options.manifestStatus ?? 200, manifest);
         }
@@ -171,7 +176,11 @@ export function startFakeAddonServer(options = {}) {
                 return options.onStream(req, res, stream[1], stream[2], u);
             }
             const body = options.streamsFor
-                ? options.streamsFor(decodeURIComponent(stream[1]), decodeURIComponent(stream[2]), u)
+                ? options.streamsFor(
+                      decodeURIComponent(stream[1]),
+                      decodeURIComponent(stream[2]),
+                      u
+                  )
                 : [];
             return send(200, { streams: body });
         }
@@ -183,12 +192,20 @@ export function startFakeAddonServer(options = {}) {
                 query: u.search
             });
             const body = options.subtitlesFor
-                ? options.subtitlesFor(decodeURIComponent(subs[1]), decodeURIComponent(subs[2]), u)
+                ? options.subtitlesFor(
+                      decodeURIComponent(subs[1]),
+                      decodeURIComponent(subs[2]),
+                      u
+                  )
                 : [];
             return send(200, { subtitles: body });
         }
         send(404, { error: 'Not found' });
-    }).then((handle) => ({ ...handle, seen, manifestUrl: `${handle.baseUrl}/manifest.json` }));
+    }).then((handle) => ({
+        ...handle,
+        seen,
+        manifestUrl: `${handle.baseUrl}/manifest.json`
+    }));
 }
 
 // ── fastify app factory ──────────────────────────────────────────────────────
