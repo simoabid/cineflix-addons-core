@@ -461,25 +461,6 @@ export function buildOpenApiSpec(
                             }
                         }
                     }
-                },
-                post: {
-                    tags: ['Addon Management'],
-                    summary: 'Install an addon from manifest URL',
-                    security: [{ BearerAuth: [] }, { SessionAuth: [] }],
-                    requestBody: {
-                        required: true,
-                        content: {
-                            'application/json': {
-                                schema: {
-                                    $ref: '#/components/schemas/InstallAddonBody'
-                                }
-                            }
-                        }
-                    },
-                    responses: {
-                        '200': { description: 'Addon installed successfully' },
-                        '400': { $ref: '#/components/responses/BadRequest' }
-                    }
                 }
             },
             '/v1/addons/{providerId}': {
@@ -587,6 +568,52 @@ export function buildOpenApiSpec(
                     }
                 }
             },
+            '/v1/addons/{providerId}/probe': {
+                post: {
+                    tags: ['Addon Management'],
+                    summary:
+                        'Probe an addon manifest immediately and record the health result',
+                    parameters: [
+                        {
+                            name: 'providerId',
+                            in: 'path',
+                            required: true,
+                            schema: { type: 'string' }
+                        }
+                    ],
+                    responses: {
+                        '200': { description: 'Probe result recorded' },
+                        '404': { $ref: '#/components/responses/NotFound' }
+                    }
+                }
+            },
+            '/v1/openapi.json': {
+                get: {
+                    tags: ['Health & Metrics'],
+                    summary: 'This OpenAPI 3.1 specification (JSON)',
+                    responses: {
+                        '200': { description: 'OpenAPI document' }
+                    }
+                }
+            },
+            '/v1/openapi.yaml': {
+                get: {
+                    tags: ['Health & Metrics'],
+                    summary: 'This OpenAPI 3.1 specification (YAML)',
+                    responses: {
+                        '200': { description: 'OpenAPI document' }
+                    }
+                }
+            },
+            '/v1/docs': {
+                get: {
+                    tags: ['Health & Metrics'],
+                    summary: 'Interactive API documentation (Swagger UI)',
+                    responses: {
+                        '200': { description: 'Swagger UI page' }
+                    }
+                }
+            },
             '/v1/quarantine': {
                 get: {
                     tags: ['Addon Management'],
@@ -594,6 +621,25 @@ export function buildOpenApiSpec(
                         'List quarantined providers (Phase 7 auto-quarantine after repeated failures)',
                     responses: {
                         '200': { description: 'Quarantined provider records' }
+                    }
+                }
+            },
+            '/v1/quarantine/{providerId}': {
+                post: {
+                    tags: ['Addon Management'],
+                    summary:
+                        'Manually quarantine a provider (operator) with an optional reason and TTL',
+                    parameters: [
+                        {
+                            name: 'providerId',
+                            in: 'path',
+                            required: true,
+                            schema: { type: 'string' }
+                        }
+                    ],
+                    responses: {
+                        '200': { description: 'Provider quarantined' },
+                        '404': { $ref: '#/components/responses/NotFound' }
                     }
                 }
             },
@@ -667,7 +713,7 @@ export function buildOpenApiSpec(
                     }
                 }
             },
-            '/v1/import/url': {
+            '/v1/addons/import/url': {
                 post: {
                     tags: ['Imports'],
                     summary: 'Import addons from URL or array of URLs',
@@ -687,7 +733,27 @@ export function buildOpenApiSpec(
                     }
                 }
             },
-            '/v1/import/stremio': {
+            '/v1/import': {
+                post: {
+                    tags: ['Imports'],
+                    summary: 'Import addons from URL (compatibility alias)',
+                    requestBody: {
+                        required: true,
+                        content: {
+                            'application/json': {
+                                schema: {
+                                    $ref: '#/components/schemas/ImportUrlBody'
+                                }
+                            }
+                        }
+                    },
+                    responses: {
+                        '200': { description: 'Imported synchronously' },
+                        '202': { description: 'Queued on job engine' }
+                    }
+                }
+            },
+            '/v1/addons/import/stremio': {
                 post: {
                     tags: ['Imports'],
                     summary: 'Import addons from Stremio user account',
@@ -707,7 +773,7 @@ export function buildOpenApiSpec(
                     }
                 }
             },
-            '/v1/import/repository': {
+            '/v1/addons/import/repository': {
                 post: {
                     tags: ['Imports'],
                     summary: 'Import addons from an addon repository index',
@@ -804,7 +870,7 @@ export function buildOpenApiSpec(
                             }
                         }
                     },
-                    responses: { '201': { description: 'Job created' } }
+                    responses: { '202': { description: 'Job enqueued' } }
                 }
             },
             '/v1/jobs/{id}': {
@@ -840,12 +906,22 @@ export function buildOpenApiSpec(
                     responses: { '200': { description: 'Job cancelled' } }
                 }
             },
-            '/v1/debrid/status': {
-                get: {
-                    tags: ['Debrid & Settings'],
-                    summary:
-                        'Get debrid provider connection and account status',
-                    responses: { '200': { description: 'Debrid status' } }
+            '/v1/jobs/{id}/retry': {
+                post: {
+                    tags: ['Jobs'],
+                    summary: 'Re-enqueue a failed or dead-lettered job',
+                    parameters: [
+                        {
+                            name: 'id',
+                            in: 'path',
+                            required: true,
+                            schema: { type: 'string' }
+                        }
+                    ],
+                    responses: {
+                        '200': { description: 'Job re-enqueued' },
+                        '404': { $ref: '#/components/responses/NotFound' }
+                    }
                 }
             },
             '/v1/debrid/transfers': {
@@ -898,12 +974,16 @@ export function buildOpenApiSpec(
                     responses: { '200': { description: 'Transfer cancelled' } }
                 }
             },
-            '/v1/settings/debrid': {
+            '/v1/settings': {
                 get: {
                     tags: ['Debrid & Settings'],
-                    summary: 'Get debrid configuration settings',
-                    responses: { '200': { description: 'Debrid settings' } }
-                },
+                    summary:
+                        'Get effective service settings (secrets redacted)',
+                    security: [{ BearerAuth: [] }, { SessionAuth: [] }],
+                    responses: { '200': { description: 'Effective settings' } }
+                }
+            },
+            '/v1/settings/debrid': {
                 patch: {
                     tags: ['Debrid & Settings'],
                     summary: 'Update debrid configuration settings',
@@ -932,18 +1012,51 @@ export function buildOpenApiSpec(
                     }
                 }
             },
+            '/v1/settings/debrid/check': {
+                post: {
+                    tags: ['Debrid & Settings'],
+                    summary:
+                        'Verify the configured debrid provider credentials (admin)',
+                    responses: {
+                        '200': { description: 'Provider check result' }
+                    }
+                }
+            },
+            '/v1/settings/export': {
+                get: {
+                    tags: ['Debrid & Settings'],
+                    summary:
+                        'Export sanitized configuration (no transport URLs, no secrets)',
+                    security: [{ BearerAuth: [] }, { SessionAuth: [] }],
+                    responses: {
+                        '200': { description: 'Sanitized export payload' }
+                    }
+                }
+            },
+            '/v1/settings/import': {
+                post: {
+                    tags: ['Debrid & Settings'],
+                    summary: 'Import a previously exported configuration',
+                    security: [{ BearerAuth: [] }, { SessionAuth: [] }],
+                    requestBody: {
+                        required: true,
+                        content: {
+                            'application/json': {
+                                schema: { type: 'object' }
+                            }
+                        }
+                    },
+                    responses: {
+                        '200': { description: 'Settings imported' },
+                        '400': { $ref: '#/components/responses/BadRequest' }
+                    }
+                }
+            },
             '/v1/cache/metrics': {
                 get: {
                     tags: ['Cache & Audit'],
                     summary: 'Get cache hit/miss and cardinality metrics',
                     responses: { '200': { description: 'Cache statistics' } }
-                }
-            },
-            '/v1/cache/purge': {
-                post: {
-                    tags: ['Cache & Audit'],
-                    summary: 'Purge cache namespaces',
-                    responses: { '200': { description: 'Cache purged' } }
                 }
             },
             '/v1/audit': {
@@ -984,11 +1097,26 @@ export function buildOpenApiSpec(
                     responses: { '200': { description: 'Logged out' } }
                 }
             },
-            '/v1/auth/session': {
+            '/v1/auth/me': {
                 get: {
                     tags: ['Authentication'],
-                    summary: 'Get current authenticated session information',
-                    responses: { '200': { description: 'Session information' } }
+                    summary:
+                        'Get the current authenticated actor (401 otherwise)',
+                    responses: {
+                        '200': { description: 'Current actor' },
+                        '401': { $ref: '#/components/responses/Unauthorized' }
+                    }
+                }
+            },
+            '/v1/auth/csrf': {
+                get: {
+                    tags: ['Authentication'],
+                    summary:
+                        'Return (or mint) the CSRF token for cookie-authenticated sessions',
+                    responses: {
+                        '200': { description: 'CSRF token' },
+                        '401': { $ref: '#/components/responses/Unauthorized' }
+                    }
                 }
             },
             '/v1/proxy/grant/{id}': {
