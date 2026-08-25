@@ -74,6 +74,8 @@ export interface AppConfig {
     internalDebug: boolean;
 
     tmdbApiKey: string;
+    /** Override for the TMDB API origin (self-hosted mirrors / hermetic tests). */
+    tmdbApiBaseUrl: string;
     tmdbCacheTTL: number;
 
     cacheType: 'memory' | 'redis';
@@ -271,6 +273,11 @@ export function loadConfig(): AppConfig {
         internalDebug: envBool('INTERNAL_DEBUG', false),
 
         tmdbApiKey: envStr('TMDB_API_KEY'),
+        tmdbApiBaseUrl:
+            envStr('TMDB_API_BASE_URL', 'https://api.themoviedb.org/3').replace(
+                /\/$/,
+                ''
+            ) || 'https://api.themoviedb.org/3',
         tmdbCacheTTL: envNum('TMDB_CACHE_TTL', 86400),
 
         cacheType:
@@ -546,6 +553,11 @@ export function assertProductionSafe(cfg: AppConfig): void {
         if (!cfg.corsOrigin || cfg.corsOrigin === '*') {
             errors.push(
                 'CORS_ORIGIN must be an exact allowlist in production (not "*").'
+            );
+        }
+        if (!cfg.tmdbApiBaseUrl.startsWith('https://')) {
+            errors.push(
+                'TMDB_API_BASE_URL must use https:// in production (TMDB metadata leaves the network).'
             );
         }
         if (cfg.allowLegacyProxy) {

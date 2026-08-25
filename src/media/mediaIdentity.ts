@@ -94,6 +94,23 @@ function isValidSeasonEpisode(s?: number, e?: number): boolean {
     );
 }
 
+// ── TMDB API base URL ────────────────────────────────────────────────────────
+// Defaults to the public TMDB API. Overridable at startup (server.ts wires
+// cfg.tmdbApiBaseUrl from TMDB_API_BASE_URL) so self-hosted mirrors and
+// hermetic end-to-end tests can point identity resolution elsewhere.
+const DEFAULT_TMDB_BASE_URL = 'https://api.themoviedb.org/3';
+let tmdbApiBaseUrl = DEFAULT_TMDB_BASE_URL;
+
+/** Set the TMDB API base URL (no trailing slash). Ignored when empty. */
+export function setTmdbApiBaseUrl(url: string): void {
+    const trimmed = (url || '').trim().replace(/\/+$/, '');
+    if (trimmed) tmdbApiBaseUrl = trimmed;
+}
+
+export function getTmdbApiBaseUrl(): string {
+    return tmdbApiBaseUrl;
+}
+
 async function tmdbFetch<T>(
     path: string,
     opts: MediaIdentityOptions = {}
@@ -114,7 +131,7 @@ async function tmdbFetch<T>(
             504
         );
 
-    const url = `https://api.themoviedb.org/3${path}${path.includes('?') ? '&' : '?'}api_key=${encodeURIComponent(key)}`;
+    const url = `${tmdbApiBaseUrl}${path}${path.includes('?') ? '&' : '?'}api_key=${encodeURIComponent(key)}`;
 
     // Merge caller signal + timeout signal
     const timeoutSignal = AbortSignal.timeout(Math.min(remaining, 12_000));
@@ -203,7 +220,8 @@ export class MediaIdentityService {
             async (span) => {
                 span.setAttribute('media.kind', kind);
                 span.setAttribute('media.tmdb_id', tmdbId);
-                if (season !== undefined) span.setAttribute('media.season', season);
+                if (season !== undefined)
+                    span.setAttribute('media.season', season);
                 if (episode !== undefined)
                     span.setAttribute('media.episode', episode);
 
@@ -248,8 +266,7 @@ export class MediaIdentityService {
                     // Cap cache size
                     if (MEDIA_CACHE.size > 1000) {
                         const first = MEDIA_CACHE.keys().next().value as
-                            | string
-                            | undefined;
+                            string | undefined;
                         if (first) MEDIA_CACHE.delete(first);
                     }
                     span.setAttribute('media.from_cache', false);
