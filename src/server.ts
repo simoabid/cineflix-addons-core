@@ -20,7 +20,10 @@ import { aggregateSubtitles } from './subtitles/index.js';
 import { HealthMonitor } from './health/monitor.js';
 import { ProviderSelectionService } from './providers/selection.js';
 import { globalReliability } from './reliability/circuit.js';
-import { globalMediaIdentity } from './media/mediaIdentity.js';
+import {
+    globalMediaIdentity,
+    setTmdbApiBaseUrl
+} from './media/mediaIdentity.js';
 import { makeAuthGuard } from './routes/auth.js';
 import { normalizeUpstreamUrl } from './sources/normalization.js';
 import { registerAddonRoutes } from './routes/addons.routes.js';
@@ -106,6 +109,10 @@ async function main(): Promise<void> {
         );
         process.exit(1);
     }
+
+    // Route media-identity resolution at the configured TMDB origin
+    // (self-hosted mirror / hermetic e2e override).
+    setTmdbApiBaseUrl(cfg.tmdbApiBaseUrl);
 
     // Fail closed on unsafe production (and some non-prod) combinations.
     try {
@@ -383,7 +390,10 @@ async function main(): Promise<void> {
     const app = server.getInstance();
 
     // Redact raw request URLs for the framework logger (P1): grant/token URLs contain bearer tokens
-    // Mutate request.url before the logger's finish handler captures it; restore after.
+    // Mutate request.raw.url before the logger's finish handler captures it;
+    // restore after. Fastify's request.url getter delegates to raw.url, so
+    // writing raw.url is the single source of truth (request.url itself is
+    // getter-only in current Fastify and must not be assigned directly).
     const origUrls = new WeakMap<import('fastify').FastifyRequest, string>();
     app.addHook('onRequest', async (request) => {
         const url = request.url ?? '';
@@ -395,20 +405,18 @@ async function main(): Promise<void> {
             const redacted = url.startsWith('/v1/proxy/grant/')
                 ? '/v1/proxy/grant/[REDACTED]'
                 : '/v1/proxy/token/[REDACTED]';
-            // Fastify's request.url is mutable via raw
-            (request as unknown as { url: string }).url = redacted;
-            if ((request as unknown as { raw: { url?: string } }).raw) {
-                (request as unknown as { raw: { url: string } }).raw.url =
-                    redacted;
+            const raw = (request as unknown as { raw?: { url?: string } }).raw;
+            if (raw) {
+                raw.url = redacted;
             }
         }
     });
     app.addHook('onResponse', async (request) => {
         const orig = origUrls.get(request);
         if (orig) {
-            (request as unknown as { url: string }).url = orig;
-            if ((request as unknown as { raw: { url?: string } }).raw) {
-                (request as unknown as { raw: { url: string } }).raw.url = orig;
+            const raw = (request as unknown as { raw?: { url?: string } }).raw;
+            if (raw) {
+                raw.url = orig;
             }
         }
     });
