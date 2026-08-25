@@ -1,9 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {
-    assertProductionSafe,
-    resolvePublicUrl
-} from '../dist/config.js';
+import { assertProductionSafe, resolvePublicUrl } from '../dist/config.js';
 
 function prodBase(overrides = {}) {
     return {
@@ -16,6 +13,7 @@ function prodBase(overrides = {}) {
         nodeEnv: 'production',
         internalDebug: false,
         tmdbApiKey: 'x',
+        tmdbApiBaseUrl: 'https://api.themoviedb.org/3',
         tmdbCacheTTL: 1,
         cacheType: 'redis',
         redis: { host: 'localhost', port: 6379 },
@@ -49,7 +47,8 @@ function prodBase(overrides = {}) {
         importEnableOnInstall: false,
         secureProxy: true,
         allowLegacyProxy: false,
-        playbackGrantSecret: 'this-is-a-very-strong-grant-secret-32+chars-1234567890',
+        playbackGrantSecret:
+            'this-is-a-very-strong-grant-secret-32+chars-1234567890',
         playbackGrantTtlSec: 7200,
         proxyTimeoutMs: 30_000,
         proxyMaxManifestBytes: 1_000_000,
@@ -172,9 +171,7 @@ test('non-prod disabled auth on non-loopback requires acknowledgement', () => {
 
 test('resolvePublicUrl strips trailing slash', () => {
     assert.equal(
-        resolvePublicUrl(
-            prodBase({ publicUrl: 'https://addons.example/' })
-        ),
+        resolvePublicUrl(prodBase({ publicUrl: 'https://addons.example/' })),
         'https://addons.example'
     );
 });

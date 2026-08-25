@@ -324,6 +324,7 @@ test('production CORS refuses wildcards and empty allowlists', async () => {
         adminToken: 'prod-token-1234567890abcdef',
         publicUrl: 'https://addons.example.com',
         corsOrigin: 'https://app.example.com',
+        tmdbApiBaseUrl: 'https://api.themoviedb.org/3',
         secretsMasterKey: randomBytes(32).toString('hex'),
         playbackGrantSecret: randomBytes(32).toString('base64url'),
         cacheType: 'redis',
