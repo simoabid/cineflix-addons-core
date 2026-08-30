@@ -21,6 +21,8 @@ export function startFakeTmdb({ movies = {}, tv = {} } = {}) {
             const body = movies[movie[1]] ?? {
                 title: `E2E Movie ${movie[1]}`,
                 release_date: '2001-01-01',
+                // Framework movie validation requires status === 'Released'.
+                status: 'Released',
                 external_ids: { imdb_id: `tt${movie[1]}` }
             };
             res.writeHead(200, { 'content-type': 'application/json' });

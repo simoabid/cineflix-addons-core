@@ -16,10 +16,6 @@ import type {
     Diagnostic,
     Subtitle
 } from '@omss/framework';
-import type { StremioManifest } from './protocol.js';
-import { fetchStreams, fetchSubtitles } from './client.js';
-import { buildIdCandidates, toStremioType } from './ids.js';
-import { mapSubtitles, type ProxyFn } from './mapper.js';
 import { resolveTorrentStreams } from '../debrid/torrentSources.js';
 import type { PlaybackGrantStore } from '../security/playbackGrant.js';
 import { deriveCapabilities as deriveAddonCapabilities } from '../capabilities/index.js';
@@ -27,6 +23,10 @@ import { globalSourceNormalization } from '../sources/normalization.js';
 import { globalReliability } from '../reliability/circuit.js';
 import { globalConcurrency } from '../concurrency/coordinator.js';
 import { globalProviderBudgets } from '../capacity/budgets.js';
+import { mapSubtitles, type ProxyFn } from './mapper.js';
+import { buildIdCandidates, toStremioType } from './ids.js';
+import { fetchStreams, fetchSubtitles } from './client.js';
+import type { StremioManifest } from './protocol.js';
 
 function deriveCapabilities(
     manifest: StremioManifest
@@ -413,20 +413,13 @@ export class StremioAddonProvider extends BaseProvider {
             ) {
                 // Another half-open trial in flight
             } else {
-                let release: (() => void) | null = null;
+                // NOTE: no reliability.acquire() here — the caller (getStreams)
+                // already holds the per-provider/per-host semaphore for this
+                // request, and that semaphore is not reentrant. Re-acquiring
+                // it deadlocked every concurrent request once the provider
+                // limit was reached (each waiter held a slot it could not
+                // release until its own acquire resolved).
                 try {
-                    const host = (() => {
-                        try {
-                            return new URL(this.BASE_URL).hostname;
-                        } catch {
-                            return undefined;
-                        }
-                    })();
-                    release = await this.reliability.acquire(
-                        this.id,
-                        host,
-                        signal
-                    );
                     const start = Date.now();
                     const subs = await this.reliability.withRetry(
                         () =>
@@ -452,8 +445,6 @@ export class StremioAddonProvider extends BaseProvider {
                         this.reliability.recordFailure(this.id, kind);
                     }
                     /* subtitles are best-effort */
-                } finally {
-                    if (release) release();
                 }
             }
         }
