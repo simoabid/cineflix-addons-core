@@ -1,7 +1,7 @@
-import { OMSSServer } from '@omss/framework';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
+import { OMSSServer } from '@omss/framework';
 import { nanoid } from 'nanoid';
 import {
     loadConfig,
@@ -21,14 +21,14 @@ import { HealthMonitor } from './health/monitor.js';
 import { ProviderSelectionService } from './providers/selection.js';
 import { globalReliability } from './reliability/circuit.js';
 import {
+    getTmdbApiBaseUrl,
     globalMediaIdentity,
     setTmdbApiBaseUrl
 } from './media/mediaIdentity.js';
-import { makeAuthGuard } from './routes/auth.js';
+import { makeAuthGuard, registerAuthRoutes } from './routes/auth.js';
 import { normalizeUpstreamUrl } from './sources/normalization.js';
 import { registerAddonRoutes } from './routes/addons.routes.js';
 import { registerImportRoutes } from './routes/import.routes.js';
-import { registerAuthRoutes } from './routes/auth.js';
 import { registerJobRoutes } from './routes/jobs.routes.js';
 import { createStorageBackend } from './storage/index.js';
 import { migrateLegacyFileToStorage } from './storage/importer.js';
@@ -1162,6 +1162,10 @@ function patchTMDBService(server: OMSSServer): void {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const tmdb = (server as unknown as { tmdbService: any }).tmdbService;
     if (!tmdb) return;
+    // Route the framework's raw TMDB fetches (validateMovie/validateTVEpisode
+    // before patching below) through the configured TMDB_API_BASE_URL so
+    // mirrors and hermetic e2e tests work for the aggregate route too.
+    tmdb.baseUrl = getTmdbApiBaseUrl();
     const origGetMedia = tmdb.getMediaObject.bind(tmdb);
     const origGetImdb = tmdb.getImdbId.bind(tmdb);
     // Bulk + native Stremio now share MediaIdentityService's single cache/taxonomy
