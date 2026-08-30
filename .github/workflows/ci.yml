@@ -24,14 +24,21 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build
-        run: npm run build
+      - name: Secret scan
+        run: npm run scan:secrets
 
-      - name: Test
-        run: npm test
+      - name: Build and test (clean output — ADR 0005)
+        run: npm run test:clean
+
+      - name: Dead-code gate (files, dependencies, cycles)
+        run: npm run check:deadcode
+
+      - name: Coverage gate
+        run: npm run check:coverage
 
       - name: Format check
         run: npm run format:check
 
       - name: Lint
         run: npm run lint
+
