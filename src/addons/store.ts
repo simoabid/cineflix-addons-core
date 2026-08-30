@@ -3,18 +3,15 @@
  * Redis (lazy).
  */
 import type { AppConfig } from '../config.js';
+import type { IStorageBackend, AddonRecord } from '../storage/types.js';
+import { PostgresStorageBackend } from '../storage/postgres/index.js';
+import { FileStorageBackend } from '../storage/file/index.js';
 import {
     type AddonStoreData,
     defaultSettings,
     emptyStoreData,
     type InstalledAddon
 } from './types.js';
-import type {
-    IStorageBackend,
-    AddonRecord
-} from '../storage/types.js';
-import { PostgresStorageBackend } from '../storage/postgres/index.js';
-import { FileStorageBackend } from '../storage/file/index.js';
 
 export interface AddonStore {
     load(): Promise<AddonStoreData>;

@@ -1,5 +1,5 @@
-import { buildOpenApiSpec, toYaml } from './spec.js';
 import { promises as fs } from 'node:fs';
+import { buildOpenApiSpec, toYaml } from './spec.js';
 
 async function generate() {
     const spec = buildOpenApiSpec();

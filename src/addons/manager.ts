@@ -12,14 +12,6 @@ import type { ProviderRegistry } from '@omss/framework';
 import { fetchManifest, normalizeAddonUrl } from '../stremio/client.js';
 import { StremioAddonProvider } from '../stremio/addonProvider.js';
 import type { StremioManifest, StremioResource } from '../stremio/protocol.js';
-import { createAddonStore, type AddonStore } from './store.js';
-import {
-    type AddonStoreData,
-    type AddonValidationFinding,
-    type AppSettings,
-    type InstalledAddon,
-    defaultSettings
-} from './types.js';
 import type { IStorageBackend } from '../storage/types.js';
 import { DEFAULT_ADDON_TIMEOUT_MS, sortAddons } from '../priority.js';
 import { debridService } from '../debrid/service.js';
@@ -40,6 +32,14 @@ import {
     type AddonCapabilities
 } from '../capabilities/index.js';
 import { parseAddonUrl } from '../stremio/url.js';
+import {
+    type AddonStoreData,
+    type AddonValidationFinding,
+    type AppSettings,
+    type InstalledAddon,
+    defaultSettings
+} from './types.js';
+import { createAddonStore, type AddonStore } from './store.js';
 
 function nowIso(): string {
     return new Date().toISOString();

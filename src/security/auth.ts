@@ -18,6 +18,7 @@
  */
 
 import { createHmac, timingSafeEqual, randomBytes } from 'node:crypto';
+import { isIP } from 'node:net';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import type { AppConfig, AuthMode } from '../config.js';
 
@@ -41,8 +42,6 @@ declare module 'fastify' {
         auth?: AuthContext;
     }
 }
-
-import { isIP } from 'node:net';
 
 function ipToInt(ip: string): number | null {
     const parts = ip.split('.').map(Number);

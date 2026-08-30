@@ -11,8 +11,8 @@
 import { secureFetch } from '../security/secureFetch.js';
 import { type UrlPolicyOptions } from '../security/urlPolicy.js';
 import { redactUrl } from '../security/redaction.js';
-import { parseAddonUrl, buildResourceUrl } from './url.js';
 import { globalConcurrency } from '../concurrency/coordinator.js';
+import { parseAddonUrl, buildResourceUrl } from './url.js';
 import type {
     StremioManifest,
     StremioStream,

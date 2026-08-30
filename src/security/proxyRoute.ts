@@ -14,15 +14,8 @@
 import { Readable, Transform } from 'node:stream';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { AppConfig } from '../config.js';
-import {
-    createPlaybackGrantStore,
-    type PlaybackGrantClaims,
-    type PlaybackGrantStore
-} from './playbackGrant.js';
-import { validateOutboundUrl, UrlPolicyError } from './urlPolicy.js';
-import { createRateLimiter, RATE_LIMITS, rateLimitKey } from './rateLimit.js';
+import { DEV_GRANT_SECRET } from '../config.js';
 import { scrapeFetch, shouldProxyUrl } from '../egress/scrapeFetch.js';
-import { getRateLimitIp } from './auth.js';
 import { globalMetrics } from '../metrics/index.js';
 import { globalConcurrency } from '../concurrency/coordinator.js';
 import {
@@ -31,6 +24,14 @@ import {
     EgressBudgetMonitor
 } from '../capacity/index.js';
 import { logger } from '../telemetry/logger.js';
+import { getRateLimitIp } from './auth.js';
+import { createRateLimiter, RATE_LIMITS, rateLimitKey } from './rateLimit.js';
+import { validateOutboundUrl, UrlPolicyError } from './urlPolicy.js';
+import {
+    createPlaybackGrantStore,
+    type PlaybackGrantClaims,
+    type PlaybackGrantStore
+} from './playbackGrant.js';
 
 const HOP_BY_HOP = new Set([
     'connection',
@@ -62,7 +63,7 @@ export function createSecureProxyContext(cfg: AppConfig): SecureProxyContext {
     // In development, allow fallback chain for convenience but never use default in prod.
     let secret = cfg.playbackGrantSecret;
     const isProd = cfg.nodeEnv === 'production';
-    const DEV_FALLBACK = 'addons-core-dev-grant-secret';
+    const DEV_FALLBACK = DEV_GRANT_SECRET;
     if (!secret) {
         if (isProd) {
             throw new Error(

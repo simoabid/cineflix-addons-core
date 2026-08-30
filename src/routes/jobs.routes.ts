@@ -2,7 +2,6 @@ import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type { AppConfig } from '../config.js';
 import type { JobEngine } from '../jobs/engine.js';
 import type { IStorageBackend, JobStatus } from '../storage/types.js';
-import { makeAuthGuard, enforceRateLimit } from './auth.js';
 import {
     createRateLimiter,
     RATE_LIMITS,
@@ -10,6 +9,7 @@ import {
 } from '../security/rateLimit.js';
 import { actorFromAuth, type AuditLogger } from '../security/audit.js';
 import { getRateLimitIp } from '../security/auth.js';
+import { makeAuthGuard, enforceRateLimit } from './auth.js';
 
 function clientIp(
     request: FastifyRequest,

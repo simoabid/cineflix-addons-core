@@ -24,13 +24,13 @@ import {
     createDecipheriv,
     createHash
 } from 'node:crypto';
+import { globalMetrics } from '../metrics/index.js';
 import {
     validateOutboundUrl,
     type UrlPolicyOptions,
     UrlPolicyError
 } from './urlPolicy.js';
 import { redactUrl, redactHeaders } from './redaction.js';
-import { globalMetrics } from '../metrics/index.js';
 
 /** Raised when the active-grant hard cap is reached (Phase 7 §10.4). */
 export class GrantCapacityError extends Error {

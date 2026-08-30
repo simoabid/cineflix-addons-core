@@ -17,7 +17,6 @@ import { toPublicAddon } from '../addons/manager.js';
 import { deriveCapabilities } from '../capabilities/index.js';
 import type { HealthMonitor } from '../health/monitor.js';
 import { debridService } from '../debrid/service.js';
-import { makeAuthGuard, enforceRateLimit } from './auth.js';
 import {
     createRateLimiter,
     RATE_LIMITS,
@@ -48,6 +47,7 @@ import {
     checkOptimisticConcurrency,
     formatValidationError
 } from '../validation/validator.js';
+import { makeAuthGuard, enforceRateLimit } from './auth.js';
 
 function clientIp(
     request: FastifyRequest,

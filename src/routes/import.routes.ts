@@ -15,7 +15,6 @@ import type { AddonManager } from '../addons/manager.js';
 import { toPublicAddon } from '../addons/manager.js';
 import { importFromUrl, importFromUrls } from '../import/url.js';
 import { importFromStremioAccount } from '../import/stremioAccount.js';
-import { makeAuthGuard, enforceRateLimit } from './auth.js';
 import {
     createRateLimiter,
     RATE_LIMITS,
@@ -32,6 +31,7 @@ import {
     jobIdValidator
 } from '../validation/schemas.js';
 import { formatValidationError } from '../validation/validator.js';
+import { makeAuthGuard, enforceRateLimit } from './auth.js';
 
 function clientIp(
     request: FastifyRequest,

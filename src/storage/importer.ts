@@ -1,7 +1,11 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import type { IStorageBackend, AddonRecord, SanitizedExportData } from './types.js';
 import { redactUrl } from '../security/redaction.js';
+import type {
+    IStorageBackend,
+    AddonRecord,
+    SanitizedExportData
+} from './types.js';
 
 export interface SensitiveUrlFinding {
     providerId: string;
@@ -116,7 +120,8 @@ export async function migrateLegacyFileToStorage(
         let migratedCount = 0;
 
         for (const legacy of parsed.addons) {
-            const providerId = legacy.providerId || `addon:${legacy.slug || 'unknown'}`;
+            const providerId =
+                legacy.providerId || `addon:${legacy.slug || 'unknown'}`;
             const mUrl = legacy.manifestUrl || '';
             const bUrl = legacy.baseUrl || '';
             const origUrl = legacy.originalImportUrl;
@@ -127,7 +132,11 @@ export async function migrateLegacyFileToStorage(
             const f2 = detectSensitiveUrl(providerId, 'baseUrl', bUrl);
             if (f2) reports.push(f2);
             if (origUrl) {
-                const f3 = detectSensitiveUrl(providerId, 'originalImportUrl', origUrl);
+                const f3 = detectSensitiveUrl(
+                    providerId,
+                    'originalImportUrl',
+                    origUrl
+                );
                 if (f3) reports.push(f3);
             }
 
@@ -142,7 +151,10 @@ export async function migrateLegacyFileToStorage(
                 admissionState: legacy.admissionState || 'validated',
                 validationFindings: legacy.validationFindings,
                 order: typeof legacy.order === 'number' ? legacy.order : 100,
-                timeoutMs: typeof legacy.timeoutMs === 'number' ? legacy.timeoutMs : 10000,
+                timeoutMs:
+                    typeof legacy.timeoutMs === 'number'
+                        ? legacy.timeoutMs
+                        : 10000,
                 source: legacy.source || 'manual',
                 manifest: legacy.manifest || {
                     id: legacy.slug || 'unknown',
@@ -207,7 +219,9 @@ export async function importSanitizedConfiguration(
             slug: item.slug,
             name: item.name,
             originalImportUrl: existing?.originalImportUrl,
-            manifestUrl: existing?.manifestUrl || `https://${item.slug}.strem.fun/manifest.json`,
+            manifestUrl:
+                existing?.manifestUrl ||
+                `https://${item.slug}.strem.fun/manifest.json`,
             baseUrl: existing?.baseUrl || `https://${item.slug}.strem.fun`,
             enabled: item.enabled,
             admissionState: item.admissionState || 'validated',

@@ -8,6 +8,10 @@
  * Phase 4 enhancements: typed resolutions, capability contracts, link expiry,
  * telemetry/error classification, and audit hooks.
  */
+import type { AuditLogger } from '../security/audit.js';
+import { globalMetrics } from '../metrics/index.js';
+import { tracer } from '../telemetry/tracing.js';
+import { globalConcurrency } from '../concurrency/coordinator.js';
 import { RealDebridResolver } from './realdebrid.js';
 import { AllDebridResolver } from './alldebrid.js';
 import { PremiumizeResolver } from './premiumize.js';
@@ -21,10 +25,6 @@ import type {
     FileSelectionResult,
     ResolveInput
 } from './types.js';
-import type { AuditLogger } from '../security/audit.js';
-import { globalMetrics } from '../metrics/index.js';
-import { tracer } from '../telemetry/tracing.js';
-import { globalConcurrency } from '../concurrency/coordinator.js';
 
 interface CacheEntry {
     url: string;

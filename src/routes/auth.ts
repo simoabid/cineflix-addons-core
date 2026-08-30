@@ -33,10 +33,9 @@ import {
 } from '../security/rateLimit.js';
 import type { AuditLogger } from '../security/audit.js';
 import { actorFromAuth } from '../security/audit.js';
+import { getRateLimitIp } from '../security/auth.js';
 
 export { makeAuthGuard, makeAdminGuard };
-
-import { getRateLimitIp } from '../security/auth.js';
 
 function clientIp(
     request: FastifyRequest,

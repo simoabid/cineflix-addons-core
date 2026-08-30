@@ -11,6 +11,8 @@ import { nanoid } from 'nanoid';
 import type { IStorageBackend, JobRecord } from '../storage/types.js';
 import type { AddonManager } from '../addons/manager.js';
 import type { AppConfig } from '../config.js';
+import { tracer, logger } from '../telemetry/index.js';
+import { globalMetrics } from '../metrics/index.js';
 import type {
     JobTypeName,
     JobHandler,
@@ -30,8 +32,6 @@ import {
     maintenanceCleanupHandler
 } from './handlers/maintenanceHandlers.js';
 import { uncachedTransferHandler } from './handlers/uncachedTransferHandler.js';
-import { tracer, logger } from '../telemetry/index.js';
-import { globalMetrics } from '../metrics/index.js';
 
 export class JobEngine {
     private readonly handlers = new Map<string, JobHandler>();

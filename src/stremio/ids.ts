@@ -7,8 +7,8 @@
  * caller tries them until one returns streams.
  */
 import type { ProviderMediaObject } from '@omss/framework';
-import type { StremioManifest } from './protocol.js';
 import { deriveCapabilities } from '../capabilities/index.js';
+import type { StremioManifest } from './protocol.js';
 
 /** OMSS media type → Stremio content type. */
 export function toStremioType(type: 'movie' | 'tv'): 'movie' | 'series' {
@@ -30,7 +30,8 @@ function supportsPrefix(manifest: StremioManifest, prefix: string): boolean {
         const union = new Set<string>();
         for (const e of caps.stream) for (const p of e.idPrefixes) union.add(p);
         if (union.size > 0) {
-            for (const p of union) if (typeof p === 'string' && p.startsWith(prefix)) return true;
+            for (const p of union)
+                if (typeof p === 'string' && p.startsWith(prefix)) return true;
             return false;
         }
     }

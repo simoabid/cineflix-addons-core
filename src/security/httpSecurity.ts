@@ -7,6 +7,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { AppConfig } from '../config.js';
 import { redactString, redactUrl, redactValue } from './redaction.js';
 import { CSRF_COOKIE, CSRF_HEADER } from './csrf.js';
+
 const SESSION_COOKIE = 'addons_core_session';
 
 export interface SafeErrorBody {
