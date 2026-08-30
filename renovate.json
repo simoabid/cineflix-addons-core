@@ -1,0 +1,50 @@
+{
+    "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+    "description": "Phase 9 §12.2 — dependency update automation with test gates. All updates must pass the full CI gate (build, test, format, lint, knip, secret scan) before automerge.",
+    "extends": [
+        "config:recommended",
+        ":semanticCommits",
+        ":semanticCommitScope(deps)",
+        ":enableVulnerabilityAlertsWithLabel(security)",
+        "schedule:weekly"
+    ],
+    "rangeStrategy": "bump",
+    "lockFileMaintenance": {
+        "enabled": true,
+        "schedule": ["before 6am on monday"]
+    },
+    "packageRules": [
+        {
+            "description": "The OMSS framework controls routing, proxying, source aggregation and health semantics — never automerge, always human-reviewed (Phase 10 §13.5).",
+            "matchPackageNames": ["@omss/framework"],
+            "automerge": false,
+            "labels": ["review-required", "framework"]
+        },
+        {
+            "description": "Group devDependency minor/patch updates for review efficiency.",
+            "matchDepTypes": ["devDependencies"],
+            "matchUpdateTypes": ["minor", "patch"],
+            "groupName": "devDependencies non-major",
+            "automerge": true,
+            "automergeType": "pr",
+            "requiredStatusChecks": ["gate"]
+        },
+        {
+            "description": "Runtime dependencies never automerge (security-sensitive server).",
+            "matchDepTypes": ["dependencies"],
+            "automerge": false,
+            "labels": ["review-required"]
+        },
+        {
+            "description": "Security updates bypass the weekly schedule.",
+            "matchUpdateTypes": ["patch"],
+            "matchCurrentVersion": "!/^0/",
+            "vulnerabilityAlert": true,
+            "schedule": ["at any time"]
+        }
+    ],
+    "vulnerabilityAlerts": {
+        "enabled": true,
+        "labels": ["security"]
+    }
+}

@@ -1,0 +1,34 @@
+{
+    "$schema": "./node_modules/knip/schema.json",
+    "entry": [
+        "src/server.ts",
+        "src/openapi/generateDocs.ts",
+        "eslint.config.js",
+        "test/**/*.test.js",
+        "test/e2e/helpers/*.js",
+        "test/helpers/*.js",
+        "scripts/**/*.js"
+    ],
+    "project": ["src/**/*.ts", "scripts/**/*.js", "test/**/*"],
+    "ignore": ["test/fixtures/**", "scripts/**"],
+    // Intentional public re-export surfaces (see AGENTS.md): members are part
+    // of the module API even when internal code imports the underlying files.
+    "ignoreExportsUsedInFile": true,
+    // Tests import the compiled artifact under ../dist (ADR 0005); knip must
+    // not treat those paths as broken imports.
+    "rules": {
+        "unresolved": "off"
+    },
+    "ignoreDependencies": [
+        // Transitive via @omss/framework by design (AGENTS.md) — used for
+        // FastifyRequest/FastifyInstance types in src/ and test/.
+        "fastify",
+        // Loaded via a guarded dynamic import in src/storage/postgres/index.ts
+        // so optional-dependency installs stay lean.
+        "pg",
+        // Type-only usage through tsconfig typeRoots.
+        "@types/js-yaml",
+        "@types/pg"
+    ],
+    "includeEntryExports": false
+}

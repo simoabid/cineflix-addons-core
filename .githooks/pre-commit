@@ -1,0 +1,57 @@
+#!/bin/sh
+# ─── Pre-commit hook (Phase 9 §12.2) ─────────────────────────────────────────
+# Runs the fast quality gates on staged changes only:
+#   1. secret scan (staged diff)
+#   2. Prettier check (staged source files)
+#   3. ESLint (staged src files)
+#   4. TypeScript typecheck (whole project; no emit)
+#
+# Installed by `npm run prepare` → `git config core.hooksPath .githooks`.
+# Bypass with `git commit --no-verify` (CI still enforces everything).
+
+set -u
+cd "$(git rev-parse --show-toplevel)"
+
+fail=0
+
+# 1. Secret scan on staged changes.
+if ! sh scripts/secret-scan.sh; then
+    echo "pre-commit: secret scan failed" >&2
+    fail=1
+fi
+
+# 2. Prettier on staged source files (only those Prettier owns).
+STAGED_SRC=$(git diff --cached --name-only --diff-filter=ACMR -- 'src/**/*.ts' '*.js' '*.json' '*.md')
+if [ -n "$STAGED_SRC" ]; then
+    if ! npx --no-install prettier --check $STAGED_SRC >/dev/null 2>&1; then
+        echo "pre-commit: prettier check failed for:" >&2
+        echo "$STAGED_SRC" >&2
+        echo "  run: npx prettier --write <files>" >&2
+        fail=1
+    fi
+fi
+
+# 3. ESLint on staged src files.
+STAGED_TS=$(git diff --cached --name-only --diff-filter=ACMR -- 'src/**/*.ts')
+if [ -n "$STAGED_TS" ]; then
+    if ! npx --no-install eslint $STAGED_TS; then
+        echo "pre-commit: eslint failed" >&2
+        fail=1
+    fi
+fi
+
+# 4. Typecheck. Skipped when no TypeScript files are staged to keep
+# non-source commits (docs, tests) fast.
+if [ -n "$STAGED_TS" ]; then
+    if ! npx --no-install tsc --noEmit; then
+        echo "pre-commit: typecheck failed" >&2
+        fail=1
+    fi
+fi
+
+if [ "$fail" -ne 0 ]; then
+    echo "pre-commit: blocked (fix the issues above or commit --no-verify)" >&2
+    exit 1
+fi
+
+exit 0
