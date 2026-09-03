@@ -78,6 +78,7 @@ export {
 
 export {
     createPlaybackGrantStore,
+    assertGrantPublicUrlOrigin,
     grantPublicView,
     GrantCapacityError,
     type PlaybackGrantClaims,

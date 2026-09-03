@@ -44,6 +44,7 @@ import {
     applySecurityHeaders,
     createAuditLogger,
     createSecureProxyContext,
+    assertGrantPublicUrlOrigin,
     createProxyCapacityGuards,
     registerSecureProxyRoutes,
     toSafeError
@@ -347,6 +348,15 @@ async function main(): Promise<void> {
     // Wire grants into providers so sources use /v1/proxy/grant/:id.
     if (cfg.secureProxy) {
         manager.setPlaybackGrants(proxyCtx.grants, publicUrl);
+        // Phase 10 §13.3 — startup assertion that generated proxy URLs use
+        // PUBLIC_URL. A mismatch would hand clients unreachable playback
+        // URLs (e.g. http://0.0.0.0:3006/... behind a TLS edge).
+        await assertGrantPublicUrlOrigin(
+            proxyCtx.grants,
+            resolvePublicUrl(cfg),
+            cfg.nodeEnv,
+            cfg.publicUrl
+        );
     }
 
     // Make bulk + native Stremio use the unified MediaIdentityService (single TMDB path, §5.4).

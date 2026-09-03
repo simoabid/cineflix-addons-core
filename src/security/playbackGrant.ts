@@ -531,6 +531,48 @@ export function createPlaybackGrantStore(
     };
 }
 
+/**
+ * Phase 10 §13.3 — startup assertion that generated proxy URLs use the
+ * PUBLIC_URL origin. Called once at boot: builds a proxy URL for a synthetic
+ * grant claim and verifies it points at the configured origin. In production,
+ * PUBLIC_URL must be https. A mismatch would hand clients unreachable
+ * playback URLs (e.g. http://0.0.0.0:3006/... behind a TLS edge), so this
+ * fails the start.
+ */
+export async function assertGrantPublicUrlOrigin(
+    grants: Pick<PlaybackGrantStore, 'toProxyUrl'>,
+    publicBase: string,
+    nodeEnv: string,
+    configuredPublicUrl?: string
+): Promise<void> {
+    const syntheticGrant: PlaybackGrantClaims = {
+        id: 'startup-assertion',
+        url: 'https://startup-assertion.invalid/probe.mp4',
+        headers: {},
+        providerId: 'startup-assertion',
+        exp: Math.floor(Date.now() / 1000),
+        iat: Math.floor(Date.now() / 1000),
+        maxRedirects: 0
+    };
+    const probeUrl = grants.toProxyUrl(syntheticGrant, publicBase);
+    const origin = new URL(publicBase).origin;
+    if (!probeUrl.startsWith(`${origin}/`)) {
+        throw new Error(
+            `startup assertion failed: playback grant URLs build as ${probeUrl} ` +
+                `but PUBLIC_URL origin is ${origin}`
+        );
+    }
+    if (
+        nodeEnv === 'production' &&
+        configuredPublicUrl &&
+        !origin.startsWith('https://')
+    ) {
+        throw new Error(
+            `startup assertion failed: PUBLIC_URL must be https in production (got ${origin})`
+        );
+    }
+}
+
 /** Safe diagnostic view of a grant (no headers, redacted URL). */
 export function grantPublicView(
     grant: PlaybackGrantClaims
