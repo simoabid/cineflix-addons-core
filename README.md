@@ -260,7 +260,20 @@ npm run format       # prettier
 
 ---
 
+## Documentation
+
+The full documentation set lives in [`docs/`](docs/README.md) — start with the
+[index](docs/README.md). Highlights: [architecture & ADRs](docs/architecture.md),
+[concepts](docs/concepts.md), [installation](docs/installation.md),
+[configuration reference](docs/configuration.md),
+[production security checklist](docs/security-checklist.md),
+[API reference](docs/api-reference.md), and the
+[incident runbooks](docs/runbooks/).
+
+---
+
 ## License
 
 [MIT](./LICENSE). Independent project. Built on the public `@omss/framework`.
 Not affiliated with Stremio.
+
