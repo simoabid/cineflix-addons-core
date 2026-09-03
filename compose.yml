@@ -1,6 +1,7 @@
 services:
     addons-core:
         build: .
+        image: addons-core:local
         ports:
             - '3006:3006'
         environment:
@@ -26,6 +27,30 @@ services:
             # - SCRAPE_PROXY_STREAM=true
         volumes:
             - addons-data:/data
+        # ─── Hardening (Phase 10 §13.1) ────────────────────────────────────────
+        # Read-only root filesystem; only the data volume and /tmp are writable.
+        read_only: true
+        tmpfs:
+            - /tmp:size=64m,mode=1777
+        # Drop every capability; the server needs none as an unprivileged user.
+        cap_drop:
+            - ALL
+        security_opt:
+            - no-new-privileges:true
+        # Explicit resource ceilings so a runaway scrape cannot starve the host.
+        mem_limit: 1g
+        cpus: 2.0
+        # Internal healthcheck mirrors the image HEALTHCHECK (liveness only).
+        healthcheck:
+            test:
+                - CMD
+                - node
+                - -e
+                - fetch('http://127.0.0.1:'+(process.env.PORT||3006)+'/health/live').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
+            interval: 30s
+            timeout: 5s
+            start_period: 20s
+            retries: 3
         restart: unless-stopped
         networks:
             - addons-network
@@ -46,3 +71,4 @@ volumes:
 networks:
     addons-network:
         driver: bridge
+
