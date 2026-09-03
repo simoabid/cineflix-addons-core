@@ -19,7 +19,8 @@
         "format:check": "prettier --check src",
         "lint": "eslint src",
         "clean": "npx rimraf dist",
-        "prepare": "git config core.hooksPath .githooks || true"
+        "prepare": "git config core.hooksPath .githooks || true",
+        "sbom": "node scripts/sbom.js"
     },
     "dependencies": {
         "@omss/framework": "^1.1.26",

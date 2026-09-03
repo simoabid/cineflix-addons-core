@@ -1,0 +1,1 @@
+# Trivy waivers: add entries as `CVE-XXXX-YYYY|pkg` with an expiry comment.
