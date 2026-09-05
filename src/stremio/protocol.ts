@@ -15,6 +15,28 @@ export interface StremioManifestCatalog {
     extra?: Array<{ name: string; isRequired?: boolean; options?: string[] }>;
 }
 
+/** Meta entry returned by addon catalog endpoints (Phase 12 §15.1). */
+export interface StremioMeta {
+    id: string;
+    type?: string;
+    name?: string;
+    poster?: string;
+    background?: string;
+    logo?: string;
+    description?: string;
+    releaseInfo?: string;
+    imdbRating?: string;
+    runtime?: string;
+    genres?: string[];
+    [key: string]: unknown;
+}
+
+export interface StremioCatalogResponse {
+    metas?: StremioMeta[];
+    cacheMaxAge?: number;
+    [key: string]: unknown;
+}
+
 /**
  * A resource can be a plain string ('stream') or a detailed object with the
  * types / idPrefixes it applies to.

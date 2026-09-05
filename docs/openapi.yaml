@@ -502,6 +502,56 @@ paths:
           description: Provider released
         '404':
           $ref: '#/components/responses/NotFound'
+  /v1/catalogs:
+    get:
+      tags:
+        - Catalogs
+      summary: List catalog descriptors from enabled catalog-capable addons (Phase 12 §15.1)
+      responses:
+        '200':
+          description: Catalog descriptor list
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/catalogs/{slug}/{type}/{catalogId}:
+    get:
+      tags:
+        - Catalogs
+      summary: Fetch one normalized, cached catalog page from an addon (Phase 12 §15.1)
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: type
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: catalogId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: search
+          in: query
+          schema:
+            type: string
+        - name: genre
+          in: query
+          schema:
+            type: string
+        - name: skip
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Normalized catalog page
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '502':
+          description: Catalog upstream failed
   /v1/addons/reorder:
     post:
       tags:

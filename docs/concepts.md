@@ -74,6 +74,15 @@ revision-keyed, and cluster replicas are invalidated via the Redis bus
 (`CLUSTER_BUS_ENABLED`). Clients treat responses from an older revision as
 stale.
 
+## Catalog and metadata passthrough — `GET /v1/catalogs`
+
+The service also exposes addon **catalogs** for browsing (Phase 12 §15.1):
+`GET /v1/catalogs` lists declared catalogs from enabled catalog-capable
+addons; `GET /v1/catalogs/:slug/:type/:catalogId` returns one normalized,
+cached page. Entries are namespaced `<providerId>:<metaId>` so addons never
+collide, and catalog-only addons serve catalogs **only** — they are never
+admitted to the stream waterfall.
+
 ## Capability model
 
 Each addon's manifest is decomposed into independent capabilities: `stream`

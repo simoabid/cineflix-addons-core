@@ -252,7 +252,7 @@ npm run format       # prettier
 
 ## Roadmap (Phase 3+)
 
-- Catalog / meta passthrough (browse addon catalogs from the admin or API).
+- ~~Catalog / meta passthrough~~ — shipped (Phase 12 §15.1): `GET /v1/catalogs` + pages.
 - Wyzie (or other) subtitle fallback when addons don't supply them.
 - Richer debrid: uncached-torrent wait/poll, multi-file picker UI.
 - Multi-backend aggregation in the CINEFLIX frontend (run cineflix-core +

@@ -18,6 +18,7 @@ export interface CacheTtlConfig {
     playbackGrantSec: number;
     healthSec: number;
     circuitSec: number;
+    catalogSec: number;
 }
 
 export const DEFAULT_CACHE_TTLS: CacheTtlConfig = {
@@ -27,7 +28,8 @@ export const DEFAULT_CACHE_TTLS: CacheTtlConfig = {
     aggregateSwrSec: 300, // 5 minutes stale-while-revalidate grace
     playbackGrantSec: 7200, // 2 hours
     healthSec: 900, // 15 minutes
-    circuitSec: 30 // 30 seconds
+    circuitSec: 30, // 30 seconds
+    catalogSec: 1800 // 30 minutes
 };
 
 export function buildMediaKey(
@@ -68,4 +70,21 @@ export function buildHealthKey(addonId: string): string {
 
 export function buildCircuitKey(providerId: string): string {
     return `circuit:v1:${providerId.trim()}`;
+}
+
+/**
+ * Catalog page key (Phase 12 §15.1). Revision-scoped so provider mutations
+ * invalidate catalog caches along with everything else.
+ */
+export function buildCatalogKey(
+    providerRevision: number | string,
+    addonSlug: string,
+    type: string,
+    catalogId: string,
+    extraKey: string
+): string {
+    const slug = encodeURIComponent(addonSlug.trim());
+    const t = encodeURIComponent(type.trim());
+    const cid = encodeURIComponent(catalogId.trim());
+    return `catalog:v1:${providerRevision}:${slug}:${t}:${cid}:${extraKey}`;
 }

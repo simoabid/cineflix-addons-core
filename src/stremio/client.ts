@@ -14,6 +14,7 @@ import { redactUrl } from '../security/redaction.js';
 import { globalConcurrency } from '../concurrency/coordinator.js';
 import { parseAddonUrl, buildResourceUrl } from './url.js';
 import type {
+    StremioCatalogResponse,
     StremioManifest,
     StremioStream,
     StremioStreamResponse,
@@ -251,5 +252,62 @@ export async function fetchSubtitles(
         return Array.isArray(json?.subtitles) ? json.subtitles : [];
     } catch {
         return [];
+    }
+}
+
+export interface FetchCatalogOptions {
+    timeoutMs?: number;
+    policy?: UrlPolicyOptions;
+    maxBytes?: number;
+    maxRedirects?: number;
+    signal?: AbortSignal;
+    /** Stremio `extra` parameters (search, genre, skip, ...). */
+    extra?: Record<string, string>;
+}
+
+/**
+ * Fetch one catalog page from an addon (Phase 12 §15.1):
+ *   {base}/catalog/{type}/{catalogId}.json?extra...
+ * Returns the raw metas plus the addon's cacheMaxAge hint when provided.
+ */
+export async function fetchCatalog(
+    baseUrl: string,
+    type: string,
+    catalogId: string,
+    options: FetchCatalogOptions = {}
+): Promise<StremioCatalogResponse> {
+    const url = new URL(buildResourceUrl(baseUrl, 'catalog', type, catalogId));
+    for (const [k, v] of Object.entries(options.extra ?? {})) {
+        if (v) url.searchParams.set(k, v);
+    }
+    const target = url.toString();
+    const policy = options.policy ?? { allowHttp: true };
+    if (options.signal?.aborted)
+        throw new StremioAddonError('Aborted', redactUrl(target));
+    try {
+        const result = await secureFetch(target, {
+            headers: DEFAULT_HEADERS,
+            timeoutMs: options.timeoutMs ?? 12_000,
+            maxBytes: options.maxBytes ?? 2_097_152,
+            maxRedirects: options.maxRedirects ?? 3,
+            acceptContentTypes: ['json', 'text/plain', 'javascript'],
+            policy,
+            viaProxy: 'auto',
+            signal: options.signal
+        });
+        if (!result.response.ok) {
+            throw new StremioAddonError(
+                `Catalog HTTP ${result.response.status}`,
+                redactUrl(target)
+            );
+        }
+        const json = (await result.response.json()) as StremioCatalogResponse;
+        return json ?? {};
+    } catch (err) {
+        if (err instanceof StremioAddonError) throw err;
+        throw new StremioAddonError(
+            err instanceof Error ? err.message : 'Failed to fetch catalog',
+            redactUrl(target)
+        );
     }
 }

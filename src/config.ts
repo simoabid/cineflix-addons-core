@@ -135,6 +135,9 @@ export interface AppConfig {
     /** New imports start disabled in production unless explicitly enabled. */
     importEnableOnInstall: boolean;
 
+    /** Phase 12 §15.1: hard cap on entries returned per catalog page. */
+    catalogMaxItems: number;
+
     /** Secure proxy / playback grants. */
     secureProxy: boolean;
     allowLegacyProxy: boolean;
@@ -349,6 +352,7 @@ export function loadConfig(): AppConfig {
         importMaxBytes: envNum('IMPORT_MAX_BYTES', 1_048_576),
         importTimeoutMs: envNum('IMPORT_TIMEOUT_MS', 20_000),
         importEnableOnInstall: envBool('IMPORT_ENABLE_ON_INSTALL', !isProd),
+        catalogMaxItems: envNum('CATALOG_MAX_ITEMS', 100),
 
         // Secure proxy is on by default; legacy open proxy only when explicitly allowed
         // and never in production.

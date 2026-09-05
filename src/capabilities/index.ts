@@ -11,6 +11,7 @@
 
 import type {
     StremioManifest,
+    StremioManifestCatalog,
     StremioResource
 } from '../stremio/protocol.js';
 
@@ -40,6 +41,8 @@ export type AddonCapabilities = {
     stream: CapabilityEntry[];
     subtitles: CapabilityEntry[];
     catalog: boolean;
+    /** Declared catalog descriptors (Phase 12 §15.1) from manifest.catalogs. */
+    catalogs: StremioManifestCatalog[];
     meta: boolean;
     /** Overall usefulness to this backend (stream/subtitle pipeline). */
     status: AddonCapabilityStatus;
@@ -61,7 +64,12 @@ const KNOWN_TYPE_MAP: Record<string, 'movie' | 'series' | 'tv'> = {
     anime: 'series'
 };
 
-const VALID_RESOURCE_NAMES = new Set(['stream', 'subtitles', 'catalog', 'meta']);
+const VALID_RESOURCE_NAMES = new Set([
+    'stream',
+    'subtitles',
+    'catalog',
+    'meta'
+]);
 
 function normalizeMediaTypes(
     types: unknown,
@@ -77,20 +85,18 @@ function normalizeMediaTypes(
         if (typeof t !== 'string') continue;
         const mapped = KNOWN_TYPE_MAP[t.toLowerCase()];
         if (mapped) out.add(mapped);
-        else if (t === 'movie' || t === 'series' || t === 'tv') out.add(t as never);
+        else if (t === 'movie' || t === 'series' || t === 'tv')
+            out.add(t as never);
     }
     return out.size ? [...out] : ['movie', 'series', 'tv'];
 }
 
-function normalizeIdPrefixes(
-    prefixes: unknown,
-    fallback: unknown
-): string[] {
+function normalizeIdPrefixes(prefixes: unknown, fallback: unknown): string[] {
     const src = Array.isArray(prefixes)
         ? prefixes
         : Array.isArray(fallback)
-            ? fallback
-            : undefined;
+          ? fallback
+          : undefined;
     if (!src || src.length === 0) {
         // De-facto default per ids.ts: tt for streams/subs.
         return ['tt'];
@@ -115,11 +121,16 @@ function normalizeResourceEntry(
 
     if (typeof r === 'string') {
         name = r;
-    } else if (r && typeof r === 'object' && typeof (r as { name?: unknown }).name === 'string') {
+    } else if (
+        r &&
+        typeof r === 'object' &&
+        typeof (r as { name?: unknown }).name === 'string'
+    ) {
         name = (r as { name: string }).name;
         const obj = r as { types?: unknown; idPrefixes?: unknown };
         if (Array.isArray(obj.types)) types = obj.types as string[];
-        if (Array.isArray(obj.idPrefixes)) idPrefixes = obj.idPrefixes as string[];
+        if (Array.isArray(obj.idPrefixes))
+            idPrefixes = obj.idPrefixes as string[];
     } else {
         return null;
     }
@@ -132,7 +143,10 @@ function normalizeResourceEntry(
             name: name as 'catalog' | 'meta',
             rawTypes: types,
             rawIdPrefixes: idPrefixes,
-            mediaTypes: normalizeMediaTypes(types, manifest.types as string[] | undefined),
+            mediaTypes: normalizeMediaTypes(
+                types,
+                manifest.types as string[] | undefined
+            ),
             idPrefixes: normalizeIdPrefixes(idPrefixes, manifest.idPrefixes)
         };
     }
@@ -142,7 +156,10 @@ function normalizeResourceEntry(
         name: name as 'stream' | 'subtitles',
         rawTypes: types,
         rawIdPrefixes: idPrefixes,
-        mediaTypes: normalizeMediaTypes(types, manifest.types as string[] | undefined),
+        mediaTypes: normalizeMediaTypes(
+            types,
+            manifest.types as string[] | undefined
+        ),
         idPrefixes: normalizeIdPrefixes(idPrefixes, manifest.idPrefixes)
     };
 }
@@ -151,7 +168,9 @@ function normalizeResourceEntry(
  * Parse manifest.resources (string and object forms) into normalized descriptors,
  * merging manifest-level types/idPrefixes correctly.
  */
-export function normalizeResources(manifest: StremioManifest): NormalizedResource[] {
+export function normalizeResources(
+    manifest: StremioManifest
+): NormalizedResource[] {
     const raw = manifest.resources;
     if (!Array.isArray(raw)) return [];
     const out: NormalizedResource[] = [];
@@ -162,7 +181,9 @@ export function normalizeResources(manifest: StremioManifest): NormalizedResourc
     return out;
 }
 
-export function deriveCapabilities(manifest: StremioManifest): AddonCapabilities {
+export function deriveCapabilities(
+    manifest: StremioManifest
+): AddonCapabilities {
     const resources = normalizeResources(manifest);
 
     const stream = resources
@@ -182,23 +203,28 @@ export function deriveCapabilities(manifest: StremioManifest): AddonCapabilities
     if (stream.length === 0 && subtitles.length === 0) {
         if (catalog || meta) {
             status = 'limited';
-            statusReason = catalog && meta
-                ? 'catalog/meta only — no stream or subtitle resources'
-                : catalog
-                    ? 'catalog only — no stream or subtitle resources'
-                    : 'meta only — no stream or subtitle resources';
+            statusReason =
+                catalog && meta
+                    ? 'catalog/meta only — no stream or subtitle resources'
+                    : catalog
+                      ? 'catalog only — no stream or subtitle resources'
+                      : 'meta only — no stream or subtitle resources';
         } else if (resources.length === 0) {
             status = 'unsupported';
             // Distinguish empty resources vs unknown resources
-            const rawLen = Array.isArray(manifest.resources) ? manifest.resources.length : 0;
+            const rawLen = Array.isArray(manifest.resources)
+                ? manifest.resources.length
+                : 0;
             if (rawLen === 0) {
                 statusReason = 'no advertised resources';
             } else {
-                statusReason = 'no stream/subtitle/catalog/meta resources advertised';
+                statusReason =
+                    'no stream/subtitle/catalog/meta resources advertised';
             }
         } else {
             status = 'unsupported';
-            statusReason = 'advertises resources but none usable for stream/subtitle pipeline';
+            statusReason =
+                'advertises resources but none usable for stream/subtitle pipeline';
         }
     }
 
@@ -206,6 +232,15 @@ export function deriveCapabilities(manifest: StremioManifest): AddonCapabilities
         stream,
         subtitles,
         catalog,
+        catalogs: Array.isArray(manifest.catalogs)
+            ? manifest.catalogs.filter(
+                  (c) =>
+                      c &&
+                      typeof c === 'object' &&
+                      typeof c.id === 'string' &&
+                      typeof c.type === 'string'
+              )
+            : [],
         meta,
         status,
         statusReason,
@@ -224,7 +259,12 @@ export function isSubtitleCapable(cap: AddonCapabilities): boolean {
 }
 
 export function isCatalogOnly(cap: AddonCapabilities): boolean {
-    return cap.status === 'limited' && cap.catalog && !isStreamCapable(cap) && !isSubtitleCapable(cap);
+    return (
+        cap.status === 'limited' &&
+        cap.catalog &&
+        !isStreamCapable(cap) &&
+        !isSubtitleCapable(cap)
+    );
 }
 
 export function canServeMediaType(
@@ -242,7 +282,9 @@ export function supportsIdPrefix(
     prefix: string
 ): boolean {
     const entries = kind === 'stream' ? cap.stream : cap.subtitles;
-    return entries.some((e) => e.idPrefixes.some((p) => prefix.startsWith(p) || p.startsWith(prefix)));
+    return entries.some((e) =>
+        e.idPrefixes.some((p) => prefix.startsWith(p) || p.startsWith(prefix))
+    );
 }
 
 /**
@@ -261,7 +303,9 @@ export function canServeMedia(
     const mediaType: 'movie' | 'series' | 'tv' =
         media.type === 'movie' ? 'movie' : 'series';
     // Check type compatibility first
-    const typeOk = entries.some((e) => e.mediaTypes.includes(mediaType) || e.mediaTypes.includes('tv'));
+    const typeOk = entries.some(
+        (e) => e.mediaTypes.includes(mediaType) || e.mediaTypes.includes('tv')
+    );
     if (!typeOk) return false;
     // If no IDs, pessimistically assume compatible (caller will try)
     if (!media.imdbId && !media.tmdbId) return true;
@@ -270,6 +314,10 @@ export function canServeMedia(
     if (media.imdbId) prefixesToTest.push('tt');
     if (media.tmdbId) prefixesToTest.push('tmdb');
     return prefixesToTest.some((p) =>
-        entries.some((e) => e.idPrefixes.some((idp) => idp.startsWith(p) || p.startsWith(idp) || idp === p))
+        entries.some((e) =>
+            e.idPrefixes.some(
+                (idp) => idp.startsWith(p) || p.startsWith(idp) || idp === p
+            )
+        )
     );
 }

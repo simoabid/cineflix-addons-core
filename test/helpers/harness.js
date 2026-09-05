@@ -117,6 +117,8 @@ export function fakeManifest(overrides = {}) {
  *   GET /manifest.json                      → options.manifest (or default)
  *   GET /stream/:type/:id.json              → options.streamsFor(type,id) ?? []
  *   GET /subtitles/:type/:id.json           → options.subtitlesFor(type,id) ?? []
+ *   GET /catalog/:type/:id.json             → options.catalogFor(type,id) ?? []
+ *                                             (or options.onCatalog(req,res,...))
  *
  * Behavior hooks (all optional):
  *   manifestStatus   — status code for /manifest.json (default 200)
@@ -127,7 +129,7 @@ export function fakeManifest(overrides = {}) {
  */
 export function startFakeAddonServer(options = {}) {
     const manifest = options.manifest ?? fakeManifest();
-    const seen = { streams: [], subtitles: [], manifests: 0 };
+    const seen = { streams: [], subtitles: [], catalogs: [], manifests: 0 };
     return startHttpServer((req, res) => {
         const u = new URL(req.url, 'http://127.0.0.1');
         const send = (status, body, headers = {}) => {
@@ -199,6 +201,33 @@ export function startFakeAddonServer(options = {}) {
                   )
                 : [];
             return send(200, { subtitles: body });
+        }
+        // Phase 12 §15.1 — fake catalog pages.
+        const cat = u.pathname.match(/^\/catalog\/([^/]+)\/([^/]+)\.json$/);
+        if (cat) {
+            seen.catalogs = seen.catalogs || [];
+            seen.catalogs.push({
+                type: decodeURIComponent(cat[1]),
+                id: decodeURIComponent(cat[2]),
+                query: u.search
+            });
+            if (options.onCatalog) {
+                return options.onCatalog(
+                    req,
+                    res,
+                    decodeURIComponent(cat[1]),
+                    decodeURIComponent(cat[2]),
+                    u
+                );
+            }
+            const body = options.catalogFor
+                ? options.catalogFor(
+                      decodeURIComponent(cat[1]),
+                      decodeURIComponent(cat[2]),
+                      u
+                  )
+                : [];
+            return send(200, { metas: body });
         }
         send(404, { error: 'Not found' });
     }).then((handle) => ({
