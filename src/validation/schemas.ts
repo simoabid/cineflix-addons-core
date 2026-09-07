@@ -339,6 +339,8 @@ export interface SubtitlesQueryParams {
     season?: number;
     episode?: number;
     language?: string;
+    /** Accessibility preference (Phase 12 §15.2): include | avoid | only. */
+    hearingImpaired?: 'include' | 'avoid' | 'only';
 }
 
 export const subtitlesQueryValidator: ValidatorFn<SubtitlesQueryParams> = (
@@ -435,6 +437,21 @@ export const subtitlesQueryValidator: ValidatorFn<SubtitlesQueryParams> = (
             });
         } else {
             out.language = raw.language.slice(0, 10).trim();
+        }
+    }
+
+    // Phase 12 §15.2: accessibility preference for hearing-impaired tracks.
+    if (raw.hearingImpaired !== undefined && raw.hearingImpaired !== '') {
+        const hi = String(raw.hearingImpaired).toLowerCase();
+        const valid = ['include', 'avoid', 'only'] as const;
+        if (!valid.includes(hi as (typeof valid)[number])) {
+            errors.push({
+                field: 'query.hearingImpaired',
+                message: `hearingImpaired must be one of: ${valid.join(', ')}`,
+                received: raw.hearingImpaired
+            });
+        } else {
+            out.hearingImpaired = hi as SubtitlesQueryParams['hearingImpaired'];
         }
     }
 

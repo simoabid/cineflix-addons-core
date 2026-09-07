@@ -138,6 +138,13 @@ export interface AppConfig {
     /** Phase 12 §15.1: hard cap on entries returned per catalog page. */
     catalogMaxItems: number;
 
+    /** Phase 12 §15.2: subtitle fallback provider (disabled by default; see fallback.ts). */
+    subtitleFallbackEnabled: boolean;
+    subtitleFallbackUrl: string;
+    subtitleFallbackTimeoutMs: number;
+    /** Phase 12 §15.2: hard cap on subtitles returned per query. */
+    subtitleMaxResults: number;
+
     /** Secure proxy / playback grants. */
     secureProxy: boolean;
     allowLegacyProxy: boolean;
@@ -353,6 +360,13 @@ export function loadConfig(): AppConfig {
         importTimeoutMs: envNum('IMPORT_TIMEOUT_MS', 20_000),
         importEnableOnInstall: envBool('IMPORT_ENABLE_ON_INSTALL', !isProd),
         catalogMaxItems: envNum('CATALOG_MAX_ITEMS', 100),
+        subtitleFallbackEnabled: envBool('SUBTITLE_FALLBACK_ENABLED', false),
+        subtitleFallbackUrl: envStr('SUBTITLE_FALLBACK_URL', ''),
+        subtitleFallbackTimeoutMs: envNum(
+            'SUBTITLE_FALLBACK_TIMEOUT_MS',
+            10_000
+        ),
+        subtitleMaxResults: envNum('SUBTITLE_MAX_RESULTS', 50),
 
         // Secure proxy is on by default; legacy open proxy only when explicitly allowed
         // and never in production.
