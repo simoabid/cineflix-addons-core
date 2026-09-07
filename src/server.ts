@@ -844,11 +844,20 @@ async function main(): Promise<void> {
                     tmdbId: q.tmdbId,
                     season: q.season,
                     episode: q.episode,
-                    language: q.language
+                    language: q.language,
+                    hearingImpaired: q.hearingImpaired
                 },
                 {
                     grants: cfg.secureProxy ? proxyCtx.grants : undefined,
                     secureProxy: cfg.secureProxy,
+                    maxResults: cfg.subtitleMaxResults,
+                    // Phase 12 §15.2: operator-gated trusted fallback.
+                    fallback: {
+                        enabled: cfg.subtitleFallbackEnabled,
+                        template: cfg.subtitleFallbackUrl,
+                        timeoutMs: cfg.subtitleFallbackTimeoutMs,
+                        policy: { allowHttp: cfg.allowHttpUpstreams }
+                    },
                     signal: (request as unknown as { signal?: AbortSignal })
                         .signal,
                     deadlineMs: deadline
@@ -856,9 +865,12 @@ async function main(): Promise<void> {
             );
             return reply.code(200).send({
                 subtitles: result.subtitles,
-                source: 'stremio-addons',
+                source: result.source,
                 addonsQueried: result.addonsQueried,
                 revision: creationRev,
+                ...(result.fallbackUsed
+                    ? { fallbackUsed: result.fallbackUsed }
+                    : {}),
                 ...(result.error ? { error: result.error } : {})
             });
         } catch (err) {

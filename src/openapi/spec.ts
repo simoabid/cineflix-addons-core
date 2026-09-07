@@ -264,6 +264,17 @@ export function buildOpenApiSpec(
                             name: 'language',
                             in: 'query',
                             schema: { type: 'string' }
+                        },
+                        {
+                            name: 'hearingImpaired',
+                            in: 'query',
+                            description:
+                                'Accessibility preference for hearing-impaired (SDH/CC) tracks',
+                            schema: {
+                                type: 'string',
+                                enum: ['include', 'avoid', 'only'],
+                                default: 'include'
+                            }
                         }
                     ],
                     responses: {
@@ -1429,7 +1440,32 @@ export function buildOpenApiSpec(
                         id: { type: 'string' },
                         language: { type: 'string', example: 'eng' },
                         url: { type: 'string', format: 'uri' },
-                        format: { type: 'string', example: 'vtt' }
+                        format: { type: 'string', example: 'vtt' },
+                        lang: {
+                            type: 'string',
+                            description:
+                                'Canonical BCP 47 tag (e.g. en-US), when known'
+                        },
+                        hearingImpaired: {
+                            type: 'boolean',
+                            description:
+                                'True for hearing-impaired (SDH/CC) tracks'
+                        },
+                        score: {
+                            type: 'integer',
+                            description:
+                                'Match-confidence score 0-100 against the query'
+                        },
+                        provenance: {
+                            type: 'string',
+                            description:
+                                'Originating addon provider id or fallback provider'
+                        },
+                        origin: {
+                            type: 'string',
+                            enum: ['addon', 'fallback'],
+                            description: 'Where this subtitle came from'
+                        }
                     }
                 },
                 SubtitlesResponse: {
@@ -1439,6 +1475,17 @@ export function buildOpenApiSpec(
                         subtitles: {
                             type: 'array',
                             items: { $ref: '#/components/schemas/OMSSSubtitle' }
+                        },
+                        source: {
+                            type: 'string',
+                            enum: ['stremio-addons', 'fallback', 'mixed'],
+                            description: 'Which backends contributed results'
+                        },
+                        addonsQueried: { type: 'integer' },
+                        fallbackUsed: {
+                            type: 'boolean',
+                            description:
+                                'True when the trusted fallback provider contributed'
                         },
                         revision: { type: 'integer' }
                     }
