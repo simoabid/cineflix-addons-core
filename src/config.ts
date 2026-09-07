@@ -61,6 +61,90 @@ function envJsonRecord(name: string): Record<string, number> {
 export type AuthMode =
     'disabled' | 'static-token' | 'oidc' | 'reverse-proxy' | 'service-jwt';
 
+/**
+ * Phase 12 §15.3 — a remote OMSS backend aggregated behind the federation
+ * endpoints. Provider ids are namespaced as `backend:<name>` so they can
+ * never collide with local `addon:<slug>` providers.
+ */
+export interface FederatedBackend {
+    /** DNS-safe unique name (also used in the namespaced provider id). */
+    name: string;
+    /** Base URL of the remote OMSS server (https in production). */
+    baseUrl: string;
+    /** Lower = higher precedence (matches provider priority convention). */
+    priority: number;
+    /** Optional bearer token — never logged or echoed. */
+    token?: string;
+}
+
+/**
+ * Parse FEDERATION_BACKENDS: comma-separated `name|baseUrl[|priority[|token]]`
+ * entries. Throws on malformed input so misconfiguration is caught at boot.
+ */
+export function parseBackendsSpec(spec: string): FederatedBackend[] {
+    const trimmed = spec.trim();
+    if (!trimmed) return [];
+    const out: FederatedBackend[] = [];
+    const seen = new Set<string>();
+    for (const entry of trimmed.split(',')) {
+        const item = entry.trim();
+        if (!item) continue;
+        const parts = item.split('|').map((p) => p.trim());
+        const [name, rawUrl, rawPriority, token] = parts;
+        if (!name || !/^[a-z0-9][a-z0-9-]{0,48}$/.test(name)) {
+            throw new Error(
+                `FEDERATION_BACKENDS: invalid backend name '${name}' (use [a-z0-9-])`
+            );
+        }
+        if (seen.has(name)) {
+            throw new Error(
+                `FEDERATION_BACKENDS: duplicate backend name '${name}'`
+            );
+        }
+        seen.add(name);
+        let parsedUrl: URL;
+        try {
+            parsedUrl = new URL(rawUrl ?? '');
+        } catch {
+            throw new Error(
+                `FEDERATION_BACKENDS: backend '${name}' has an invalid URL`
+            );
+        }
+        if (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') {
+            throw new Error(
+                `FEDERATION_BACKENDS: backend '${name}' must use http(s)`
+            );
+        }
+        if (parsedUrl.pathname && parsedUrl.pathname !== '/') {
+            throw new Error(
+                `FEDERATION_BACKENDS: backend '${name}' URL must not include a path`
+            );
+        }
+        let priority = 500;
+        if (rawPriority !== undefined && rawPriority !== '') {
+            priority = Number(rawPriority);
+            if (
+                !Number.isFinite(priority) ||
+                priority < 0 ||
+                priority > 100_000
+            ) {
+                throw new Error(
+                    `FEDERATION_BACKENDS: backend '${name}' priority must be a number 0-100000`
+                );
+            }
+        }
+        const baseUrl = parsedUrl.toString().replace(/\/$/, '');
+        out.push({
+            name,
+            baseUrl,
+            priority,
+            ...(token ? { token } : {})
+        });
+    }
+    return out;
+}
+
+
 export type Role = 'viewer' | 'operator' | 'admin';
 
 export interface AppConfig {
@@ -144,6 +228,11 @@ export interface AppConfig {
     subtitleFallbackTimeoutMs: number;
     /** Phase 12 §15.2: hard cap on subtitles returned per query. */
     subtitleMaxResults: number;
+
+    /** Phase 12 §15.3: federated OMSS backends (disabled by default). */
+    federationEnabled: boolean;
+    federationBackends: FederatedBackend[];
+    federationTimeoutMs: number;
 
     /** Secure proxy / playback grants. */
     secureProxy: boolean;
@@ -367,6 +456,13 @@ export function loadConfig(): AppConfig {
             10_000
         ),
         subtitleMaxResults: envNum('SUBTITLE_MAX_RESULTS', 50),
+
+        // Phase 12 §15.3 — federated backends. The spec is parsed eagerly so a
+        // malformed FEDERATION_BACKENDS value fails startup (fail-closed)
+        // instead of surfacing as per-request errors.
+        federationEnabled: envBool('FEDERATION_ENABLED', false),
+        federationBackends: parseBackendsSpec(envStr('FEDERATION_BACKENDS', '')),
+        federationTimeoutMs: envNum('FEDERATION_TIMEOUT_MS', 10_000),
 
         // Secure proxy is on by default; legacy open proxy only when explicitly allowed
         // and never in production.
