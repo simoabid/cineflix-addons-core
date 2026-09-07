@@ -213,14 +213,17 @@ describe('rankSubtitles', () => {
             [
                 entry({ url: 'https://x/a.srt', lang: 'fr' }),
                 entry({ url: 'https://x/b.srt', lang: 'en' }),
-                entry({ url: 'https://x/a.srt', lang: 'en' }) // dup url
+                entry({ url: 'https://x/a.srt', lang: 'en' })
             ],
             { language: 'en' }
         );
         assert.equal(ranked.length, 2);
+        // Both survivors score 55 (exact language + native .srt format);
+        // stable order is input order: b.srt first, then the deduped a.srt
+        // (en occurrence wins — the fr one was filtered by language pref).
         assert.equal(ranked[0].collected.sub.url, 'https://x/b.srt');
-        assert.equal(ranked[0].score, 55); // 50 language + 5 format
-        // Dedup keeps the highest-scored (lang en) occurrence.
+        assert.equal(ranked[0].score, 55);
+        assert.equal(ranked[1].collected.sub.url, 'https://x/a.srt');
         assert.equal(ranked[1].langCanonical, 'en');
     });
 
