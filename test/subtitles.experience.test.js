@@ -208,23 +208,19 @@ function entry(sub, providerId = 'addon:test', origin = 'addon') {
 }
 
 describe('rankSubtitles', () => {
-    test('sorts by score descending and dedups by url', () => {
-        const ranked = rankSubtitles(
-            [
-                entry({ url: 'https://x/a.srt', lang: 'fr' }),
-                entry({ url: 'https://x/b.srt', lang: 'en' }),
-                entry({ url: 'https://x/a.srt', lang: 'en' })
-            ],
-            { language: 'en' }
-        );
+    test('sorts by score descending and dedups by url (highest kept)', () => {
+        const ranked = rankSubtitles([
+            entry({ url: 'https://x/a.srt', lang: 'en' }),
+            entry({ url: 'https://x/b.srt', lang: 'en' }),
+            // Same url as the first, but SDH → higher score.
+            entry({ url: 'https://x/a.srt', lang: 'en', id: 'sdh-1' })
+        ]);
         assert.equal(ranked.length, 2);
-        // Both survivors score 55 (exact language + native .srt format);
-        // stable order is input order: b.srt first, then the deduped a.srt
-        // (en occurrence wins — the fr one was filtered by language pref).
-        assert.equal(ranked[0].collected.sub.url, 'https://x/b.srt');
-        assert.equal(ranked[0].score, 55);
-        assert.equal(ranked[1].collected.sub.url, 'https://x/a.srt');
-        assert.equal(ranked[1].langCanonical, 'en');
+        // The SDH duplicate outranks the plain one and is kept.
+        assert.equal(ranked[0].collected.sub.url, 'https://x/a.srt');
+        assert.equal(ranked[0].hearingImpaired, true);
+        assert.equal(ranked[0].collected.sub.id, 'sdh-1');
+        assert.equal(ranked[1].collected.sub.url, 'https://x/b.srt');
     });
 
     test('accessibility avoid excludes hearing-impaired tracks', () => {

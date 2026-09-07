@@ -182,7 +182,7 @@ test('fallback activates only when addons return nothing and is provenance-tagge
                 ...BASE_OPTS,
                 fallback: {
                     enabled: true,
-                    template: `${fallbackAddon.baseUrl}/subtitles/movie/tt{{imdbId}}.json`,
+                    template: `${fallbackAddon.baseUrl}/subtitles/movie/{imdbId}.json`,
                     policy: {
                         allowHttp: true,
                         allowHostSuffixes: ['127.0.0.1']
@@ -229,7 +229,7 @@ test('fallback template that violates policy yields no results (fail closed)', a
                 ...BASE_OPTS,
                 fallback: {
                     enabled: true,
-                    template: `${fallbackAddon.baseUrl}/subtitles/movie/tt{{imdbId}}.json`
+                    template: `${fallbackAddon.baseUrl}/subtitles/movie/{imdbId}.json`
                 }
             }
         );
