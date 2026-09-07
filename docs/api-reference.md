@@ -35,7 +35,14 @@ progressive single-provider waterfall (the frontend's primary path) ·
 
 ### Subtitles
 `GET /v1/subtitles` — aggregates all subtitle-capable addons (IMDb/TMDB id,
-season/episode, language filters)
+season/episode, language filters). Results are ranked by match confidence
+(language, season/episode, release-name, format) and deduplicated; each entry
+carries canonical BCP 47 `lang`, `hearingImpaired`, `score`, and provenance
+(`provenance`/`origin`). Query params: `imdbId`/`tmdbId`, `season`, `episode`,
+`language` (BCP 47 or ISO 639), `hearingImpaired=include|avoid|only`.
+An optional operator-gated trusted fallback provider
+(`SUBTITLE_FALLBACK_ENABLED`, see `.env.example`) fills empty results and is
+reported via `source: fallback|mixed` + `fallbackUsed: true`.
 
 ### Playback proxy
 `GET /v1/proxy/grant/:id` — redeem a short-lived, signed playback grant
