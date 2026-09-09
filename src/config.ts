@@ -144,7 +144,6 @@ export function parseBackendsSpec(spec: string): FederatedBackend[] {
     return out;
 }
 
-
 export type Role = 'viewer' | 'operator' | 'admin';
 
 export interface AppConfig {
@@ -228,6 +227,16 @@ export interface AppConfig {
     subtitleFallbackTimeoutMs: number;
     /** Phase 12 §15.2: hard cap on subtitles returned per query. */
     subtitleMaxResults: number;
+
+    /** Phase 12 §15.4: provider marketplace / import policy controls. */
+    marketplaceTrustedIds: string[];
+    marketplaceTrustedFingerprints: string[];
+    marketplaceBlockedIds: string[];
+    marketplaceBlockedFingerprints: string[];
+    /** Minimum trust level that may be auto-enabled at import time. */
+    marketplaceMinTrustForEnable: 'trusted' | 'known' | 'unknown';
+    /** When true (default) denylisted manifests are rejected outright. */
+    marketplaceEnforceDenylist: boolean;
 
     /** Phase 12 §15.3: federated OMSS backends (disabled by default). */
     federationEnabled: boolean;
@@ -457,11 +466,33 @@ export function loadConfig(): AppConfig {
         ),
         subtitleMaxResults: envNum('SUBTITLE_MAX_RESULTS', 50),
 
+        // Phase 12 §15.4 — provider marketplace / import policy controls.
+        marketplaceTrustedIds: envList('MARKETPLACE_TRUSTED_IDS'),
+        marketplaceTrustedFingerprints: envList(
+            'MARKETPLACE_TRUSTED_FINGERPRINTS'
+        ),
+        marketplaceBlockedIds: envList('MARKETPLACE_BLOCKED_IDS'),
+        marketplaceBlockedFingerprints: envList(
+            'MARKETPLACE_BLOCKED_FINGERPRINTS'
+        ),
+        marketplaceMinTrustForEnable: (() => {
+            const v = envStr('MARKETPLACE_MIN_TRUST_FOR_ENABLE', 'unknown');
+            return v === 'trusted' || v === 'known' || v === 'unknown'
+                ? v
+                : 'unknown';
+        })(),
+        marketplaceEnforceDenylist: envBool(
+            'MARKETPLACE_ENFORCE_DENYLIST',
+            true
+        ),
+
         // Phase 12 §15.3 — federated backends. The spec is parsed eagerly so a
         // malformed FEDERATION_BACKENDS value fails startup (fail-closed)
         // instead of surfacing as per-request errors.
         federationEnabled: envBool('FEDERATION_ENABLED', false),
-        federationBackends: parseBackendsSpec(envStr('FEDERATION_BACKENDS', '')),
+        federationBackends: parseBackendsSpec(
+            envStr('FEDERATION_BACKENDS', '')
+        ),
         federationTimeoutMs: envNum('FEDERATION_TIMEOUT_MS', 10_000),
 
         // Secure proxy is on by default; legacy open proxy only when explicitly allowed

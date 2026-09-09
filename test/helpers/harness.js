@@ -128,7 +128,12 @@ export function fakeManifest(overrides = {}) {
  *   onStream         — (req, res, type, id, query) => void custom handler
  */
 export function startFakeAddonServer(options = {}) {
-    const manifest = options.manifest ?? fakeManifest();
+    // `manifest` may be a static object or a () => manifest function so tests
+    // can mutate the served manifest between requests (drift scenarios).
+    const manifest = () =>
+        typeof options.manifest === 'function'
+            ? options.manifest()
+            : (options.manifest ?? fakeManifest());
     const seen = { streams: [], subtitles: [], catalogs: [], manifests: 0 };
     return startHttpServer((req, res) => {
         const u = new URL(req.url, 'http://127.0.0.1');
@@ -164,7 +169,7 @@ export function startFakeAddonServer(options = {}) {
                     options.manifestBody
                 );
             }
-            return send(options.manifestStatus ?? 200, manifest);
+            return send(options.manifestStatus ?? 200, manifest());
         }
         const stream = u.pathname.match(/^\/stream\/([^/]+)\/(.+)\.json$/);
         if (stream) {

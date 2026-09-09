@@ -31,6 +31,7 @@ export type AddonValidationFindingCode =
     | 'invalid_manifest'
     | 'oversized_response'
     | 'policy_violation'
+    | 'fingerprint_drift'
     | 'http_upstream'
     | 'ok';
 
@@ -94,6 +95,11 @@ export interface InstalledAddon {
     };
     /** Normalized capabilities derived from manifest (cached for fast filtering). */
     capabilities?: AddonCapabilities;
+    /**
+     * Phase 12 §15.4: stable SHA-256 fingerprint of the manifest document at
+     * last install/refresh (verified-marketplace / drift detection).
+     */
+    manifestFingerprint?: string;
 }
 
 export interface AddonStoreData {

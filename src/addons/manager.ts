@@ -40,6 +40,11 @@ import {
     defaultSettings
 } from './types.js';
 import { createAddonStore, type AddonStore } from './store.js';
+import {
+    evaluateImportPolicy,
+    marketplacePolicyFromConfig,
+    type MarketplaceClassification
+} from './marketplace.js';
 
 function nowIso(): string {
     return new Date().toISOString();
@@ -72,6 +77,8 @@ export interface InstallResult {
     /** true when the URL was already installed (updated in place). */
     updated?: boolean;
     findings?: AddonValidationFinding[];
+    /** Phase 12 §15.4: marketplace classification of the manifest. */
+    marketplace?: MarketplaceClassification;
 }
 
 function hasResource(manifest: StremioManifest, name: string): boolean {
@@ -920,6 +927,17 @@ export class AddonManager {
             originalImportUrl,
             manifestUrl
         );
+        // Phase 12 §15.4 — marketplace classification + import policy.
+        const policy = marketplacePolicyFromConfig(this.cfg);
+        const decision = evaluateImportPolicy(manifest, policy);
+        if (!decision.allowed) {
+            findings.push(decision.finding!);
+            return {
+                ok: false,
+                error: decision.reason,
+                findings
+            };
+        }
         const hasError = findings.some((f) => f.severity === 'error');
         if (hasError) {
             return {
@@ -932,7 +950,11 @@ export class AddonManager {
             };
         }
 
-        const enable = options.enable ?? this.cfg.importEnableOnInstall ?? true;
+        // Trust-gated auto-enable: imports below the configured minimum trust
+        // level install disabled + pending until an operator enables them.
+        const enable =
+            (options.enable ?? this.cfg.importEnableOnInstall ?? true) &&
+            decision.mayAutoEnable;
 
         // Dedupe: same manifest URL or base → update in place (idempotent).
         // Dedupe by normalized fingerprint, not raw string equality.
@@ -960,6 +982,9 @@ export class AddonManager {
             existing.originalImportUrl = originalImportUrl;
             existing.validationFindings = findings;
             existing.capabilities = capabilitiesFor(manifest);
+            // Phase 12 §15.4: refresh the recorded fingerprint (drift is
+            // detected and surfaced on subsequent operator refreshes).
+            existing.manifestFingerprint = decision.fingerprint;
             existing.admissionState = enable
                 ? 'validated'
                 : (existing.admissionState ?? 'validated');
@@ -972,7 +997,18 @@ export class AddonManager {
             this.reconcileRegistry();
             await this.bumpRevision();
             await this.persist();
-            return { ok: true, addon: existing, updated: true, findings };
+            return {
+                ok: true,
+                addon: existing,
+                updated: true,
+                findings,
+                marketplace: {
+                    level: decision.trustLevel,
+                    reason: decision.reason,
+                    fingerprint: decision.fingerprint,
+                    matchedBy: decision.matchedBy
+                }
+            };
         }
 
         const providerId = this.uniqueProviderId(manifest, baseUrl);
@@ -988,9 +1024,12 @@ export class AddonManager {
             manifestUrl,
             baseUrl,
             enabled: enable,
+            // Below-minimum-trust installs stay pending until an operator
+            // reviews and enables them (Phase 12 §15.4 trust gate).
             admissionState: enable ? 'validated' : 'pending',
             validationFindings: findings,
             capabilities: capabilitiesFor(manifest),
+            manifestFingerprint: decision.fingerprint,
             order: maxOrder + 1,
             timeoutMs: DEFAULT_ADDON_TIMEOUT_MS,
             source,
@@ -1002,7 +1041,17 @@ export class AddonManager {
         this.reconcileRegistry();
         await this.bumpRevision();
         await this.persist();
-        return { ok: true, addon, findings };
+        return {
+            ok: true,
+            addon,
+            findings,
+            marketplace: {
+                level: decision.trustLevel,
+                reason: decision.reason,
+                fingerprint: decision.fingerprint,
+                matchedBy: decision.matchedBy
+            }
+        };
     }
 
     async remove(providerId: string): Promise<boolean> {
@@ -1076,7 +1125,30 @@ export class AddonManager {
         const addon = this.get(providerId);
         if (!addon) return { ok: false, error: 'Addon not found' };
         const url = addon.originalImportUrl || addon.manifestUrl;
-        return this.install(url, addon.source, { enable: addon.enabled });
+        const previousFingerprint = addon.manifestFingerprint;
+        const result = await this.install(url, addon.source, {
+            enable: addon.enabled
+        });
+        // Phase 12 §15.4 — verified-manifest drift detection: when the
+        // upstream manifest changed since the last install/refresh, surface a
+        // warning finding so operators can review before re-trusting.
+        if (
+            result.ok &&
+            previousFingerprint &&
+            result.marketplace?.fingerprint &&
+            result.marketplace.fingerprint !== previousFingerprint
+        ) {
+            result.findings = [
+                ...(result.findings ?? []),
+                {
+                    code: 'fingerprint_drift',
+                    message:
+                        'Manifest fingerprint changed since the last refresh — review the addon before re-trusting it',
+                    severity: 'warning'
+                }
+            ];
+        }
+        return result;
     }
 
     // ── registry sync ────────────────────────────────────────────────────────
@@ -1197,6 +1269,9 @@ export function toPublicAddon(a: InstalledAddon) {
         admissionState:
             a.admissionState ?? (a.enabled ? 'validated' : 'disabled'),
         validationFindings: a.validationFindings,
+        // Phase 12 §15.4: verified-marketplace metadata (safe to expose —
+        // a hash of the public manifest, not a secret).
+        manifestFingerprint: a.manifestFingerprint,
         capabilities: {
             stream: caps.stream,
             subtitles: caps.subtitles,

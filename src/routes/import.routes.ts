@@ -15,6 +15,11 @@ import type { AddonManager } from '../addons/manager.js';
 import { toPublicAddon } from '../addons/manager.js';
 import { importFromUrl, importFromUrls } from '../import/url.js';
 import { importFromStremioAccount } from '../import/stremioAccount.js';
+import { fetchManifest } from '../stremio/client.js';
+import {
+    evaluateImportPolicy,
+    marketplacePolicyFromConfig
+} from '../addons/marketplace.js';
 import {
     createRateLimiter,
     RATE_LIMITS,
@@ -274,6 +279,92 @@ export function registerImportRoutes(
         handleImportUrl
     );
     app.post('/v1/import', { preHandler: adminGuard }, handleImportUrl);
+
+    // ── Phase 12 §15.4: evaluate a manifest without installing it ───────────
+    // Controlled-rollout helper: fetches the manifest, classifies it against
+    // the operator's marketplace policy, and reports the trust level plus the
+    // would-be auto-enable decision. No state is persisted.
+    app.post(
+        '/v1/addons/evaluate',
+        { preHandler: adminGuard },
+        async (req, reply) => {
+            if (!(await gate(req, reply))) return;
+            const val = importUrlBodyValidator(req.body);
+            if (!val.ok && val.errors) {
+                return reply
+                    .code(400)
+                    .send(formatValidationError(val.errors, req.id));
+            }
+            const body = val.data!;
+            // Evaluate operates on a single URL only.
+            const url = (typeof body.url === 'string' ? body.url : '').trim();
+            if (!url) {
+                return reply.code(400).send({
+                    error: {
+                        code: 'MISSING_PARAMETER',
+                        message: 'Provide { url } (single manifest URL)'
+                    }
+                });
+            }
+            try {
+                const fetched = await fetchManifest(url, cfg.importTimeoutMs, {
+                    maxBytes: cfg.importMaxBytes,
+                    policy: manager.urlPolicy()
+                });
+                const policy = marketplacePolicyFromConfig(cfg);
+                const decision = evaluateImportPolicy(fetched.manifest, policy);
+                if (audit) {
+                    await audit.record({
+                        actor: actorFromAuth(
+                            req.auth?.actor,
+                            clientIp(req, cfg)
+                        ),
+                        action: 'addon.evaluate',
+                        target: `addon:${String(fetched.manifest.id ?? '').toLowerCase()}`,
+                        requestId: req.id,
+                        revision: manager.getRevision(),
+                        outcome: 'success',
+                        meta: { url: redactUrl(url) }
+                    });
+                }
+                return reply.code(200).send({
+                    ok: true,
+                    name: fetched.manifest.name ?? null,
+                    manifestId: fetched.manifest.id ?? null,
+                    trustLevel: decision.trustLevel,
+                    reason: decision.reason,
+                    fingerprint: decision.fingerprint,
+                    matchedBy: decision.matchedBy,
+                    wouldAutoEnable: decision.mayAutoEnable,
+                    denied: !decision.allowed,
+                    revision: manager.getRevision()
+                });
+            } catch (err) {
+                const message =
+                    err instanceof Error
+                        ? err.message
+                        : 'manifest fetch failed';
+                if (audit) {
+                    await audit.record({
+                        actor: actorFromAuth(
+                            req.auth?.actor,
+                            clientIp(req, cfg)
+                        ),
+                        action: 'addon.evaluate',
+                        requestId: req.id,
+                        revision: manager.getRevision(),
+                        outcome: 'failure',
+                        reason: message,
+                        meta: { url: redactUrl(url) }
+                    });
+                }
+                return reply.code(400).send({
+                    ok: false,
+                    error: message
+                });
+            }
+        }
+    );
 
     // ── import from Stremio account ─────────────────────────────────────────
     const handleImportStremio = async (

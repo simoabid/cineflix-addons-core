@@ -598,6 +598,26 @@ paths:
           description: Health check completed synchronously
         '202':
           description: Health check queued asynchronously on job engine
+  /v1/addons/evaluate:
+    post:
+      tags:
+        - Addon Management
+      summary: Evaluate a manifest URL against the marketplace policy without installing it
+      description: Fetches the manifest, classifies it (trust level, fingerprint, denylist), and reports the would-be auto-enable decision. No state is persisted.
+      security:
+        - BearerAuth: []
+        - SessionAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImportUrlBody'
+      responses:
+        '200':
+          description: Policy evaluation result
+        '400':
+          description: Missing or invalid URL
   /v1/addons/import/url:
     post:
       tags:
