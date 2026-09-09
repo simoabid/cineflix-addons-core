@@ -29,6 +29,8 @@ import { makeAuthGuard, registerAuthRoutes } from './routes/auth.js';
 import { normalizeUpstreamUrl } from './sources/normalization.js';
 import { registerAddonRoutes } from './routes/addons.routes.js';
 import { registerImportRoutes } from './routes/import.routes.js';
+import { registerFederationRoutes } from './routes/federation.routes.js';
+import { FederationService } from './federation/service.js';
 import { registerCatalogRoutes } from './routes/catalogs.routes.js';
 import { registerJobRoutes } from './routes/jobs.routes.js';
 import { createStorageBackend } from './storage/index.js';
@@ -1099,6 +1101,19 @@ async function main(): Promise<void> {
     );
     registerImportRoutes(app, manager, cfg, audit, jobEngine);
     registerJobRoutes(app, jobEngine, storage, cfg, audit);
+
+    // ── Federation (Phase 12 §15.3) — fail-closed unless enabled + backends ───
+    const federation = new FederationService(
+        cfg.federationEnabled ? cfg.federationBackends : [],
+        cfg.federationTimeoutMs,
+        {
+            allowHttp: cfg.allowHttpUpstreams,
+            allowHostSuffixes: cfg.outboundHostAllowSuffixes,
+            allowCredentials: false,
+            maxLength: 2048
+        }
+    );
+    registerFederationRoutes(app, cfg, federation);
 
     // ── Catalog browsing (Phase 12 §15.1) ─────────────────────────────────────
     registerCatalogRoutes(app, manager, cfg, cacheManager);
