@@ -1456,7 +1456,25 @@ export function buildOpenApiSpec(
                         size: { type: 'integer' },
                         providerId: { type: 'string' },
                         addonName: { type: 'string' },
-                        seeders: { type: 'integer' }
+                        seeders: { type: 'integer' },
+                        rank: {
+                            type: 'object',
+                            description:
+                                'Explainable ranking info — present only when SOURCE_RANKING_ENABLED=true',
+                            properties: {
+                                score: {
+                                    type: 'integer',
+                                    description:
+                                        'Ranking score 0-100 (higher = better)'
+                                },
+                                reasons: {
+                                    type: 'array',
+                                    items: { type: 'string' },
+                                    description:
+                                        'Explainable contributors, e.g. quality:1080p'
+                                }
+                            }
+                        }
                     }
                 },
                 OMSSSubtitle: {

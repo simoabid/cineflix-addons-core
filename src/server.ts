@@ -27,6 +27,7 @@ import {
 } from './media/mediaIdentity.js';
 import { makeAuthGuard, registerAuthRoutes } from './routes/auth.js';
 import { normalizeUpstreamUrl } from './sources/normalization.js';
+import { rankSources } from './sources/ranking.js';
 import { registerAddonRoutes } from './routes/addons.routes.js';
 import { registerImportRoutes } from './routes/import.routes.js';
 import { registerFederationRoutes } from './routes/federation.routes.js';
@@ -1390,52 +1391,68 @@ function patchSourceService(
                         )
                     )
                 );
-                if (hasProvenance) {
-                    const seen = new Set<string>();
-                    const deduped = asArray.map((r) => {
-                        const filtered: unknown[] = [];
-                        for (const s of r.sources as Array<{
-                            provenance?: {
-                                upstreamUrl: string;
-                                headers?: Record<string, string>;
-                            };
-                            url: string;
-                        }>) {
-                            const prov = (
-                                s as unknown as {
-                                    provenance?: {
-                                        upstreamUrl: string;
-                                        headers?: Record<string, string>;
-                                    };
-                                }
-                            ).provenance;
-                            const upstream = prov?.upstreamUrl ?? s.url;
-                            const headers = prov?.headers;
-                            const headerKey = headers
-                                ? JSON.stringify(
-                                      Object.entries(headers)
-                                          .sort((a, b) =>
-                                              a[0].localeCompare(b[0])
-                                          )
-                                          .map(
-                                              ([k, v]) =>
-                                                  `${k.toLowerCase()}:${v}`
-                                          )
-                                  )
-                                : '';
-                            const key =
-                                normalizeUpstreamUrl(upstream) +
-                                '|' +
-                                headerKey;
-                            if (seen.has(key)) continue;
-                            seen.add(key);
-                            filtered.push(s);
-                        }
-                        return { ...r, sources: filtered };
-                    });
+                let transformed: Array<{
+                    sources: unknown[];
+                    subtitles?: unknown[];
+                    diagnostics?: unknown[];
+                }> | null = hasProvenance
+                    ? asArray.map((r) => {
+                          const seen = new Set<string>();
+                          const filtered: unknown[] = [];
+                          for (const s of r.sources as Array<{
+                              provenance?: {
+                                  upstreamUrl: string;
+                                  headers?: Record<string, string>;
+                              };
+                              url: string;
+                          }>) {
+                              const prov = (
+                                  s as unknown as {
+                                      provenance?: {
+                                          upstreamUrl: string;
+                                          headers?: Record<string, string>;
+                                      };
+                                  }
+                              ).provenance;
+                              const upstream = prov?.upstreamUrl ?? s.url;
+                              const headers = prov?.headers;
+                              const headerKey = headers
+                                  ? JSON.stringify(
+                                        Object.entries(headers)
+                                            .sort((a, b) =>
+                                                a[0].localeCompare(b[0])
+                                            )
+                                            .map(
+                                                ([k, v]) =>
+                                                    `${k.toLowerCase()}:${v}`
+                                            )
+                                    )
+                                  : '';
+                              const key =
+                                  normalizeUpstreamUrl(upstream) +
+                                  '|' +
+                                  headerKey;
+                              if (seen.has(key)) continue;
+                              seen.add(key);
+                              filtered.push(s);
+                          }
+                          return { ...r, sources: filtered };
+                      })
+                    : null;
+
+                // Phase 12 §15.5 — opt-in explainable re-ranking. Runs after
+                // dedup so dedup keeps the highest-ranked occurrence; the
+                // ranked flat order is preserved through buildResponse's
+                // insertion-ordered Map, and each source carries its `rank`.
+                if (cfg.sourceRankingEnabled) {
+                    const input = transformed ?? asArray;
+                    transformed = rankBulkResults(input);
+                }
+
+                if (transformed) {
                     return (originalBuild as (r: unknown[]) => unknown).call(
                         this,
-                        deduped
+                        transformed
                     );
                 }
             } catch {
@@ -1451,6 +1468,36 @@ function patchSourceService(
     console.log(
         `[selection] patched SourceService.fetchFromProviders to use ProviderSelectionService (aggregate mode, concurrency=4)`
     );
+}
+
+/**
+ * Phase 12 §15.5 — re-rank a bulk provider-result array by explainable
+ * score. Sources are flattened across provider results, scored against the
+ * reliability registry telemetry, and rebuilt as a single synthetic result
+ * whose insertion order is the ranked order (buildResponse preserves array
+ * order through its dedup Map). Subtitles and diagnostics are concatenated
+ * untouched. Returns the input unchanged when there is nothing to rank.
+ */
+function rankBulkResults(
+    results: Array<{
+        sources: unknown[];
+        subtitles?: unknown[];
+        diagnostics?: unknown[];
+    }>
+): Array<{ sources: unknown[]; subtitles?: unknown[]; diagnostics?: unknown[] }> {
+    const flat = results.flatMap((r) => r.sources);
+    if (flat.length === 0) return results;
+    const ranked = rankSources(
+        flat as import('@omss/framework').Source[],
+        { metrics: (pid) => globalReliability.getMetrics(pid) }
+    );
+    return [
+        {
+            sources: ranked,
+            subtitles: results.flatMap((r) => r.subtitles ?? []),
+            diagnostics: results.flatMap((r) => r.diagnostics ?? [])
+        }
+    ];
 }
 
 /**

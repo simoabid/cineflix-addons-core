@@ -228,6 +228,15 @@ export interface AppConfig {
     /** Phase 12 §15.2: hard cap on subtitles returned per query. */
     subtitleMaxResults: number;
 
+    /**
+     * Phase 12 §15.5: opt-in explainable source re-ranking for bulk
+     * aggregates. When true, bulk sources are re-ordered by an explainable
+     * score (reliability/latency/playability/quality) and each source carries
+     * a `rank` field; the original provider order remains the tie-break so
+     * explicit user ordering is never silently replaced.
+     */
+    sourceRankingEnabled: boolean;
+
     /** Phase 12 §15.4: provider marketplace / import policy controls. */
     marketplaceTrustedIds: string[];
     marketplaceTrustedFingerprints: string[];
@@ -465,6 +474,9 @@ export function loadConfig(): AppConfig {
             10_000
         ),
         subtitleMaxResults: envNum('SUBTITLE_MAX_RESULTS', 50),
+
+        // Phase 12 §15.5 — opt-in explainable source re-ranking (bulk mode).
+        sourceRankingEnabled: envBool('SOURCE_RANKING_ENABLED', false),
 
         // Phase 12 §15.4 — provider marketplace / import policy controls.
         marketplaceTrustedIds: envList('MARKETPLACE_TRUSTED_IDS'),
